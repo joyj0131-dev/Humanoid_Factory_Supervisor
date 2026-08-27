@@ -1,0 +1,19 @@
+seed: 42
+max_episode_steps: 200
+
+action:
+  scale: 0.05
+
+object:
+  x_range: [0.22, 0.32]
+  y_range: [-0.08, 0.08]
+  z: 0.782
+
+target:
+  left_offset: [0.0, 0.08, 0.0]
+  right_offset: [0.0, -0.08, 0.0]
+  success_threshold: 0.05
+  success_bonus: 1.0
+
+simulation:
+  frame_skip: 5

@@ -1,0 +1,67 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# =========================
+# IDE / OS
+# =========================
+.vscode/
+.idea/
+.DS_Store
+
+# =========================
+# Claude / local AI context
+# =========================
+.claude/
+CLAUDE.md
+PROJECT_CONTEXT.md
+
+# =========================
+# Training / experiment data
+# =========================
+datasets/
+checkpoints/
+logs/
+
+# Generated results
+results/videos/
+results/*.mp4
+results/*.gif
+
+# =========================
+# Temporary / cache
+# =========================
+*.tmp
+*.log
+.cache/
+.pytest_cache/
+.mypy_cache/
+
+# =========================
+# Local config / secrets
+# =========================
+.env
+.env.*
+*.local
+
+# =========================
+# MuJoCo / Robot Assets
+# =========================
+assets/robots/g1/
+
+# =========================
+# Misc
+# =========================
+nohup.out
