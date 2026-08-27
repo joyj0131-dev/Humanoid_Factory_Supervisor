@@ -9,6 +9,8 @@ re-check these names before trusting them again.
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -95,8 +97,14 @@ class EnvConfig:
         DEFAULT_TABLE_POS[2] + DEFAULT_TABLE_HALF_SIZE[2] + OBJECT_HALF_SIZE + OBJECT_TABLE_GAP
     )
 
-    left_target_offset: tuple[float, float, float] = (0.0, 0.08, 0.0)
-    right_target_offset: tuple[float, float, float] = (0.0, -0.08, 0.0)
+    # z=0.09 (not 0.0): a target at the object's own height puts the pre-grasp
+    # point essentially on the table surface. The EE *site* is a mathematical
+    # point, but the physical wrist/hand geometry around it is not, so a
+    # zero-height offset drove the wrist into a persistent collision with the
+    # table and IK stalled around ~18cm error (see Phase 2 report). +9cm
+    # gives the hand clearance to approach from slightly above.
+    left_target_offset: tuple[float, float, float] = (0.0, 0.08, 0.09)
+    right_target_offset: tuple[float, float, float] = (0.0, -0.08, 0.09)
 
     success_threshold: float = 0.05
     success_bonus: float = 1.0
@@ -105,6 +113,13 @@ class EnvConfig:
     table_half_size: tuple[float, float, float] = DEFAULT_TABLE_HALF_SIZE
 
     g1_xml_path: Path = field(default_factory=lambda: G1_XML_PATH)
+
+    def config_id(self) -> str:
+        """Short stable hash of this config, stored with every demonstration
+        episode so a dataset can be traced back to the env parameters it was
+        collected under (see PROJECT_CONTEXT.md, Demonstration Dataset)."""
+        payload = repr(sorted(dataclasses.asdict(self).items()))
+        return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
     @staticmethod
     def from_yaml(path: str | Path) -> "EnvConfig":

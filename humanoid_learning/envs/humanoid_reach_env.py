@@ -266,3 +266,53 @@ class BimanualReachEnv(gym.Env):
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
+
+    # ------------------------------------------------------------------
+    # public read-only accessors for Expert / evaluation code
+    #
+    # These expose exactly the physical quantities a controller needs
+    # (target, EE position, arm Jacobian, joint-limit proximity) without a
+    # separate Expert-facing Environment variant -- Expert reads the same
+    # state BC/PPO observe, just via typed accessors instead of parsing the
+    # flat observation vector.
+    # ------------------------------------------------------------------
+    @property
+    def left_target(self) -> np.ndarray:
+        return self._left_target.copy()
+
+    @property
+    def right_target(self) -> np.ndarray:
+        return self._right_target.copy()
+
+    @property
+    def left_ee_pos(self) -> np.ndarray:
+        return self.data.site_xpos[self._left_ee_site].copy()
+
+    @property
+    def right_ee_pos(self) -> np.ndarray:
+        return self.data.site_xpos[self._right_ee_site].copy()
+
+    def arm_jacobians(self) -> tuple[np.ndarray, np.ndarray]:
+        """Position Jacobians (3 x 7) of the left/right EE site w.r.t. that
+        arm's own 7 joints only (columns for all other dofs are dropped,
+        since only the arm's own joints are actuated by the policy)."""
+        jacp = np.zeros((3, self.model.nv))
+        mujoco.mj_jacSite(self.model, self.data, jacp, None, self._left_ee_site)
+        left_jac = jacp[:, self._arm_dof_adr[:_N_PER_ARM]].copy()
+
+        jacp[:] = 0.0
+        mujoco.mj_jacSite(self.model, self.data, jacp, None, self._right_ee_site)
+        right_jac = jacp[:, self._arm_dof_adr[_N_PER_ARM:]].copy()
+
+        return left_jac, right_jac
+
+    def arm_qpos(self) -> tuple[np.ndarray, np.ndarray]:
+        left = self.data.qpos[self._arm_qpos_adr[:_N_PER_ARM]].copy()
+        right = self.data.qpos[self._arm_qpos_adr[_N_PER_ARM:]].copy()
+        return left, right
+
+    def joint_limit_margins(self) -> np.ndarray:
+        """Distance (rad) of each of the 14 arm joints' current qpos to its
+        nearer ctrlrange bound. Small/zero means the joint is saturated."""
+        qpos = self.data.qpos[self._arm_qpos_adr]
+        return np.minimum(qpos - self._arm_ctrl_low, self._arm_ctrl_high - qpos)
