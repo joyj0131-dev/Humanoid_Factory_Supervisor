@@ -1,0 +1,21 @@
+seed: 42
+val_fraction: 0.2
+
+model:
+  hidden_sizes: [256, 256]
+
+training:
+  batch_size: 256
+  learning_rate: 0.001
+  weight_decay: 0.0
+  epochs: 200
+
+dataset:
+  dir: datasets
+  index_file: index.csv
+
+checkpoint:
+  dir: checkpoints/bc
+
+results:
+  dir: results/bc

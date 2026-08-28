@@ -1,0 +1,30 @@
+# Same seed list (seed_base .. seed_base + episodes_per_condition - 1) is
+# used for every condition, so no condition is given easier seeds than
+# another -- see PROJECT_CONTEXT.md, Fair Evaluation.
+episodes_per_condition: 20
+seed_base: 1000
+
+# Seen: same object pose distribution as training (configs/environment.yaml).
+seen:
+  object_x_range: [0.22, 0.32]
+  object_y_range: [-0.08, 0.08]
+
+# Unseen: outside the training x-range, verified reachable by re-running
+# the Phase 2 ScriptedExpert on this exact range (30 seeds): 83% (25/30)
+# expert success, comparable to its ~95-98% in-distribution rate -- close
+# enough to the table edge to be genuinely out-of-distribution without
+# being an infeasible target. An earlier, more aggressive choice
+# (x=[0.32,0.36], y=[0.09,0.15]) was rejected after the expert itself only
+# reached 25% there, which would have confounded "BC fails to generalize"
+# with "the target is barely reachable at all" -- see Phase 3 report.
+unseen:
+  object_x_range: [0.32, 0.34]
+  object_y_range: [-0.05, 0.05]
+
+# Noise: same distribution as Seen, with reproducible Gaussian noise added
+# to the raw observation vector before it reaches the policy.
+noise:
+  object_x_range: [0.22, 0.32]
+  object_y_range: [-0.08, 0.08]
+  obs_noise_std: 0.01
+  noise_seed: 500
