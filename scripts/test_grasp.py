@@ -1151,6 +1151,76 @@ def test_hand_hand_contact_detected_and_capped_size12():
     )
 
 
+def test_global_four_face_metrics_wired_and_bounded_size12():
+    """Honest diagnostic (Four-Face Diagonal Corner Grasp session, Section
+    12/20): the new GLOBAL (both-hand) four-face metrics must exist on
+    GraspOutcome and stay within their defined bounds on a real SIZE_12
+    rollout. This runs against the CURRENT default topology (vertical
+    stagger only, Candidate B) -- it does NOT assert four-face success
+    (the diagonal-corner topology, Candidate C, is not implemented yet),
+    only that the measurement machinery itself is correct and does not
+    crash, matching this project's existing "wired and bounded" pattern
+    for streak metrics that are still work-in-progress."""
+    from humanoid_learning.envs.grasp_config import SIZE_12_HALF
+    env = make_env(object_pos=(0.27, 0.0, 0.0), arm_kp=120.0, object_half_size=SIZE_12_HALF)
+    env.reset(seed=0)
+    expert = BimanualSidePinchExpert(env, GraspExpertConfig())
+    outcome = expert.run(max_total_steps=6000)
+    assert outcome.max_four_face_contact_streak >= 0
+    assert outcome.contacted_side_faces <= {"FACE_POS_X", "FACE_NEG_X", "FACE_POS_Y", "FACE_NEG_Y"}
+    assert outcome.four_face_coverage == (outcome.opposing_x_pair and outcome.opposing_y_pair)
+    assert outcome.global_grasp_wrench_rank >= 0
+    assert outcome.global_grasp_wrench_condition > 0.0  # inf allowed (rank-deficient/too-few-contacts case)
+    print(
+        f"    contacted_side_faces={sorted(outcome.contacted_side_faces)} "
+        f"four_face_coverage={outcome.four_face_coverage} "
+        f"opposing(x,y)=({outcome.opposing_x_pair},{outcome.opposing_y_pair}) "
+        f"max_four_face_contact_streak={outcome.max_four_face_contact_streak} "
+        f"wrench_rank={outcome.global_grasp_wrench_rank} wrench_condition={outcome.global_grasp_wrench_condition:.1f} "
+        f"net_force={np.round(outcome.global_net_force, 2).tolist()} "
+        f"net_torque={np.round(outcome.global_net_torque, 3).tolist()}"
+    )
+
+
+def test_classify_contact_face_side_top_bottom_and_ambiguous():
+    """Unit test (Four-Face Diagonal Corner Grasp session, Section 11)
+    for _classify_contact_face using synthetic normals -- no live sim
+    needed, this is a pure geometry function. Covers: each side face
+    center, a ROTATED object (confirms classification uses the object's
+    OWN local frame, not world axes), an edge/corner-ambiguous normal,
+    and top/bottom separation from the four side faces."""
+    identity_quat = np.array([1.0, 0.0, 0.0, 0.0])
+    obj_pos = np.array([0.27, 0.0, 0.8])
+
+    def classify(normal, quat=identity_quat):
+        return BimanualSidePinchExpert._classify_contact_face(
+            np.zeros(3), np.array(normal, dtype=float), obj_pos, quat
+        )
+
+    assert classify([1.0, 0.0, 0.0]) == "FACE_POS_X"
+    assert classify([-1.0, 0.0, 0.0]) == "FACE_NEG_X"
+    assert classify([0.0, 1.0, 0.0]) == "FACE_POS_Y"
+    assert classify([0.0, -1.0, 0.0]) == "FACE_NEG_Y"
+    assert classify([0.0, 0.0, 1.0]) == "FACE_TOP"
+    assert classify([0.0, 0.0, -1.0]) == "FACE_BOTTOM"
+
+    # Exact edge normal (45 degrees between two side faces) must be
+    # ambiguous, not silently assigned to whichever axis is numerically
+    # first.
+    assert classify([0.7071, 0.7071, 0.0]) == "EDGE_OR_CORNER_AMBIGUOUS"
+    # A true corner (three comparable components) is also ambiguous.
+    assert classify([0.577, 0.577, 0.577]) == "EDGE_OR_CORNER_AMBIGUOUS"
+
+    # Rotated object (90 degrees about Z, i.e. quat for that rotation):
+    # a WORLD-frame +X normal must now classify as the object's OWN
+    # -Y face. Verified numerically: this quat maps local +X -> world +Y
+    # and local +Y -> world -X, so local -Y -> world +X -- meaning a
+    # world +X normal corresponds to local -Y, i.e. FACE_NEG_Y. Proves
+    # classification happens in object-local frame, not world frame.
+    quat_90z = np.array([np.cos(np.pi / 4), 0.0, 0.0, np.sin(np.pi / 4)])
+    assert classify([1.0, 0.0, 0.0], quat=quat_90z) == "FACE_NEG_Y"
+
+
 def _run_gate_a_tripod_check(object_half_size: float):
     """Gate A (Section 12): the REAL, literal criterion is bilateral
     TRIPOD contact (thumb + a genuinely opposing index/middle contact)

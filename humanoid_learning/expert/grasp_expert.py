@@ -562,6 +562,18 @@ class GraspOutcome:
     max_hand_hand_force_raw: float
     substep_safety_event_count: int
     max_substep_safety_force: float
+    # Four-Face Diagonal Corner Grasp session, Section 12/20: GLOBAL
+    # (both-hand) metrics, added alongside the existing per-hand
+    # opposing-normal fields above (not replacing them).
+    contacted_side_faces: frozenset[str]
+    four_face_coverage: bool
+    opposing_x_pair: bool
+    opposing_y_pair: bool
+    max_four_face_contact_streak: int
+    global_net_force: np.ndarray
+    global_net_torque: np.ndarray
+    global_grasp_wrench_rank: int
+    global_grasp_wrench_condition: float
     left_first_finger_contact_step: int | None
     right_first_finger_contact_step: int | None
     bilateral_first_finger_contact_step: int | None
@@ -683,6 +695,23 @@ class BimanualSidePinchExpert:
         self.max_hand_hand_contact_streak = 0
         self.substep_safety_event_count = 0
         self.max_substep_safety_force = 0.0
+
+        # Four-Face Diagonal Corner Grasp session, Section 12: GLOBAL
+        # (both-hand) four-face success metrics, ADDED alongside (not
+        # replacing) the existing per-hand opposing-normal metric above.
+        # A ~90 degree thumb-vs-index/middle normal WITHIN one hand is not
+        # a failure under this metric set -- only the two-hand wrench
+        # (opposing +X/-X and +Y/-Y face pairs) matters here.
+        self.contacted_side_faces: set[str] = set()
+        self.four_face_coverage = False
+        self.opposing_x_pair = False
+        self.opposing_y_pair = False
+        self._four_face_streak = 0
+        self.max_four_face_contact_streak = 0
+        self.global_net_force = np.zeros(3, dtype=np.float64)
+        self.global_net_torque = np.zeros(3, dtype=np.float64)
+        self.global_grasp_wrench_rank = 0
+        self.global_grasp_wrench_condition = float("inf")
 
         self._coupled_traj: _MinJerkJointTrajectory | None = None  # None = not tracking a coupled trajectory
         self._coupled_last_result: CoupledIKResult | None = None
@@ -994,6 +1023,9 @@ class BimanualSidePinchExpert:
     def _object_pos(self) -> np.ndarray:
         return self.env.data.qpos[self.env._object_qpos_adr : self.env._object_qpos_adr + 3].copy()
 
+    def _object_quat(self) -> np.ndarray:
+        return self.env.data.qpos[self.env._object_qpos_adr + 3 : self.env._object_qpos_adr + 7].copy()
+
     def _object_table_contact(self) -> bool:
         model, data = self.env.model, self.env.data
         obj_body = self.env._object_body_id
@@ -1128,6 +1160,49 @@ class BimanualSidePinchExpert:
         return np.array([contact.thumb.resultant, contact.index.resultant, contact.middle.resultant])
 
     @staticmethod
+    def _classify_contact_face(
+        world_point: np.ndarray, world_normal: np.ndarray, obj_pos: np.ndarray, obj_quat: np.ndarray,
+        ambiguity_margin: float = 0.3,
+    ) -> str:
+        """Classifies a single contact into one of FACE_POS_X/FACE_NEG_X/
+        FACE_POS_Y/FACE_NEG_Y/FACE_TOP/FACE_BOTTOM/EDGE_OR_CORNER_
+        AMBIGUOUS (Phase 4 -- Four-Face Diagonal Corner Grasp session,
+        Section 11), given a contact normal already oriented to point
+        OBJECT -> other body (world_normal, matching ContactCategory's
+        own convention -- see _contact()'s docstring on why this is
+        flipped based on which geom slot the object landed in, so this
+        classifier's result does not depend on geom1/geom2 order).
+
+        Uses the NORMAL, not the contact point, as the primary signal:
+        for an axis-aligned box the outward normal of a true face contact
+        is exactly one basis vector, robust even when the object itself
+        is rotated (the normal is rotated into the object's OWN local
+        frame here, via obj_quat, before classifying) or when the contact
+        point itself sits near an edge. An edge/corner contact produces a
+        normal with two (or three) comparably-sized components instead of
+        one dominant one -- classified as EDGE_OR_CORNER_AMBIGUOUS rather
+        than guessed, controlled by ``ambiguity_margin`` (the gap required
+        between the largest and second-largest |component| before
+        committing to a single face)."""
+        R = np.zeros(9)
+        mujoco.mju_quat2Mat(R, obj_quat)
+        R = R.reshape(3, 3)
+        local_normal = R.T @ np.asarray(world_normal, dtype=np.float64)
+        n = local_normal / (np.linalg.norm(local_normal) + 1e-12)
+        abs_n = np.abs(n)
+        order = np.argsort(abs_n)[::-1]
+        if abs_n[order[0]] - abs_n[order[1]] < ambiguity_margin:
+            return "EDGE_OR_CORNER_AMBIGUOUS"
+        axis = order[0]
+        sign = n[axis] > 0
+        if axis == 0:
+            return "FACE_POS_X" if sign else "FACE_NEG_X"
+        elif axis == 1:
+            return "FACE_POS_Y" if sign else "FACE_NEG_Y"
+        else:
+            return "FACE_TOP" if sign else "FACE_BOTTOM"
+
+    @staticmethod
     def _opposing_normal_score(contact: HandContact) -> tuple[float, str | None, float]:
         """(score, opposing_finger_name, separation) for one hand's
         HandContact snapshot (Thumb Opposition + Claw-Style Bimanual
@@ -1154,6 +1229,70 @@ class BimanualSidePinchExpert:
             if best_name is None or score > best_score:
                 best_score, best_name, best_sep = score, name, sep
         return best_score, best_name, best_sep
+
+    def _global_four_face_metrics(
+        self, left_c: HandContact, right_c: HandContact, obj_pos: np.ndarray, obj_quat: np.ndarray,
+    ) -> tuple[set[str], np.ndarray, np.ndarray]:
+        """GLOBAL (both-hand) four-face metrics (Four-Face Diagonal Corner
+        Grasp session, Section 12/20) -- ADDED alongside, not replacing,
+        the existing per-hand _opposing_normal_score. Classifies every
+        currently-touching thumb/index/middle category (both hands) into
+        an object-local face via _classify_contact_face, then returns:
+        (contacted_side_faces, net_force, net_torque). net_force/net_
+        torque are computed from whichever single largest-resultant
+        contact each touching category currently tracks (same "largest
+        contact per category" simplification _contact() already uses
+        elsewhere -- not a sum over every individual MuJoCo contact
+        point), so they are an approximation, not an exact multi-contact
+        wrench integral."""
+        side_faces = {"FACE_POS_X", "FACE_NEG_X", "FACE_POS_Y", "FACE_NEG_Y"}
+        contacted: set[str] = set()
+        net_force = np.zeros(3, dtype=np.float64)
+        net_torque = np.zeros(3, dtype=np.float64)
+        for hand_c in (left_c, right_c):
+            for cat in (hand_c.thumb, hand_c.index, hand_c.middle):
+                if not cat.touched or cat.world_normal is None or cat.world_point is None:
+                    continue
+                face = self._classify_contact_face(cat.world_point, cat.world_normal, obj_pos, obj_quat)
+                if face in side_faces:
+                    contacted.add(face)
+                force_vec = cat.world_normal * cat.normal_force
+                net_force += force_vec
+                net_torque += np.cross(cat.world_point - obj_pos, force_vec)
+        return contacted, net_force, net_torque
+
+    @staticmethod
+    def _grasp_wrench_rank_condition(
+        left_c: HandContact, right_c: HandContact, obj_pos: np.ndarray,
+    ) -> tuple[int, float]:
+        """Global two-hand grasp wrench matrix rank/condition number
+        (Four-Face Diagonal Corner Grasp session, Section 20). Builds one
+        6-dim point-contact wrench column [n; r x n] per currently-
+        touching thumb/index/middle category (both hands, unit normal
+        directions -- this is a simplified frictionless point-contact
+        model, NOT a full friction-cone wrench space; adequate for a
+        rank/conditioning comparison across candidates A/B/C/D, not a
+        certified force-closure proof). rank < 6 or a very large
+        condition number both indicate at least one direction the grasp
+        cannot resist (a "weak motion direction"). Returns (0, inf) when
+        fewer than 2 contacts are active (rank/conditioning are not
+        meaningful with 0-1 point contacts)."""
+        columns = []
+        for hand_c in (left_c, right_c):
+            for cat in (hand_c.thumb, hand_c.index, hand_c.middle):
+                if not cat.touched or cat.world_normal is None or cat.world_point is None:
+                    continue
+                n = cat.world_normal / (np.linalg.norm(cat.world_normal) + 1e-12)
+                r = cat.world_point - obj_pos
+                columns.append(np.concatenate([n, np.cross(r, n)]))
+        if len(columns) < 2:
+            return 0, float("inf")
+        wrench_matrix = np.stack(columns, axis=1)
+        rank = int(np.linalg.matrix_rank(wrench_matrix))
+        singular_values = np.linalg.svd(wrench_matrix, compute_uv=False)
+        smallest, largest = float(singular_values[-1]), float(singular_values[0])
+        condition = float("inf") if smallest < 1e-9 else largest / smallest
+        return rank, condition
 
     def _contact(self, side: str) -> HandContact:
         model, data = self.env.model, self.env.data
@@ -1801,6 +1940,37 @@ class BimanualSidePinchExpert:
         self.max_hand_hand_force_raw = max(self.max_hand_hand_force_raw, self.hand_hand_force_raw)
         self._hand_hand_streak = self._hand_hand_streak + 1 if self.hand_hand_touched else 0
         self.max_hand_hand_contact_streak = max(self.max_hand_hand_contact_streak, self._hand_hand_streak)
+
+        # Four-Face Diagonal Corner Grasp session, Section 12: GLOBAL
+        # (both-hand) four-face coverage/opposing-pair/wrench metrics,
+        # computed every step regardless of GraspState -- kept alongside
+        # (not replacing) the existing per-hand opposing-normal metric,
+        # which is still computed separately inside TRIPOD_SETTLE below.
+        obj_quat = self._object_quat()
+        self.contacted_side_faces, self.global_net_force, self.global_net_torque = (
+            self._global_four_face_metrics(left_c, right_c, obj, obj_quat)
+        )
+        self.opposing_x_pair = "FACE_POS_X" in self.contacted_side_faces and "FACE_NEG_X" in self.contacted_side_faces
+        self.opposing_y_pair = "FACE_POS_Y" in self.contacted_side_faces and "FACE_NEG_Y" in self.contacted_side_faces
+        self.four_face_coverage = self.opposing_x_pair and self.opposing_y_pair
+        # Section 12's explicit success condition list: both X/Y opposing
+        # pairs present, both-hand thumb contact, both-hand index-or-
+        # middle contact, and no wrist/palm contact -- NOT just face
+        # coverage alone (four faces touched by an accidental palm/wrist
+        # graze would not count).
+        both_hand_thumb = left_c.thumb.touched and right_c.thumb.touched
+        both_hand_index_or_middle = (
+            (left_c.index.touched or left_c.middle.touched) and (right_c.index.touched or right_c.middle.touched)
+        )
+        no_wrist_palm_contact = not left_c.palm.touched and not right_c.palm.touched
+        four_face_success_this_step = (
+            self.four_face_coverage and both_hand_thumb and both_hand_index_or_middle and no_wrist_palm_contact
+        )
+        self._four_face_streak = self._four_face_streak + 1 if four_face_success_this_step else 0
+        self.max_four_face_contact_streak = max(self.max_four_face_contact_streak, self._four_face_streak)
+        self.global_grasp_wrench_rank, self.global_grasp_wrench_condition = self._grasp_wrench_rank_condition(
+            left_c, right_c, obj
+        )
         self.left_max_force_raw = max(self.left_max_force_raw, left_force_raw)
         self.right_max_force_raw = max(self.right_max_force_raw, right_force_raw)
 
@@ -3010,6 +3180,15 @@ class BimanualSidePinchExpert:
             max_hand_hand_force_raw=self.max_hand_hand_force_raw,
             substep_safety_event_count=self.substep_safety_event_count,
             max_substep_safety_force=self.max_substep_safety_force,
+            contacted_side_faces=frozenset(self.contacted_side_faces),
+            four_face_coverage=self.four_face_coverage,
+            opposing_x_pair=self.opposing_x_pair,
+            opposing_y_pair=self.opposing_y_pair,
+            max_four_face_contact_streak=self.max_four_face_contact_streak,
+            global_net_force=self.global_net_force.copy(),
+            global_net_torque=self.global_net_torque.copy(),
+            global_grasp_wrench_rank=self.global_grasp_wrench_rank,
+            global_grasp_wrench_condition=self.global_grasp_wrench_condition,
             left_first_finger_contact_step=self.left_first_finger_contact_step,
             right_first_finger_contact_step=self.right_first_finger_contact_step,
             bilateral_first_finger_contact_step=self.bilateral_first_finger_contact_step,
