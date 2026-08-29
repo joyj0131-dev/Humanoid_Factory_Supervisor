@@ -108,8 +108,8 @@ RIGHT_THUMB_TIP_SITE = "right_thumb_tip"
 RIGHT_INDEX_TIP_SITE = "right_index_tip"
 RIGHT_MIDDLE_TIP_SITE = "right_middle_tip"
 
-# Distal link each fingertip site is attached to, at that link's own origin
-# (a reasonable fingertip proxy -- these ARE the most distal link bodies).
+# Distal link each fingertip site is attached to (these ARE the most
+# distal link bodies).
 FINGERTIP_SITE_BODIES = {
     LEFT_THUMB_TIP_SITE: "left_hand_thumb_2_link",
     LEFT_INDEX_TIP_SITE: "left_hand_index_1_link",
@@ -117,6 +117,35 @@ FINGERTIP_SITE_BODIES = {
     RIGHT_THUMB_TIP_SITE: "right_hand_thumb_2_link",
     RIGHT_INDEX_TIP_SITE: "right_hand_index_1_link",
     RIGHT_MIDDLE_TIP_SITE: "right_hand_middle_1_link",
+}
+
+# Local (body-frame) position of each fingertip site, CORRECTED (Phase 4
+# — Collision-Free Thumb Preshape + Early Tripod Closure session) from
+# the previous (0, 0, 0) placement. Direct measurement found (0,0,0) sits
+# exactly on that body's OWN joint's rotation axis -- rotating the joint
+# living in that same body (the distal curl joint) produced EXACTLY zero
+# site displacement across its full range, for all 6 sites, on both
+# hands (confirmed directly). This meant every fingertip-based
+# calculation (_measure_fingertip_grasp_offset, _min_fingertip_distance,
+# clearance/collision checks) was blind to distal curl and measured a
+# point ~5.9cm proximal of the true tip.
+#
+# These values are each body's own collision MESH's AABB extent along
+# its dominant (longest) local axis, taken on the side FARTHER from the
+# body origin (i.e. the true distal end, not the proximal/joint end) --
+# computed from model.geom_pos/geom_quat/geom_size and verified directly
+# by rotating each distal joint and confirming the site now moves
+# ~9cm across the joint's range (was exactly 0.0 before). Thumb's mesh
+# frame differs from index/middle's (own local Y vs X), which is why the
+# nonzero component differs by finger; magnitudes match within noise
+# across all 6 (mirrored correctly left/right).
+FINGERTIP_SITE_LOCAL_POS = {
+    LEFT_THUMB_TIP_SITE: (-0.0002, -0.0593, -0.0010),
+    LEFT_INDEX_TIP_SITE: (0.0593, 0.0002, 0.0010),
+    LEFT_MIDDLE_TIP_SITE: (0.0593, 0.0002, 0.0010),
+    RIGHT_THUMB_TIP_SITE: (-0.0002, 0.0593, 0.0010),
+    RIGHT_INDEX_TIP_SITE: (0.0593, -0.0002, -0.0010),
+    RIGHT_MIDDLE_TIP_SITE: (0.0593, -0.0002, -0.0010),
 }
 
 # Sites already authored in the stock XML (not added by us): local offset

@@ -849,22 +849,24 @@ def test_size12_first_object_contact_is_finger_not_wrist_or_palm():
 def test_natural_approach_state_sequence_reaches_contact_acquire_size12():
     """End-to-end structural check of the 9-state early pipeline
     (STABLE_START -> NATURAL_ARM_LIFT -> FOREARM_LATERAL_APPROACH ->
-    FOREARM_DESCEND -> WRIST_ALIGN -> FINGER_PRESHAPE -> THUMB_ABDUCT ->
-    FINGERTIP_PRECONTACT -> CONTACT_ACQUIRE; THUMB_ABDUCT added in the
-    Thumb Opposition + Claw-Style Bimanual Grasp session, keeping thumb
-    pinned abducted while index/middle preshape) for SIZE_12 -- every
-    state must be visited in this exact order, with no premature wrist/
-    palm/forearm contact along the way (a planned finger touch during
-    FINGERTIP_PRECONTACT is allowed and is exactly how this sequence is
-    expected to reach CONTACT_ACQUIRE)."""
+    THUMB_CLEARANCE_PRESHAPE -> FOREARM_DESCEND -> WRIST_ALIGN ->
+    FINGER_PRESHAPE -> FINGERTIP_PRECONTACT -> CONTACT_ACQUIRE;
+    THUMB_CLEARANCE_PRESHAPE moved to right after FOREARM_LATERAL_
+    APPROACH in the Collision-Free Thumb Preshape + Early Tripod Closure
+    session -- thumb abducts while still at approach_height, well clear
+    of the object, instead of after WRIST_ALIGN/FINGER_PRESHAPE) for
+    SIZE_12 -- every state must be visited in this exact order, with no
+    premature wrist/palm/forearm contact along the way (a planned finger
+    touch during FINGERTIP_PRECONTACT is allowed and is exactly how this
+    sequence is expected to reach CONTACT_ACQUIRE)."""
     from humanoid_learning.envs.grasp_config import SIZE_12_HALF
     env = make_env(object_pos=(0.27, 0.0, 0.0), arm_kp=120.0, object_half_size=SIZE_12_HALF)
     env.reset(seed=0)
     expert = BimanualSidePinchExpert(env, GraspExpertConfig())
     expected_order = [
         GraspState.STABLE_START, GraspState.NATURAL_ARM_LIFT, GraspState.FOREARM_LATERAL_APPROACH,
-        GraspState.FOREARM_DESCEND, GraspState.WRIST_ALIGN, GraspState.FINGER_PRESHAPE,
-        GraspState.THUMB_ABDUCT, GraspState.FINGERTIP_PRECONTACT, GraspState.CONTACT_ACQUIRE,
+        GraspState.THUMB_CLEARANCE_PRESHAPE, GraspState.FOREARM_DESCEND, GraspState.WRIST_ALIGN,
+        GraspState.FINGER_PRESHAPE, GraspState.FINGERTIP_PRECONTACT, GraspState.CONTACT_ACQUIRE,
     ]
     visited = [expert.state]
     for _ in range(900):
@@ -1031,26 +1033,39 @@ def test_thumb1_open_close_targets_not_frozen():
     assert abs(right_close - right_open) > 0.3, "right thumb_1 open/close still effectively frozen"
 
 
-def test_thumb_abduct_state_keeps_thumb_open_while_index_middle_preshape():
-    """Section 5: THUMB_ABDUCT (and FINGER_PRESHAPE before it) must keep
-    the thumb group pinned at synergy 0 (fully abducted) while index/
-    middle actively ramp toward preshape_synergy -- this is the direct
-    fix for the regression this session found (thumb moving through an
-    untested intermediate pose during preshape broke SIZE_12's approach
-    convergence) and is also the correct claw behavior per spec."""
+def test_thumb_clearance_preshape_abducts_before_descent_and_stays_open():
+    """Section 3/5 (Collision-Free Thumb Preshape + Early Tripod Closure
+    session): THUMB_CLEARANCE_PRESHAPE (right after FOREARM_LATERAL_
+    APPROACH, while still at approach_height) must actually converge
+    thumb_1's ACTUAL qpos to the GRASP_ABDUCT pose before FOREARM_DESCEND
+    is ever entered -- the whole point of moving thumb abduction earlier
+    is that the hand must not begin descending toward the object until
+    thumb is genuinely out of the way. Thumb must then STAY there
+    (group_synergy[0] pinned at 0, only the direct override moves it)
+    through FOREARM_DESCEND/WRIST_ALIGN/FINGER_PRESHAPE while index/
+    middle actively ramp toward preshape_synergy."""
+    cfg = GraspExpertConfig()
     env = make_env(object_pos=(0.27, 0.0, 0.0), arm_kp=120.0)
     env.reset(seed=0)
-    expert = BimanualSidePinchExpert(env, GraspExpertConfig())
-    reached = False
+    expert = BimanualSidePinchExpert(env, cfg)
+    reached_clearance = False
+    left_thumb1_at_descend_start = None
     for _ in range(700):
         expert.step()
-        if expert.state == GraspState.THUMB_ABDUCT:
-            reached = True
-            assert expert.left_group_synergy[0] == 0.0, "left thumb should stay pinned open in THUMB_ABDUCT"
-            assert expert.right_group_synergy[0] == 0.0, "right thumb should stay pinned open in THUMB_ABDUCT"
+        if expert.state == GraspState.THUMB_CLEARANCE_PRESHAPE:
+            reached_clearance = True
+            assert expert.left_group_synergy[0] == 0.0, "left thumb group synergy should stay pinned"
+            assert expert.right_group_synergy[0] == 0.0, "right thumb group synergy should stay pinned"
+        if expert.state == GraspState.FOREARM_DESCEND and left_thumb1_at_descend_start is None:
+            left_thumb1_at_descend_start = env.data.qpos[env._left_finger_qpos_adr[1]]
         if expert.state in (GraspState.FINGERTIP_PRECONTACT, GraspState.CONTACT_ACQUIRE, GraspState.FAILURE):
             break
-    assert reached, "never reached THUMB_ABDUCT"
+    assert reached_clearance, "never reached THUMB_CLEARANCE_PRESHAPE"
+    assert left_thumb1_at_descend_start is not None, "never reached FOREARM_DESCEND"
+    assert abs(left_thumb1_at_descend_start - cfg.thumb1_abduct_pose_left) < 0.1, (
+        f"thumb_1 must already be converged to GRASP_ABDUCT before FOREARM_DESCEND begins, "
+        f"got {left_thumb1_at_descend_start} vs target {cfg.thumb1_abduct_pose_left}"
+    )
 
 
 def test_opposing_normal_score_detects_true_opposition_vs_same_side_push():

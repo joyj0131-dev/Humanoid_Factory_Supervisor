@@ -130,7 +130,9 @@ def _add_grasp_sites(spec: "mujoco.MjSpec") -> None:
         size=[0.008, 0.008, 0.008],
     )
     for site_name, body_name in wbc.FINGERTIP_SITE_BODIES.items():
-        spec.body(body_name).add_site(name=site_name, pos=[0.0, 0.0, 0.0], size=[0.004, 0.004, 0.004])
+        spec.body(body_name).add_site(
+            name=site_name, pos=list(wbc.FINGERTIP_SITE_LOCAL_POS[site_name]), size=[0.004, 0.004, 0.004]
+        )
 
 
 def _add_floor(spec: "mujoco.MjSpec") -> None:
