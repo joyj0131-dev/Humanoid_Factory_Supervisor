@@ -28,10 +28,13 @@ from humanoid_learning.expert.diagonal_feasibility import (
     CANDIDATE_C1,
     CANDIDATE_C2,
     FACE_NORMALS_LOCAL,
+    build_candidate_specific_seeds,
     build_posture_seeds,
     corner_direction_local,
+    corner_direction_local_at_yaw,
     evaluate_static_pose,
     hand_corner_target,
+    measure_per_finger_local_offsets,
     score_result,
 )
 from humanoid_learning.expert.grasp_expert import BimanualSidePinchExpert, GraspExpertConfig
@@ -75,6 +78,13 @@ def _finger_open_targets(env):
     left_open[1] = gcfg.thumb1_abduct_pose_left
     right_open[1] = gcfg.thumb1_abduct_pose_right
     return (env._left_finger_qpos_adr, env._right_finger_qpos_adr), (left_open, right_open)
+
+
+def _finger_offsets(env):
+    gcfg = GraspExpertConfig()
+    left_offsets = measure_per_finger_local_offsets(env, "left", gcfg.thumb1_abduct_pose_left)
+    right_offsets = measure_per_finger_local_offsets(env, "right", gcfg.thumb1_abduct_pose_right)
+    return left_offsets, right_offsets
 
 
 # ---------------------------------------------------------------------
@@ -188,10 +198,11 @@ def test_collision_candidate_is_rejected_not_silently_passed():
     left_t = hand_corner_target(obj_pos, identity_quat, SIZE_12_HALF, CANDIDATE_C1.left, palm_standoff=0.0)
     right_t = hand_corner_target(obj_pos, identity_quat, SIZE_12_HALF, CANDIDATE_C1.right, palm_standoff=0.0)
     finger_adr, finger_targets = _finger_open_targets(env)
+    left_offsets, right_offsets = _finger_offsets(env)
     seeds = build_posture_seeds(stand_q17)
     r = evaluate_static_pose(
-        coupled, scratch, env.model, env._object_body_id, CANDIDATE_C1, seeds[0], left_t, right_t,
-        finger_qpos_adr=finger_adr, finger_open_targets=finger_targets,
+        coupled, scratch, env.model, env._object_body_id, obj_pos, identity_quat, CANDIDATE_C1, seeds[0], left_t, right_t,
+        left_offsets, right_offsets, finger_qpos_adr=finger_adr, finger_open_targets=finger_targets,
     )
     assert not r.collision_free, "zero standoff must be detected as a collision, not passed silently"
     assert not r.success
@@ -203,50 +214,96 @@ def test_collision_candidate_is_rejected_not_silently_passed():
 # Cartesian error (Section 5: "단순 Cartesian error만 가장 낮은 후보를
 # 고르지 마라").
 # ---------------------------------------------------------------------
-def test_score_result_prioritizes_collision_and_joint_limit_over_raw_error():
+def _make_feasibility_result(**overrides):
     from humanoid_learning.expert.diagonal_feasibility import FeasibilityResult
-    good_but_far = FeasibilityResult(
+    defaults = dict(
         candidate="C1", seed_name="a", success=False,
-        left_pos_error=0.20, left_ori_error=0.20, right_pos_error=0.20, right_ori_error=0.20,
-        joint_limit_margin=0.05, collision_free=True, collision_pairs=[],
+        left_pos_error=0.0, left_ori_error=0.0, right_pos_error=0.0, right_ori_error=0.0,
+        joint_limit_margin=0.05, wrist_yaw_margin=0.05, elbow_margin=0.05,
+        collision_free=True, collision_pairs=[],
         left_target_face_thumb="FACE_POS_X", left_target_face_finger="FACE_POS_Y",
         right_target_face_thumb="FACE_NEG_X", right_target_face_finger="FACE_NEG_Y",
-        q17=np.zeros(17), iterations=10,
+        left_thumb_face_actual="FACE_POS_X", left_finger_face_actual="FACE_POS_Y",
+        right_thumb_face_actual="FACE_NEG_X", right_finger_face_actual="FACE_NEG_Y",
+        face_assignment_satisfied=True,
+        q17=np.zeros(17), corner_yaw_deg=(45.0, 45.0), iterations=10,
     )
-    close_but_colliding = FeasibilityResult(
-        candidate="C1", seed_name="b", success=False,
-        left_pos_error=0.001, left_ori_error=0.001, right_pos_error=0.001, right_ori_error=0.001,
-        joint_limit_margin=0.05, collision_free=False, collision_pairs=[("a", "b")],
-        left_target_face_thumb="FACE_POS_X", left_target_face_finger="FACE_POS_Y",
-        right_target_face_thumb="FACE_NEG_X", right_target_face_finger="FACE_NEG_Y",
-        q17=np.zeros(17), iterations=10,
+    defaults.update(overrides)
+    return FeasibilityResult(**defaults)
+
+
+def test_score_result_prioritizes_collision_and_joint_limit_over_raw_error():
+    good_but_far = _make_feasibility_result(left_pos_error=0.20, right_pos_error=0.20, left_ori_error=0.20, right_ori_error=0.20)
+    close_but_colliding = _make_feasibility_result(
+        left_pos_error=0.001, right_pos_error=0.001, left_ori_error=0.001, right_ori_error=0.001,
+        collision_free=False, collision_pairs=[("a", "b")], success=False,
     )
     assert score_result(good_but_far) < score_result(close_but_colliding)
 
 
+def test_score_result_rejects_face_assignment_failure_over_raw_error():
+    """Section 2's real success criterion: a candidate with tiny position/
+    orientation error but WRONG fingertip faces (e.g. the solver drifted
+    to a locally-close but geometrically wrong pose) must score worse
+    than one with larger error but correct face assignment."""
+    correct_faces_but_farther = _make_feasibility_result(left_pos_error=0.03, right_pos_error=0.03)
+    tiny_error_wrong_faces = _make_feasibility_result(
+        left_pos_error=0.001, right_pos_error=0.001,
+        face_assignment_satisfied=False, left_thumb_face_actual="FACE_NEG_Y", success=False,
+    )
+    assert score_result(correct_faces_but_farther) < score_result(tiny_error_wrong_faces)
+
+
+def test_score_result_rejects_one_sided_convergence():
+    """Section 12: "한 손만 잘 수렴하고 다른 손이 limit에 걸린 후보는
+    탈락시킨다" -- an excellent-left/terrible-right candidate must not
+    outscore a mediocre-but-balanced one, i.e. scoring must use the
+    WORSE hand, not the average."""
+    balanced = _make_feasibility_result(left_pos_error=0.025, right_pos_error=0.025)
+    one_sided = _make_feasibility_result(left_pos_error=0.001, right_pos_error=0.15, success=False)
+    assert score_result(balanced) < score_result(one_sided)
+
+
 # ---------------------------------------------------------------------
-# Section 14, item 13 / Section 17: the actual static feasibility
-# verdict. THIS TEST DOCUMENTS A REAL, MEASURED NEGATIVE RESULT -- see
-# PROJECT_CONTEXT.md's 21st-session report for the full systematic sweep
-# (2 candidates x 10 posture families x 5-10 standoffs = up to 100
-# attempts). It is intentionally left FAILING (not adjusted to pass) per
-# project convention: no candidate achieved simultaneous (a) sub-2cm/
-# sub-15-degree convergence for BOTH hands, (b) collision-free contact,
-# and (c) >=0.02 joint-limit margin. The binding constraint found in
-# EVERY attempt across the wider sweep was the "far corner" hand's
-# wrist_yaw joint pinned exactly at its physical limit (+/-1.614 rad)
-# with elbow also near its limit -- a genuine, reproducible mechanical
-# reach/orientation constraint, not a solver artifact (verified: the
-# EASY-side hand in every candidate converges to <1cm/<5-degree with
-# healthy margin using the exact same solver/tolerances).
+# New this session: corner_yaw_deg interpolation and candidate-specific
+# posture seeds.
 # ---------------------------------------------------------------------
-def test_static_feasibility_search_size12_diagonal_corner():
+def test_corner_direction_local_at_yaw_interpolates_from_finger_face_to_bisector():
+    d0 = corner_direction_local_at_yaw(CANDIDATE_C1.left, 0.0)
+    np.testing.assert_allclose(d0, FACE_NORMALS_LOCAL["FACE_POS_Y"], atol=1e-6)
+    d45 = corner_direction_local_at_yaw(CANDIDATE_C1.left, 45.0)
+    np.testing.assert_allclose(d45, corner_direction_local(CANDIDATE_C1.left), atol=1e-6)
+    d20 = corner_direction_local_at_yaw(CANDIDATE_C1.left, 20.0)
+    # strictly between the two endpoints, not equal to either
+    assert not np.allclose(d20, d0, atol=1e-3) and not np.allclose(d20, d45, atol=1e-3)
+
+
+def test_candidate_specific_seeds_target_the_known_hard_hand():
+    stand_q17 = np.zeros(17)
+    c1_seeds = build_candidate_specific_seeds("C1", stand_q17)
+    c2_seeds = build_candidate_specific_seeds("C2", stand_q17)
+    assert len(c1_seeds) >= 1 and len(c2_seeds) >= 1
+    # C1's seed perturbs the LEFT arm's block (indices 3-9), C2's the RIGHT (10-16).
+    assert np.any(c1_seeds[0].q17[3:10] != 0.0)
+    assert np.any(c2_seeds[0].q17[10:17] != 0.0)
+
+
+# ---------------------------------------------------------------------
+# Section 15, item 1: the 21st-session 45-degree-forced baseline is
+# PRESERVED here (not deleted), still reproducing its own negative
+# result, so the Contact-Driven session's own result can be compared
+# against it directly. ori_task_weight=1.0/require_orientation=True and
+# wrist_yaw_rest_gain_boost=0.0 exactly reproduce that session's
+# behavior through the now-shared evaluate_static_pose.
+# ---------------------------------------------------------------------
+def test_static_feasibility_45deg_forced_orientation_baseline_size12():
     env = _make_solver_env()
     coupled, stand_q17 = _build_coupled_ik(env)
     seeds = build_posture_seeds(stand_q17)
     obj_pos = env.data.qpos[env._object_qpos_adr:env._object_qpos_adr + 3].copy()
     obj_quat = env.data.qpos[env._object_qpos_adr + 3:env._object_qpos_adr + 7].copy()
     finger_adr, finger_targets = _finger_open_targets(env)
+    left_offsets, right_offsets = _finger_offsets(env)
     scratch = mujoco.MjData(env.model)
 
     results = []
@@ -258,30 +315,124 @@ def test_static_feasibility_search_size12_diagonal_corner():
                 scratch.qpos[:] = env.data.qpos
                 scratch.qvel[:] = 0.0
                 r = evaluate_static_pose(
-                    coupled, scratch, env.model, env._object_body_id, candidate, seed, left_t, right_t,
-                    finger_qpos_adr=finger_adr, finger_open_targets=finger_targets,
+                    coupled, scratch, env.model, env._object_body_id, obj_pos, obj_quat, candidate, seed, left_t, right_t,
+                    left_offsets, right_offsets, finger_qpos_adr=finger_adr, finger_open_targets=finger_targets,
+                    ori_task_weight=1.0, require_orientation=True, wrist_yaw_rest_gain_boost=0.0,
                 )
                 results.append((standoff, r))
 
     results.sort(key=lambda sr: score_result(sr[1]))
     best_standoff, best = results[0]
     print(
-        f"    best candidate={best.candidate} seed={best.seed_name} standoff={best_standoff} "
-        f"collision_free={best.collision_free} joint_limit_margin={best.joint_limit_margin:.4f} "
+        f"    [45deg baseline] best candidate={best.candidate} seed={best.seed_name} standoff={best_standoff} "
+        f"wrist_yaw_margin={best.wrist_yaw_margin:.4f} elbow_margin={best.elbow_margin:.4f} "
         f"Lpos={best.left_pos_error:.4f} Rpos={best.right_pos_error:.4f} "
-        f"Lori={best.left_ori_error:.4f} Rori={best.right_ori_error:.4f}"
+        f"Lori={best.left_ori_error:.4f} Rori={best.right_ori_error:.4f} face_ok={best.face_assignment_satisfied}"
     )
     n_success = sum(1 for _, r in results if r.success)
-    print(f"    {n_success} / {len(results)} attempts fully succeeded (collision-free + joint-limit-safe + converged)")
-    assert best.left_pos_error < 0.02 and best.right_pos_error < 0.02, (
-        "Gate A (position component of the static pose) FAILED: even the best-scored candidate "
-        f"has position error Lpos={best.left_pos_error:.4f} Rpos={best.right_pos_error:.4f} (need < 0.02m each) -- "
-        "see PROJECT_CONTEXT.md for the joint-limit root cause (wrist_yaw/elbow saturation on the far-corner hand)."
+    print(f"    {n_success} / {len(results)} attempts fully succeeded")
+    assert best.wrist_yaw_margin >= 0.02, (
+        "45-degree-forced baseline Gate FAILED (expected -- this documents the prior session's finding): "
+        f"wrist_yaw_margin={best.wrist_yaw_margin:.4f} < 0.02 even for the best-scored candidate. "
+        "See PROJECT_CONTEXT.md 21st/22nd-session reports."
     )
-    assert best.left_ori_error < 0.1 and best.right_ori_error < 0.1, (
-        "Gate A (orientation component of the static pose) FAILED: even the best-scored candidate "
-        f"has orientation error Lori={best.left_ori_error:.4f} Rori={best.right_ori_error:.4f} rad (need < 0.1 rad each) -- "
-        "see PROJECT_CONTEXT.md for the joint-limit root cause (wrist_yaw/elbow saturation on the far-corner hand)."
+
+
+# ---------------------------------------------------------------------
+# Stage U (this session): contact-driven orientation -- corner_yaw swept
+# 10-45 degrees INDEPENDENTLY per hand, soft orientation task, explicit
+# wrist_yaw rest_gain boost, candidate-specific posture seeds added, and
+# real success measured by FINGERTIP FACE ASSIGNMENT (Section 2), not by
+# hitting an exact palm angle. Coarse-to-fine (Section 6): a coarse
+# symmetric-angle x standoff x posture-family pass, then a fine pass
+# with INDEPENDENT left/right angles around the best coarse region.
+# ---------------------------------------------------------------------
+def test_stage_u_contact_driven_four_face_feasibility_size12():
+    env = _make_solver_env()
+    coupled, stand_q17 = _build_coupled_ik(env)
+    seeds = build_posture_seeds(stand_q17)
+    obj_pos = env.data.qpos[env._object_qpos_adr:env._object_qpos_adr + 3].copy()
+    obj_quat = env.data.qpos[env._object_qpos_adr + 3:env._object_qpos_adr + 7].copy()
+    finger_adr, finger_targets = _finger_open_targets(env)
+    left_offsets, right_offsets = _finger_offsets(env)
+    scratch = mujoco.MjData(env.model)
+
+    def solve_one(candidate, seed, yaw_l, yaw_r, standoff):
+        left_t = hand_corner_target(obj_pos, obj_quat, SIZE_12_HALF, candidate.left, palm_standoff=standoff, corner_yaw_deg=yaw_l)
+        right_t = hand_corner_target(obj_pos, obj_quat, SIZE_12_HALF, candidate.right, palm_standoff=standoff, corner_yaw_deg=yaw_r)
+        scratch.qpos[:] = env.data.qpos
+        scratch.qvel[:] = 0.0
+        return evaluate_static_pose(
+            coupled, scratch, env.model, env._object_body_id, obj_pos, obj_quat, candidate, seed, left_t, right_t,
+            left_offsets, right_offsets, finger_qpos_adr=finger_adr, finger_open_targets=finger_targets,
+            corner_yaw_deg=(yaw_l, yaw_r),
+        )
+
+    # --- coarse pass: symmetric angle, both candidates, all generic +
+    # candidate-specific seeds, a few standoffs.
+    coarse_results = []
+    n_coarse_attempts = 0
+    for candidate in (CANDIDATE_C1, CANDIDATE_C2):
+        all_seeds = seeds + build_candidate_specific_seeds(candidate.name, stand_q17)
+        for yaw in (15.0, 25.0, 35.0, 45.0):
+            for standoff in (0.16, 0.20):
+                for seed in all_seeds:
+                    r = solve_one(candidate, seed, yaw, yaw, standoff)
+                    coarse_results.append((standoff, r))
+                    n_coarse_attempts += 1
+
+    coarse_results.sort(key=lambda sr: score_result(sr[1]))
+    best_coarse_standoff, best_coarse = coarse_results[0]
+    print(
+        f"    [Stage U coarse] {n_coarse_attempts} attempts; best candidate={best_coarse.candidate} "
+        f"seed={best_coarse.seed_name} yaw={best_coarse.corner_yaw_deg} standoff={best_coarse_standoff} "
+        f"face_ok={best_coarse.face_assignment_satisfied} collision_free={best_coarse.collision_free} "
+        f"wrist_yaw_margin={best_coarse.wrist_yaw_margin:.4f} elbow_margin={best_coarse.elbow_margin:.4f} "
+        f"Lpos={best_coarse.left_pos_error:.4f} Rpos={best_coarse.right_pos_error:.4f}"
+    )
+
+    # --- fine pass: independent left/right angles around the coarse
+    # winner's angle, same candidate/seed/standoff.
+    base_yaw = best_coarse.corner_yaw_deg[0]
+    fine_angles = sorted({max(10.0, base_yaw - 10.0), base_yaw, min(45.0, base_yaw + 10.0)})
+    fine_results = []
+    for yaw_l in fine_angles:
+        for yaw_r in fine_angles:
+            r = solve_one(
+                CANDIDATE_C1 if best_coarse.candidate == "C1" else CANDIDATE_C2,
+                next(s for s in (seeds + build_candidate_specific_seeds(best_coarse.candidate, stand_q17)) if s.name == best_coarse.seed_name),
+                yaw_l, yaw_r, best_coarse_standoff,
+            )
+            fine_results.append(r)
+    fine_results.sort(key=score_result)
+    best_fine = fine_results[0]
+    print(
+        f"    [Stage U fine] {len(fine_results)} attempts around yaw={base_yaw}; best yaw={best_fine.corner_yaw_deg} "
+        f"face_ok={best_fine.face_assignment_satisfied} collision_free={best_fine.collision_free} "
+        f"wrist_yaw_margin={best_fine.wrist_yaw_margin:.4f} elbow_margin={best_fine.elbow_margin:.4f} "
+        f"Lpos={best_fine.left_pos_error:.4f} Rpos={best_fine.right_pos_error:.4f} "
+        f"actual_faces=(L:{best_fine.left_thumb_face_actual}/{best_fine.left_finger_face_actual}, "
+        f"R:{best_fine.right_thumb_face_actual}/{best_fine.right_finger_face_actual})"
+    )
+
+    overall_best = min(coarse_results[0][1], best_fine, key=score_result)
+    n_success_coarse = sum(1 for _, r in coarse_results if r.success)
+    n_success_fine = sum(1 for r in fine_results if r.success)
+    print(f"    total Stage U attempts={n_coarse_attempts + len(fine_results)}, "
+          f"fully succeeded={n_success_coarse + n_success_fine}")
+
+    # Real Stage U success criterion (Section 7): face assignment
+    # satisfied, collision-free, AND a healthy wrist_yaw/elbow margin --
+    # NOT a hard-coded palm-orientation check.
+    assert overall_best.face_assignment_satisfied, (
+        "Stage U FAILED: even the best contact-driven candidate does not achieve the intended "
+        f"fingertip-face assignment (got L:{overall_best.left_thumb_face_actual}/{overall_best.left_finger_face_actual}, "
+        f"R:{overall_best.right_thumb_face_actual}/{overall_best.right_finger_face_actual})."
+    )
+    assert overall_best.collision_free, "Stage U FAILED: best candidate still collides."
+    assert overall_best.wrist_yaw_margin >= 0.02 and overall_best.elbow_margin >= 0.02, (
+        f"Stage U FAILED: wrist_yaw_margin={overall_best.wrist_yaw_margin:.4f} / "
+        f"elbow_margin={overall_best.elbow_margin:.4f}, need >= 0.02 each."
     )
 
 
