@@ -424,6 +424,44 @@ class GraspExpertConfig:
     # conditions (any-finger bilateral vs genuine thumb+opposing-finger
     # tripod) and may need to diverge later.
     tripod_settle_stable_steps: int = 30
+    # Phase-specific thumb_1 poses (Thumb Opposition + Claw-Style Bimanual
+    # Grasp session, interactive-viewer follow-up): thumb_1 has THREE
+    # distinct required poses that a single 2-point (open,close) synergy
+    # interpolation cannot represent -- TRANSPORT/REST (whole_body_
+    # config.py's own open target, self-collision-safe, used everywhere
+    # by default including STABLE_START/NATURAL_ARM_LIFT), GRASP_ABDUCT
+    # (this field -- full kinematic clearance, applied ONLY from
+    # THUMB_ABDUCT through just before THUMB_OPPOSE, once the arm has
+    # already left the body), and opposed/CLOSE (whole_body_config.py's
+    # own close target, used during THUMB_OPPOSE). Applying GRASP_ABDUCT
+    # globally (as a same-day config default) was tried and reverted: it
+    # fixed the real clearance problem but made the self-collision-prone
+    # pose the default REST pose everywhere, which is a strictly worse
+    # trade -- see whole_body_config.py's LEFT/RIGHT_HAND_SYNERGY_TARGETS
+    # comment. Values are thumb_1's own measured kinematic range extremes
+    # (left range=[-0.724312, 1.0472], right range=[-1.0472, 0.724312]).
+    thumb1_abduct_pose_left: float = -0.724312
+    thumb1_abduct_pose_right: float = 0.724312
+    # thumb_0 DETOUR pose, used ONLY transiently while thumb_1 crosses its
+    # own narrow collision band (see below) -- direct 2D sweep at the
+    # live grasp configuration found thumb_1's abduct transit clips
+    # SIZE_12's larger object across roughly q1 in [0.25, 0.45] (LEFT
+    # sign convention) UNLESS thumb_0 first swings to its own range
+    # extreme (+/-1.0472, well outside thumb_0's normal OPEN/CLOSE table
+    # of 0.0/+-0.6) to route the thumb's arc around the object. thumb_1
+    # only starts its own ramp once thumb_0 has already crossed
+    # thumb0_detour_threshold, so the detour is always in place before
+    # the danger band is entered.
+    thumb0_detour_pose_left: float = -1.0472
+    thumb0_detour_pose_right: float = -1.0472
+    thumb0_detour_threshold: float = -0.8
+    # Rate limit (rad/step) for the direct thumb_0/thumb_1 override ramps
+    # below -- matches this controller's general "finger target rate
+    # limit" principle (Section: Index/middle acquisition), not an
+    # instant snap. thumb_0 ramps faster since it must lead thumb_1's
+    # detour, not merely match it.
+    thumb0_override_rate: float = 0.1
+    thumb1_override_rate: float = 0.05
     # Section 7: object must not be actively perturbed for a state to
     # accept a transition into finger closing/lifting.
     max_object_speed_for_transition: float = 0.05  # m/s
@@ -600,6 +638,18 @@ class BimanualSidePinchExpert:
         # contact point.
         self._left_fingertip_offset_local = self._measure_fingertip_grasp_offset("left")
         self._right_fingertip_offset_local = self._measure_fingertip_grasp_offset("right")
+
+        # Phase-specific thumb_0/thumb_1 direct override (see
+        # GraspExpertConfig.thumb0/1_*_pose_* and env.thumb0/1_ctrl_
+        # override_*).
+        self._left_thumb1_transport_pose = wbc.LEFT_HAND_SYNERGY_TARGETS[1][1]
+        self._right_thumb1_transport_pose = wbc.RIGHT_HAND_SYNERGY_TARGETS[1][1]
+        self._left_thumb1_ramp = self._left_thumb1_transport_pose
+        self._right_thumb1_ramp = self._right_thumb1_transport_pose
+        self._left_thumb0_transport_pose = wbc.LEFT_HAND_SYNERGY_TARGETS[0][1]
+        self._right_thumb0_transport_pose = wbc.RIGHT_HAND_SYNERGY_TARGETS[0][1]
+        self._left_thumb0_ramp = self._left_thumb0_transport_pose
+        self._right_thumb0_ramp = self._right_thumb0_transport_pose
 
         self._coupled_traj: _MinJerkJointTrajectory | None = None  # None = not tracking a coupled trajectory
         self._coupled_last_result: CoupledIKResult | None = None
@@ -908,6 +958,95 @@ class BimanualSidePinchExpert:
         be individually rewritten for 3 groups."""
         self.left_desired_synergy = float(self.left_group_synergy.mean())
         self.right_desired_synergy = float(self.right_group_synergy.mean())
+
+    # States where thumb_1 stays on the normal TRANSPORT/REST<->CLOSE
+    # group-synergy pipeline (whole_body_config.py's own OPEN/CLOSE table)
+    # -- everything else (THUMB_ABDUCT onward) uses the phase-specific
+    # direct override below instead.
+    _THUMB1_NO_OVERRIDE_STATES = (
+        GraspState.STABLE_START, GraspState.NATURAL_ARM_LIFT, GraspState.FOREARM_LATERAL_APPROACH,
+        GraspState.FOREARM_DESCEND, GraspState.WRIST_ALIGN, GraspState.FINGER_PRESHAPE,
+        GraspState.FAILURE, GraspState.SUCCESS,
+    )
+
+    def _update_thumb1_override(self) -> None:
+        """Sets env.thumb0/1_ctrl_override_left/right BEFORE env.step()
+        (Thumb Opposition + Claw-Style Bimanual Grasp session, Section:
+        phase-specific thumb pose separation). Writing to env.data.ctrl
+        AFTER env.step() does NOT work -- env.step() unconditionally
+        recomputes the whole thumb group's ctrl from the group synergy
+        scalar every call, so a post-hoc write gets wiped before the next
+        physics step ever uses it (measured directly: had zero effect,
+        thumb kept touching early exactly as before this override
+        existed). env.thumb0/1_ctrl_override_* is the correct hook -- see
+        grasp_env.py's reset()/step() -- applied by env.step() itself
+        AFTER the group loop, so it wins for these two joints every step.
+
+        thumb_0 DETOUR (config.thumb0_detour_pose_*): a direct 2D sweep
+        at the live grasp configuration found thumb_1's straight-line
+        transit toward its abduct pose clips SIZE_12's larger object
+        across a narrow band of its own range UNLESS thumb_0 first swings
+        to its own range extreme to route the arc around the object.
+        thumb_0 ramps toward this detour pose FIRST and STAYS there for
+        the remainder of the grasp attempt (it does not return to its own
+        normal CLOSE value -- committing to opposing whichever finger
+        that extreme faces, index or middle, both allowed per spec);
+        thumb_1 does not start moving until thumb_0 has already crossed
+        config.thumb0_detour_threshold, guaranteeing the detour is in
+        place before the danger band is ever entered.
+
+        thumb_1 drives the actual open<->close motion: GRASP_ABDUCT pose
+        (config.thumb1_abduct_pose_*) from THUMB_ABDUCT onward,
+        interpolating toward the CLOSE pose as THUMB_OPPOSE's own
+        per-group force regulation (already applied to left/right_
+        group_synergy[0] in that state's block) advances, so thumb_1
+        continues smoothly from wherever it was rather than snapping back
+        through the TRANSPORT pose. Before THUMB_ABDUCT, both overrides
+        are cleared (None) so the thumb group's normal TRANSPORT/REST<->
+        CLOSE synergy interpolation (whole_body_config.py's own table)
+        drives both joints -- correct for STABLE_START..FINGER_PRESHAPE,
+        where thumb should just sit at the safe REST pose. Both ramps are
+        rate-limited (Section: Index/middle acquisition's "finger target
+        rate limit" principle) -- never an instant jump."""
+        cfg = self.config
+        override_active = self.state not in self._THUMB1_NO_OVERRIDE_STATES
+        if override_active:
+            rate0 = cfg.thumb0_override_rate
+            self._left_thumb0_ramp += np.clip(cfg.thumb0_detour_pose_left - self._left_thumb0_ramp, -rate0, rate0)
+            self._right_thumb0_ramp += np.clip(cfg.thumb0_detour_pose_right - self._right_thumb0_ramp, -rate0, rate0)
+            self.env.thumb0_ctrl_override_left = self._left_thumb0_ramp
+            self.env.thumb0_ctrl_override_right = self._right_thumb0_ramp
+
+            left_close = wbc.LEFT_HAND_SYNERGY_TARGETS[1][2]
+            right_close = wbc.RIGHT_HAND_SYNERGY_TARGETS[1][2]
+            t_l = float(np.clip(self.left_group_synergy[0], 0.0, 1.0))
+            t_r = float(np.clip(self.right_group_synergy[0], 0.0, 1.0))
+            left_goal = cfg.thumb1_abduct_pose_left + t_l * (left_close - cfg.thumb1_abduct_pose_left)
+            right_goal = cfg.thumb1_abduct_pose_right + t_r * (right_close - cfg.thumb1_abduct_pose_right)
+            rate1 = cfg.thumb1_override_rate
+            left_detour_ready = self._left_thumb0_ramp <= cfg.thumb0_detour_threshold
+            right_detour_ready = self._right_thumb0_ramp <= cfg.thumb0_detour_threshold
+            if left_detour_ready:
+                self._left_thumb1_ramp += np.clip(left_goal - self._left_thumb1_ramp, -rate1, rate1)
+            if right_detour_ready:
+                self._right_thumb1_ramp += np.clip(right_goal - self._right_thumb1_ramp, -rate1, rate1)
+            self.env.thumb1_ctrl_override_left = self._left_thumb1_ramp
+            self.env.thumb1_ctrl_override_right = self._right_thumb1_ramp
+        else:
+            # Not yet in the grasp-specific abduct phase -- track the
+            # TRANSPORT pose so both ramps start from the right place the
+            # instant THUMB_ABDUCT begins, but clear both overrides so
+            # env.step()'s own group-synergy pipeline actually drives the
+            # actuators (it already targets these same safe poses at
+            # synergy 0).
+            self._left_thumb1_ramp = self._left_thumb1_transport_pose
+            self._right_thumb1_ramp = self._right_thumb1_transport_pose
+            self._left_thumb0_ramp = self._left_thumb0_transport_pose
+            self._right_thumb0_ramp = self._right_thumb0_transport_pose
+            self.env.thumb1_ctrl_override_left = None
+            self.env.thumb1_ctrl_override_right = None
+            self.env.thumb0_ctrl_override_left = None
+            self.env.thumb0_ctrl_override_right = None
 
     @staticmethod
     def _group_force_raw(contact: HandContact) -> np.ndarray:
@@ -2589,6 +2728,7 @@ class BimanualSidePinchExpert:
             )
 
         if self.state not in (GraspState.SUCCESS, GraspState.FAILURE):
+            self._update_thumb1_override()
             qpos_before = self.env.data.qpos[self.env._arm_qpos_adr].copy()
             self.env.step(a)
             qpos_after = self.env.data.qpos[self.env._arm_qpos_adr].copy()

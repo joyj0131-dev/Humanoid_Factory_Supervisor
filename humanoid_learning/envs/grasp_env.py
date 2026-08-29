@@ -201,6 +201,24 @@ class FixedBaseGraspEnv(gym.Env):
         self._hand_group_synergy = np.zeros(N_HAND_GROUPS, dtype=np.float64)
         self._step_count = 0
         self._contact_streak = 0
+        # Thumb Opposition + Claw-Style Bimanual Grasp session: thumb_1
+        # needs a THIRD pose (full-clearance abduct) distinct from the
+        # thumb group's own TRANSPORT/REST<->CLOSE synergy interpolation
+        # that the other 2 joints in its group (thumb_0, thumb_2) still
+        # use -- a single group scalar cannot represent that on its own.
+        # None means "no override, use the group synergy value normally";
+        # set by the caller (grasp_expert.py) to directly command just
+        # this one joint's ctrl each step, bypassing the group's own
+        # open/close table for it specifically.
+        self.thumb1_ctrl_override_left: float | None = None
+        self.thumb1_ctrl_override_right: float | None = None
+        # thumb_0 needs the same treatment: direct measurement found
+        # thumb_1's abduct transit clips the (larger, SIZE_12) object at
+        # a narrow band around its own mid-range unless thumb_0 first
+        # swings to ITS OWN range extreme to route around it -- thumb_0's
+        # own OPEN/CLOSE table (0.0/+-0.6) never reaches that extreme.
+        self.thumb0_ctrl_override_left: float | None = None
+        self.thumb0_ctrl_override_right: float | None = None
 
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs(), self._get_info()
@@ -238,6 +256,17 @@ class FixedBaseGraspEnv(gym.Env):
             self.data.ctrl[self._right_group_act_ids[g]] = hand_synergy.synergy_to_targets(
                 self._hand_group_synergy[3 + g], _RIGHT_GROUP_TARGETS[g]
             )
+        # thumb_1 direct override (see reset()'s comment) -- applied AFTER
+        # the group loop above so it wins over the group-synergy value for
+        # this one joint specifically, every step, before physics runs.
+        if self.thumb1_ctrl_override_left is not None:
+            self.data.ctrl[self._left_group_act_ids[0][1]] = self.thumb1_ctrl_override_left
+        if self.thumb1_ctrl_override_right is not None:
+            self.data.ctrl[self._right_group_act_ids[0][1]] = self.thumb1_ctrl_override_right
+        if self.thumb0_ctrl_override_left is not None:
+            self.data.ctrl[self._left_group_act_ids[0][0]] = self.thumb0_ctrl_override_left
+        if self.thumb0_ctrl_override_right is not None:
+            self.data.ctrl[self._right_group_act_ids[0][0]] = self.thumb0_ctrl_override_right
 
         for _ in range(self.config.frame_skip):
             mujoco.mj_step(self.model, self.data)

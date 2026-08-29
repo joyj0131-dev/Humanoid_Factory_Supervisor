@@ -157,23 +157,42 @@ STAND_KEYFRAME = tc.STAND_KEYFRAME  # "stand": pelvis (0,0,0.79) identity quat, 
 # mode: the single largest lever for thumb opposition distance was pinned
 # permanently at one partially-closed value.
 #
-# OPEN chosen as +0.45 (left) / -0.45 (right), NOT thumb_1's raw kinematic
-# range extreme (+/-0.724312): a direct self-collision sweep at the
-# model's STAND/rest arm pose found the joint's full range from its close
-# value down to about +/-0.30 penetrates the hip/leg by up to 3.8cm
-# (thumb_2_link vs hip_pitch_link) -- the raw extreme is NOT a safe choice
-# independent of arm pose. +/-0.40 through the close value stays at the
-# same benign ~0.0003m contact level present at every other tested value
-# (an existing, harmless soft-constraint touch against the wrist, not a
-# real penetration); +/-0.45 keeps a small margin inside that safe band
-# while still recovering a genuine ~35 degree abduction swing versus the
-# old, entirely frozen joint.
+# OPEN is the TRANSPORT/REST pose (+0.45 left / -0.45 right), NOT
+# thumb_1's raw kinematic range extreme (-0.724312/+0.724312) -- REVERTED
+# back from a same-day attempt to widen this GLOBALLY (Thumb Opposition +
+# Claw-Style Bimanual Grasp session, interactive-viewer follow-up,
+# 2026-08-29). That attempt DID fix a real problem (thumb reaching the
+# object at the same depth as index/middle, since +0.45 alone isn't
+# enough clearance) but widening it HERE made it the default REST/
+# TRANSPORT pose everywhere (WholeBodyEnv, any non-grasp-expert synergy
+# usage, and this env's own STABLE_START), which self-collides with the
+# hip at the STAND arm pose (~3.8cm thumb_2_link/hip_pitch_link
+# penetration, confirmed directly) and broke an unrelated low-level IK
+# test that holds the arm near the body. That was a genuine REST-pose
+# regression, not a test-fixture bug -- per project policy this is fixed
+# at the source (this table stays the safe TRANSPORT/REST pose) rather
+# than by loosening the test. The full-clearance abduct pose thumb needs
+# during an actual grasp attempt is instead applied by
+# grasp_expert.py as a PHASE-SPECIFIC direct actuator override (see
+# BimanualSidePinchExpert's THUMB_ABDUCT/THUMB_OPPOSE handling and
+# GraspExpertConfig.thumb1_abduct_pose_left/right) -- active only from
+# THUMB_ABDUCT (after the arm has already left the body and WRIST_ALIGN
+# is done) through just before THUMB_OPPOSE closes it again, never as
+# this module's own default.
+#
+# thumb_1 joint facts (measured directly, both hands, 2026-08-29):
+#   left_hand_thumb_1_joint:  axis=local Z, range=[-0.724312, +1.0472]
+#   right_hand_thumb_1_joint: axis=local Z, range=[-1.0472, +0.724312]
+#   Mirrored as expected (right's range is left's negated and swapped).
+#   Increasing left's value (toward +1.0472) / decreasing right's value
+#   (toward -1.0472) moves the thumb CLOSER to index/middle (opposition);
+#   the opposite bound on each side is the furthest/most-abducted point.
 # ---------------------------------------------------------------------------
 
 # (joint_name, open_rad, close_rad) -- order matches LEFT/RIGHT_HAND_JOINTS.
 LEFT_HAND_SYNERGY_TARGETS = [
     ("left_hand_thumb_0_joint", 0.0, 0.6),  # lateral swing: neutral -> biased toward middle finger
-    ("left_hand_thumb_1_joint", 0.45, 1.0472),  # opposition: abducted (far, self-collision-safe) -> opposed (close), range [-0.724312, 1.0472]
+    ("left_hand_thumb_1_joint", 0.45, 1.0472),  # opposition: TRANSPORT/REST (self-collision-safe) -> opposed (close), full range [-0.724312, 1.0472]
     ("left_hand_thumb_2_joint", 0.0, 1.74533),  # range [0, 1.74533]
     ("left_hand_middle_0_joint", 0.0, -1.5708),  # range [-1.5708, 0]
     ("left_hand_middle_1_joint", 0.0, -1.74533),  # range [-1.74533, 0]
@@ -182,7 +201,7 @@ LEFT_HAND_SYNERGY_TARGETS = [
 ]
 RIGHT_HAND_SYNERGY_TARGETS = [
     ("right_hand_thumb_0_joint", 0.0, -0.6),  # mirrored sign vs left
-    ("right_hand_thumb_1_joint", -0.45, -1.0472),  # mirrored: abducted (far, self-collision-safe) -> opposed (close), range [-1.0472, 0.724312]
+    ("right_hand_thumb_1_joint", -0.45, -1.0472),  # mirrored: TRANSPORT/REST (self-collision-safe) -> opposed (close), full range [-1.0472, 0.724312]
     ("right_hand_thumb_2_joint", 0.0, -1.74533),
     ("right_hand_middle_0_joint", 0.0, 1.5708),  # range [0, 1.5708]
     ("right_hand_middle_1_joint", 0.0, 1.74533),
