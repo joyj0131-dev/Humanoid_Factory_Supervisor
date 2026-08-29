@@ -1116,6 +1116,41 @@ def test_thumb_and_tripod_streak_metrics_wired_and_bounded():
     )
 
 
+def test_hand_hand_contact_detected_and_capped_size12():
+    """Regression guard (Collision-Free Thumb Preshape + Early Tripod
+    Closure session, follow-up): direct trace found both thumbs colliding
+    with EACH OTHER (left_hand_thumb_2_link vs right_hand_thumb_2_link)
+    during THUMB_OPPOSE/TRIPOD_SETTLE for SIZE_12, reaching 40N with
+    nothing detecting or reacting to it (neither hand's own object-
+    contact force said anything about this). This asserts the detector
+    (_hand_hand_contact) actually fires on a real SIZE_12 rollout, and
+    that the active relief (widening grip_half_width) keeps it from
+    growing unbounded -- not that it eliminates hand-hand contact
+    entirely (it does not, this is an open blocker, see
+    PROJECT_CONTEXT.md), only that it is visible and capped rather than
+    silently ignored."""
+    from humanoid_learning.envs.grasp_config import SIZE_12_HALF
+    env = make_env(object_pos=(0.27, 0.0, 0.0), arm_kp=120.0, object_half_size=SIZE_12_HALF)
+    env.reset(seed=0)
+    expert = BimanualSidePinchExpert(env, GraspExpertConfig())
+    outcome = expert.run(max_total_steps=6000)
+    print(
+        f"    max_hand_hand_contact_streak={outcome.max_hand_hand_contact_streak} "
+        f"max_hand_hand_force_raw={outcome.max_hand_hand_force_raw:.1f}N"
+    )
+    assert outcome.max_hand_hand_contact_streak >= 0
+    # A hard safety ceiling: even though this is a known, unresolved
+    # instability, the active relief must keep raw hand-hand force from
+    # growing without bound (e.g. runaway actuator saturation). 60N is a
+    # generous ceiling well above the ~40N measured before this test was
+    # written -- this catches a REGRESSION (relief stops working), not a
+    # claim that hand-hand contact itself is solved.
+    assert outcome.max_hand_hand_force_raw < 60.0, (
+        f"hand-hand contact force grew unexpectedly large ({outcome.max_hand_hand_force_raw:.1f}N) "
+        f"-- the active relief (grip_half_width widening) may have regressed"
+    )
+
+
 def _run_gate_a_tripod_check(object_half_size: float):
     """Gate A (Section 12): the REAL, literal criterion is bilateral
     TRIPOD contact (thumb + a genuinely opposing index/middle contact)

@@ -542,6 +542,8 @@ class GraspOutcome:
     right_opposing_normal_score: float
     left_thumb_contact_separation: float
     right_thumb_contact_separation: float
+    max_hand_hand_contact_streak: int
+    max_hand_hand_force_raw: float
     left_first_finger_contact_step: int | None
     right_first_finger_contact_step: int | None
     bilateral_first_finger_contact_step: int | None
@@ -656,6 +658,11 @@ class BimanualSidePinchExpert:
         self._left_thumb1_ramp = self._left_thumb1_transport_pose
         self._right_thumb1_ramp = self._right_thumb1_transport_pose
         self._thumb_clearance_streak = 0
+        self.hand_hand_touched = False
+        self.hand_hand_force_raw = 0.0
+        self.max_hand_hand_force_raw = 0.0
+        self._hand_hand_streak = 0
+        self.max_hand_hand_contact_streak = 0
 
         self._coupled_traj: _MinJerkJointTrajectory | None = None  # None = not tracking a coupled trajectory
         self._coupled_last_result: CoupledIKResult | None = None
@@ -1193,6 +1200,38 @@ class BimanualSidePinchExpert:
 
         return HandContact(contact_count=contact_count, **cats)
 
+    def _hand_hand_contact(self) -> tuple[bool, float]:
+        """Direct MuJoCo contact scan for LEFT-hand-vs-RIGHT-hand self
+        collision (Phase 4 -- Collision-Free Thumb Preshape + Early
+        Tripod Closure session, follow-up): found via direct trace that
+        both thumbs collide with EACH OTHER (left_hand_thumb_2_link vs
+        right_hand_thumb_2_link) during THUMB_OPPOSE/TRIPOD_SETTLE for
+        SIZE_12 -- neither hand's own _contact() (which only reports
+        contact against the OBJECT) nor any existing force regulation had
+        any awareness of this, so thumb kept closing past the point where
+        the two hands' fingers meet in the middle instead of reaching the
+        object. Returns (touched, max_resultant_force) so callers can
+        both react (stop closing further) and report it as a genuine
+        failure mode rather than silently absorbing it into the general
+        CONTACT_LOST/OBJECT_DISPLACED bucket."""
+        model, data = self.env.model, self.env.data
+        touched = False
+        max_force = 0.0
+        for i in range(data.ncon):
+            c = data.contact[i]
+            b1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom1]) or ""
+            b2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom2]) or ""
+            is_hand_hand = (b1.startswith("left_hand") and b2.startswith("right_hand")) or (
+                b2.startswith("left_hand") and b1.startswith("right_hand")
+            )
+            if not is_hand_hand:
+                continue
+            touched = True
+            force6 = np.zeros(6)
+            mujoco.mj_contactForce(model, data, i, force6)
+            max_force = max(max_force, float(np.hypot(force6[0], np.hypot(force6[1], force6[2]))))
+        return touched, max_force
+
     def _apply(
         self, left_target_pos, right_target_pos, left_group_synergy=None, right_group_synergy=None,
         null_gain: float | None = None, left_max_dq: float | None = None, right_max_dq: float | None = None,
@@ -1724,6 +1763,10 @@ class BimanualSidePinchExpert:
         self._last_left_contact, self._last_right_contact = left_c, right_c
         left_touch, left_force_raw = left_c.any_touch, left_c.max_force
         right_touch, right_force_raw = right_c.any_touch, right_c.max_force
+        self.hand_hand_touched, self.hand_hand_force_raw = self._hand_hand_contact()
+        self.max_hand_hand_force_raw = max(self.max_hand_hand_force_raw, self.hand_hand_force_raw)
+        self._hand_hand_streak = self._hand_hand_streak + 1 if self.hand_hand_touched else 0
+        self.max_hand_hand_contact_streak = max(self.max_hand_hand_contact_streak, self._hand_hand_streak)
         self.left_max_force_raw = max(self.left_max_force_raw, left_force_raw)
         self.right_max_force_raw = max(self.right_max_force_raw, right_force_raw)
 
@@ -2401,13 +2444,24 @@ class BimanualSidePinchExpert:
 
             step_size = 1.0 / cfg.finger_close_steps
             over, under = cfg.max_safe_grip_force, cfg.finger_force_limit
-            # thumb (group 0): actively ramp closed unless already over force
+            # thumb (group 0): actively ramp closed unless already over
+            # force -- OR the two hands are touching EACH OTHER (direct
+            # trace found both thumbs colliding with each other,
+            # left_hand_thumb_2_link vs right_hand_thumb_2_link, for
+            # SIZE_12 during exactly this closing motion; neither hand's
+            # own object-contact force says anything about this, so it
+            # must be checked separately). Hand-hand contact is treated
+            # the same as over-force: stop closing further (do not back
+            # off automatically -- thumb may already have a valid object
+            # contact, and retreating both would just give up a real
+            # grip over a self-collision at the wrist/edge).
+            hand_hand_blocked = self.hand_hand_touched
             for side_syn, side_force in (
                 (self.left_group_synergy, self.left_group_force_raw),
                 (self.right_group_synergy, self.right_group_force_raw),
             ):
-                if side_force[0] > over:
-                    side_syn[0] = max(0.0, side_syn[0] - step_size)
+                if side_force[0] > over or hand_hand_blocked:
+                    side_syn[0] = max(0.0, side_syn[0] - step_size) if side_force[0] > over else side_syn[0]
                 elif side_force[0] < under:
                     side_syn[0] = min(1.0, side_syn[0] + step_size)
             # index/middle (groups 1,2): gentle hold, same regulation FINGER_CLOSE uses
@@ -2420,6 +2474,18 @@ class BimanualSidePinchExpert:
                 np.where(self.right_group_force_raw[1:] < under, np.minimum(1.0, self.right_group_synergy[1:] + step_size), self.right_group_synergy[1:]),
             )
             self._sync_scalar_synergy()
+
+            # Active relief for hand-hand collision (not just capping
+            # further curl, see the comment above): widen grip_half_width
+            # -- the same lever FINGER_CLOSE/FORCE_SETTLE already use to
+            # back the whole hand away from an over-force OBJECT contact
+            # -- since both hands sit symmetrically at +/-grip_half_width
+            # from grip_center, widening it increases separation between
+            # the two hands directly. Direct measurement found hand-hand
+            # force reaching 40N with only the curl-cap in place (a real,
+            # previously invisible safety issue) -- this is the fix.
+            if self.hand_hand_touched:
+                self.grip_half_width = min(self.outside_offset, self.grip_half_width + min(0.02, 0.002 * self.hand_hand_force_raw))
 
             left_thumb_ready = left_c.thumb.touched and self.left_group_force_raw[0] < over
             right_thumb_ready = right_c.thumb.touched and self.right_group_force_raw[0] < over
@@ -2457,6 +2523,7 @@ class BimanualSidePinchExpert:
 
             fine_step = 0.5 / cfg.finger_close_steps
             over, under = cfg.max_safe_grip_force, cfg.target_grip_force
+            left_thumb_before, right_thumb_before = self.left_group_synergy[0], self.right_group_synergy[0]
             self.left_group_synergy = np.where(
                 self.left_group_force_raw > over, np.maximum(0.0, self.left_group_synergy - fine_step),
                 np.where(self.left_group_force_raw < under, np.minimum(1.0, self.left_group_synergy + fine_step), self.left_group_synergy),
@@ -2465,6 +2532,17 @@ class BimanualSidePinchExpert:
                 self.right_group_force_raw > over, np.maximum(0.0, self.right_group_synergy - fine_step),
                 np.where(self.right_group_force_raw < under, np.minimum(1.0, self.right_group_synergy + fine_step), self.right_group_synergy),
             )
+            # Hand-hand collision guard (same rationale as THUMB_OPPOSE):
+            # never let this state's force regulation keep INCREASING
+            # thumb curl once the two hands are touching each other --
+            # only allow it to hold or back off, same as an over-force
+            # reading would.
+            if self.hand_hand_touched:
+                self.left_group_synergy[0] = min(self.left_group_synergy[0], left_thumb_before)
+                self.right_group_synergy[0] = min(self.right_group_synergy[0], right_thumb_before)
+                # Active relief (see THUMB_OPPOSE's identical comment) --
+                # widen grip_half_width to increase hand-hand separation.
+                self.grip_half_width = min(self.outside_offset, self.grip_half_width + min(0.02, 0.002 * self.hand_hand_force_raw))
             self._sync_scalar_synergy()
 
             left_score, left_opp_finger, left_sep = self._opposing_normal_score(left_c)
@@ -2479,8 +2557,13 @@ class BimanualSidePinchExpert:
             # least partly toward each other, not both from the same
             # side -- see _opposing_normal_score docstring for the "같은
             # 방향에서 물체를 누름" failure mode this rules out).
-            left_tripod = left_c.thumb.touched and left_opp_finger is not None and left_score > 0.0
-            right_tripod = right_c.thumb.touched and right_opp_finger is not None and right_score > 0.0
+            # Hand-hand collision disqualifies the tripod streak entirely
+            # (Section 9: "Thumb 조기 충돌을 무시하거나 contact filter로
+            # 숨기지 마라") -- a "stable" grip that is only stable because
+            # both thumbs are jammed against each other, not the object's
+            # opposite faces, is not a genuine tripod.
+            left_tripod = left_c.thumb.touched and left_opp_finger is not None and left_score > 0.0 and not self.hand_hand_touched
+            right_tripod = right_c.thumb.touched and right_opp_finger is not None and right_score > 0.0 and not self.hand_hand_touched
             both_tripod = left_tripod and right_tripod
 
             self._left_tripod_streak = self._left_tripod_streak + 1 if left_tripod else 0
@@ -2881,6 +2964,8 @@ class BimanualSidePinchExpert:
             right_opposing_normal_score=self.right_opposing_normal_score,
             left_thumb_contact_separation=self.left_thumb_contact_separation,
             right_thumb_contact_separation=self.right_thumb_contact_separation,
+            max_hand_hand_contact_streak=self.max_hand_hand_contact_streak,
+            max_hand_hand_force_raw=self.max_hand_hand_force_raw,
             left_first_finger_contact_step=self.left_first_finger_contact_step,
             right_first_finger_contact_step=self.right_first_finger_contact_step,
             bilateral_first_finger_contact_step=self.bilateral_first_finger_contact_step,
