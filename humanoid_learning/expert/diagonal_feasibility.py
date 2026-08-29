@@ -323,6 +323,7 @@ class FeasibilityResult:
     face_assignment_satisfied: bool  # Section 2: real success criterion, not palm orientation
     q17: np.ndarray
     corner_yaw_deg: tuple[float, float]  # (left, right) -- independent per Section 2
+    waist_weight_used: float  # None (solver default, 6.0) reported as 6.0 for readability
     iterations: int
 
 
@@ -436,6 +437,7 @@ def evaluate_static_pose(
     require_orientation: bool = False,
     wrist_yaw_rest_gain_boost: float = 0.3,
     corner_yaw_deg: tuple[float, float] = (45.0, 45.0),
+    waist_weight: float | None = None,
 ) -> FeasibilityResult:
     """Runs ONE static solve (Section 2/4/5): seeds the scratch qpos AND
     the null-space rest_q from ``seed``, solves for the given corner
@@ -465,10 +467,29 @@ def evaluate_static_pose(
     finger qpos the scratch data happened to hold. Without this, a small
     palm_standoff can report an "object-finger collision" that is really
     just an artifact of unshaped fingers, not a genuine standoff/reach
-    infeasibility."""
+    infeasibility.
+
+    ``waist_weight`` (added after a user question caught a real gap):
+    ``CoupledBilateralIK`` defaults to a 6x DLS task-space penalty on the
+    waist columns (see coupled_ik.py's own docstring -- a deliberate
+    anti-overuse choice for the LIVE grasp controller). Every posture-
+    family SEED in this module biases the null-space *rest_q* toward
+    more waist rotation, but rest_q only sets where the solver is pulled
+    in the LEFTOVER null space -- it does not lower the primary task's
+    6x cost of actually moving the waist there. Passing a lower
+    ``waist_weight`` here overrides ``coupled_ik.solve``'s per-call
+    ``joint_weight`` (the solver's constructor-time default is left
+    untouched for any other caller), letting the search actually verify
+    whether genuine waist twist relieves wrist_yaw/elbow saturation, not
+    just whether a seed NEAR more waist twist does under the default 6x
+    penalty. None reproduces the solver's own default exactly."""
     coupled_ik._set_q(scratch_data, seed.q17)
     rest_gain = np.full(17, 0.15)
     rest_gain[list(_WRIST_YAW_IDX)] += wrist_yaw_rest_gain_boost
+    joint_weight = None
+    if waist_weight is not None:
+        joint_weight = coupled_ik.joint_weight.copy()
+        joint_weight[0:3] = waist_weight
     result = coupled_ik.solve(
         scratch_data,
         left_target.palm_pos, left_target.palm_R,
@@ -478,6 +499,7 @@ def evaluate_static_pose(
         ori_task_weight=ori_task_weight,
         require_orientation=require_orientation,
         limit_margin_min=limit_margin_min,
+        joint_weight=joint_weight,
     )
     q_full = np.concatenate([result.waist_q, result.left_q, result.right_q])
     coupled_ik._set_q(scratch_data, q_full)
@@ -525,7 +547,9 @@ def evaluate_static_pose(
         left_thumb_face_actual=left_thumb_face, left_finger_face_actual=left_finger_face,
         right_thumb_face_actual=right_thumb_face, right_finger_face_actual=right_finger_face,
         face_assignment_satisfied=face_ok,
-        q17=q_full, corner_yaw_deg=corner_yaw_deg, iterations=result.iterations,
+        q17=q_full, corner_yaw_deg=corner_yaw_deg,
+        waist_weight_used=waist_weight if waist_weight is not None else float(coupled_ik.joint_weight[0]),
+        iterations=result.iterations,
     )
 
 

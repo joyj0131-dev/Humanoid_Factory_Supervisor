@@ -226,7 +226,7 @@ def _make_feasibility_result(**overrides):
         left_thumb_face_actual="FACE_POS_X", left_finger_face_actual="FACE_POS_Y",
         right_thumb_face_actual="FACE_NEG_X", right_finger_face_actual="FACE_NEG_Y",
         face_assignment_satisfied=True,
-        q17=np.zeros(17), corner_yaw_deg=(45.0, 45.0), iterations=10,
+        q17=np.zeros(17), corner_yaw_deg=(45.0, 45.0), waist_weight_used=6.0, iterations=10,
     )
     defaults.update(overrides)
     return FeasibilityResult(**defaults)
@@ -286,6 +286,60 @@ def test_candidate_specific_seeds_target_the_known_hard_hand():
     # C1's seed perturbs the LEFT arm's block (indices 3-9), C2's the RIGHT (10-16).
     assert np.any(c1_seeds[0].q17[3:10] != 0.0)
     assert np.any(c2_seeds[0].q17[10:17] != 0.0)
+
+
+# ---------------------------------------------------------------------
+# Real gap found after a user question ("자세를 트는건 하지 않았어?"):
+# every posture-family SEED biases the null-space rest_q toward more
+# waist rotation, but CoupledBilateralIK's default 6x DLS task-space
+# penalty on the waist (coupled_ik.py, waist_weight=6.0) means the
+# PRIMARY solve barely lets the waist actually move away from wherever
+# it started, regardless of the seed. This test proves that directly:
+# the SAME seed/target/standoff, solved once at the solver's own default
+# weight and once with the waist made as cheap as an arm joint, must
+# show genuinely different waist usage and joint-limit outcomes -- if
+# they were the same, waist_weight would not be the actual lever.
+# ---------------------------------------------------------------------
+def test_waist_weight_override_actually_changes_waist_usage_and_wrist_yaw_margin():
+    env = _make_solver_env()
+    coupled, stand_q17 = _build_coupled_ik(env)
+    obj_pos = env.data.qpos[env._object_qpos_adr:env._object_qpos_adr + 3].copy()
+    obj_quat = env.data.qpos[env._object_qpos_adr + 3:env._object_qpos_adr + 7].copy()
+    finger_adr, finger_targets = _finger_open_targets(env)
+    left_offsets, right_offsets = _finger_offsets(env)
+    seed = build_candidate_specific_seeds("C2", stand_q17)[0]
+    left_t = hand_corner_target(obj_pos, obj_quat, SIZE_12_HALF, CANDIDATE_C2.left, palm_standoff=0.20, corner_yaw_deg=45.0)
+    right_t = hand_corner_target(obj_pos, obj_quat, SIZE_12_HALF, CANDIDATE_C2.right, palm_standoff=0.20, corner_yaw_deg=45.0)
+
+    scratch = mujoco.MjData(env.model)
+    scratch.qpos[:] = env.data.qpos
+    r_default = evaluate_static_pose(
+        coupled, scratch, env.model, env._object_body_id, obj_pos, obj_quat, CANDIDATE_C2, seed, left_t, right_t,
+        left_offsets, right_offsets, finger_qpos_adr=finger_adr, finger_open_targets=finger_targets,
+        wrist_yaw_rest_gain_boost=0.5, waist_weight=None,
+    )
+    scratch.qpos[:] = env.data.qpos
+    r_freed = evaluate_static_pose(
+        coupled, scratch, env.model, env._object_body_id, obj_pos, obj_quat, CANDIDATE_C2, seed, left_t, right_t,
+        left_offsets, right_offsets, finger_qpos_adr=finger_adr, finger_open_targets=finger_targets,
+        wrist_yaw_rest_gain_boost=0.5, waist_weight=1.0,
+    )
+    waist_yaw_default = r_default.q17[0]
+    waist_yaw_freed = r_freed.q17[0]
+    print(
+        f"    default(waist_weight=6.0): waist_yaw={waist_yaw_default:+.3f} wrist_yaw_margin={r_default.wrist_yaw_margin:.4f} "
+        f"elbow_margin={r_default.elbow_margin:.4f}\n"
+        f"    freed(waist_weight=1.0):   waist_yaw={waist_yaw_freed:+.3f} wrist_yaw_margin={r_freed.wrist_yaw_margin:.4f} "
+        f"elbow_margin={r_freed.elbow_margin:.4f}"
+    )
+    assert abs(waist_yaw_freed - seed.q17[0]) > abs(waist_yaw_default - seed.q17[0]), (
+        "freeing the waist (lower joint_weight) must let it actually rotate FURTHER from its seed "
+        "value than the solver's own 6x-penalized default does -- otherwise waist_weight is not the real lever"
+    )
+    assert r_freed.elbow_margin > r_default.elbow_margin + 0.5, (
+        "freeing the waist must measurably relieve elbow joint-limit saturation compared to the default "
+        f"(default={r_default.elbow_margin:.4f}, freed={r_freed.elbow_margin:.4f})"
+    )
 
 
 # ---------------------------------------------------------------------
@@ -357,53 +411,75 @@ def test_stage_u_contact_driven_four_face_feasibility_size12():
     left_offsets, right_offsets = _finger_offsets(env)
     scratch = mujoco.MjData(env.model)
 
-    def solve_one(candidate, seed, yaw_l, yaw_r, standoff):
-        left_t = hand_corner_target(obj_pos, obj_quat, SIZE_12_HALF, candidate.left, palm_standoff=standoff, corner_yaw_deg=yaw_l)
-        right_t = hand_corner_target(obj_pos, obj_quat, SIZE_12_HALF, candidate.right, palm_standoff=standoff, corner_yaw_deg=yaw_r)
+    def solve_one(candidate, seed, yaw_l, yaw_r, standoff, waist_weight=None, height_offset=0.0):
+        left_t = hand_corner_target(obj_pos, obj_quat, SIZE_12_HALF, candidate.left, palm_standoff=standoff, height_offset=height_offset, corner_yaw_deg=yaw_l)
+        right_t = hand_corner_target(obj_pos, obj_quat, SIZE_12_HALF, candidate.right, palm_standoff=standoff, height_offset=height_offset, corner_yaw_deg=yaw_r)
         scratch.qpos[:] = env.data.qpos
         scratch.qvel[:] = 0.0
         return evaluate_static_pose(
             coupled, scratch, env.model, env._object_body_id, obj_pos, obj_quat, candidate, seed, left_t, right_t,
             left_offsets, right_offsets, finger_qpos_adr=finger_adr, finger_open_targets=finger_targets,
-            corner_yaw_deg=(yaw_l, yaw_r),
+            corner_yaw_deg=(yaw_l, yaw_r), waist_weight=waist_weight,
         )
 
-    # --- coarse pass: symmetric angle, both candidates, all generic +
-    # candidate-specific seeds, a few standoffs.
+    # --- coarse pass: symmetric angle, both candidates, a curated seed
+    # subset (+ the candidate-specific seed), a few standoffs, AND
+    # (added after the waist-weight finding above) TWO waist_weight
+    # settings -- the solver's own 6x-penalized default, and a "freed"
+    # 1.0 that lets the waist actually twist as far as the null-space
+    # bias asks. Trimmed to a curated 8-seed subset (from the full 15 in
+    # build_posture_seeds) to keep this extra axis's runtime bounded.
+    curated_seed_names = {
+        "neutral_rest", "shoulder_forward", "waist_yaw_assist", "waist_yaw_assist_negative",
+        "waist_yaw_asymmetric_shoulders", "shoulder_diagonal_outward", "shoulder_diagonal_inward",
+        "waist_pitch_shoulder_forward_elbow_extension",
+    }
     coarse_results = []
     n_coarse_attempts = 0
     for candidate in (CANDIDATE_C1, CANDIDATE_C2):
-        all_seeds = seeds + build_candidate_specific_seeds(candidate.name, stand_q17)
-        for yaw in (15.0, 25.0, 35.0, 45.0):
-            for standoff in (0.16, 0.20):
-                for seed in all_seeds:
-                    r = solve_one(candidate, seed, yaw, yaw, standoff)
-                    coarse_results.append((standoff, r))
-                    n_coarse_attempts += 1
+        all_seeds = [s for s in seeds if s.name in curated_seed_names] + build_candidate_specific_seeds(candidate.name, stand_q17)
+        for yaw in (15.0, 30.0, 45.0):
+            for standoff in (0.20, 0.24):
+                for waist_weight in (None, 1.0):
+                    for seed in all_seeds:
+                        r = solve_one(candidate, seed, yaw, yaw, standoff, waist_weight=waist_weight)
+                        coarse_results.append((standoff, r))
+                        n_coarse_attempts += 1
 
     coarse_results.sort(key=lambda sr: score_result(sr[1]))
     best_coarse_standoff, best_coarse = coarse_results[0]
     print(
         f"    [Stage U coarse] {n_coarse_attempts} attempts; best candidate={best_coarse.candidate} "
         f"seed={best_coarse.seed_name} yaw={best_coarse.corner_yaw_deg} standoff={best_coarse_standoff} "
+        f"waist_weight={best_coarse.waist_weight_used:.1f} "
         f"face_ok={best_coarse.face_assignment_satisfied} collision_free={best_coarse.collision_free} "
         f"wrist_yaw_margin={best_coarse.wrist_yaw_margin:.4f} elbow_margin={best_coarse.elbow_margin:.4f} "
         f"Lpos={best_coarse.left_pos_error:.4f} Rpos={best_coarse.right_pos_error:.4f}"
     )
 
     # --- fine pass: independent left/right angles around the coarse
-    # winner's angle, same candidate/seed/standoff.
+    # winner's angle, PLUS a small height_offset sweep (the waist-weight
+    # experiment found freeing the waist can trade wrist_yaw margin for
+    # a NEW table collision -- height_offset is the natural knob to
+    # recheck that trade-off with), same candidate/seed/standoff/
+    # waist_weight.
+    best_candidate_obj = CANDIDATE_C1 if best_coarse.candidate == "C1" else CANDIDATE_C2
+    best_seed = next(
+        s for s in ([s for s in seeds if s.name in curated_seed_names] + build_candidate_specific_seeds(best_coarse.candidate, stand_q17))
+        if s.name == best_coarse.seed_name
+    )
     base_yaw = best_coarse.corner_yaw_deg[0]
     fine_angles = sorted({max(10.0, base_yaw - 10.0), base_yaw, min(45.0, base_yaw + 10.0)})
     fine_results = []
     for yaw_l in fine_angles:
         for yaw_r in fine_angles:
-            r = solve_one(
-                CANDIDATE_C1 if best_coarse.candidate == "C1" else CANDIDATE_C2,
-                next(s for s in (seeds + build_candidate_specific_seeds(best_coarse.candidate, stand_q17)) if s.name == best_coarse.seed_name),
-                yaw_l, yaw_r, best_coarse_standoff,
-            )
-            fine_results.append(r)
+            for height_offset in (0.0, 0.03, -0.03):
+                r = solve_one(
+                    best_candidate_obj, best_seed, yaw_l, yaw_r, best_coarse_standoff,
+                    waist_weight=best_coarse.waist_weight_used if best_coarse.waist_weight_used != 6.0 else None,
+                    height_offset=height_offset,
+                )
+                fine_results.append(r)
     fine_results.sort(key=score_result)
     best_fine = fine_results[0]
     print(
