@@ -212,9 +212,63 @@ class FixedBaseGraspEnv(gym.Env):
         # open/close table for it specifically.
         self.thumb1_ctrl_override_left: float | None = None
         self.thumb1_ctrl_override_right: float | None = None
+        # Dex3 Final Control Feasibility session: safety events from the
+        # LAST step() call, (side, group_idx, peak_force) tuples -- see
+        # step()'s substep-level force safety loop. Empty means no group
+        # exceeded finger_force_safety_limit during that step.
+        self.last_safety_events: list[tuple[str, int, float]] = []
 
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs(), self._get_info()
+
+    def _group_contact_force(self, side: str, group_idx: int) -> float:
+        """Peak resultant contact force between ONE finger group's bodies
+        and the object, read directly from the CURRENT data.contact (safe
+        to call mid-substep, unlike grasp_expert.py's _contact() which
+        also does full palm/wrist/self bookkeeping this doesn't need).
+        group_idx: 0=thumb, 1=index, 2=middle. Matches _group_force_raw's
+        "max within group" convention in grasp_expert.py -- same physical
+        quantity, just computed at substep granularity here."""
+        model, data = self.model, self.data
+        obj_body = self._object_body_id
+        group_name = ("thumb", "index", "middle")[group_idx]
+        prefix = f"{side}_hand_{group_name}"
+        peak = 0.0
+        for i in range(data.ncon):
+            c = data.contact[i]
+            b1, b2 = model.geom_bodyid[c.geom1], model.geom_bodyid[c.geom2]
+            if obj_body not in (b1, b2):
+                continue
+            other = b2 if b1 == obj_body else b1
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, other) or ""
+            if not name.startswith(prefix):
+                continue
+            force6 = np.zeros(6)
+            mujoco.mj_contactForce(model, data, i, force6)
+            resultant = float(np.hypot(force6[0], np.hypot(force6[1], force6[2])))
+            peak = max(peak, resultant)
+        return peak
+
+    def _hand_hand_contact_force(self) -> float:
+        """Peak resultant contact force between ANY left_hand body and ANY
+        right_hand body -- direct trace found both thumbs colliding with
+        EACH OTHER (not the object) reaching 40N+ with nothing detecting
+        it at the per-tick level (grasp_expert.py's _contact() only
+        checks each hand against the OBJECT). Substep-granularity twin of
+        _group_contact_force above, for the same reason."""
+        model, data = self.model, self.data
+        peak = 0.0
+        for i in range(data.ncon):
+            c = data.contact[i]
+            b1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom1]) or ""
+            b2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom2]) or ""
+            if not ((b1.startswith("left_hand") and b2.startswith("right_hand")) or (b2.startswith("left_hand") and b1.startswith("right_hand"))):
+                continue
+            force6 = np.zeros(6)
+            mujoco.mj_contactForce(model, data, i, force6)
+            resultant = float(np.hypot(force6[0], np.hypot(force6[1], force6[2])))
+            peak = max(peak, resultant)
+        return peak
 
     def step(self, action: np.ndarray):
         action = np.asarray(action, dtype=np.float64)
@@ -235,6 +289,19 @@ class FixedBaseGraspEnv(gym.Env):
         self._hand_group_synergy = np.clip(
             self._hand_group_synergy + self.config.hand_synergy_action_scale * group_delta, 0.0, 1.0
         )
+
+        # LAST-SAFE snapshot (Dex3 Final Control Feasibility session):
+        # each finger group's ctrl as it stood at the END of the PREVIOUS
+        # tick, i.e. before this tick's newly-commanded (possibly further-
+        # closing) target is written below. This is what the substep-level
+        # safety loop rolls a group back to if force spikes mid-tick --
+        # NOT a threshold relaxation, just the reference point for "stop
+        # closing further" (see step()'s docstring-equivalent comment
+        # below the substep loop).
+        prev_group_ctrl = [
+            [self.data.ctrl[self._left_group_act_ids[g]].copy() for g in range(3)],
+            [self.data.ctrl[self._right_group_act_ids[g]].copy() for g in range(3)],
+        ]
 
         # Legs/everything-else besides waist+arms+hands is simply never
         # written after reset(), so it stays exactly at stand ctrl -- no
@@ -257,8 +324,51 @@ class FixedBaseGraspEnv(gym.Env):
         if self.thumb1_ctrl_override_right is not None:
             self.data.ctrl[self._right_group_act_ids[0][1]] = self.thumb1_ctrl_override_right
 
+        # Physics-substep force safety (Dex3 Final Control Feasibility
+        # session, Section 3/4): grasp_expert.py's own 8N per-group
+        # regulation only reads contact force ONCE per outer step() call,
+        # AFTER all frame_skip physics substeps have run -- direct
+        # measurement found raw per-group force reaching 25-30N despite
+        # that regulation, because a spike can build up and partially
+        # decay entirely WITHIN one 5-substep window, invisible to a
+        # once-per-tick check. This checks EVERY substep instead: once a
+        # group's force exceeds finger_force_safety_limit, that group's
+        # ctrl is rolled back to its LAST-SAFE (prev_group_ctrl) value for
+        # the rest of this tick's remaining substeps -- stopping closure
+        # immediately, not waiting for the next control tick to notice.
+        # Between the warning ratio and the hard limit, ctrl is damped
+        # halfway toward the safe value each substep instead of an
+        # instant snap. Ungrouped bodies (arm/wrist/palm) are NOT touched
+        # here -- only the 6 finger-group actuator sets -- so this cannot
+        # induce the "back the whole hand away" reactive widening Section
+        # 17 explicitly prohibits; it only ever holds or partially eases
+        # ONE already-touching group's own curl.
+        limit = self.config.finger_force_safety_limit
+        warn = limit * self.config.finger_force_warning_ratio
+        self.last_safety_events = []
         for _ in range(self.config.frame_skip):
             mujoco.mj_step(self.model, self.data)
+            for side_idx, (side, group_ids) in enumerate((("left", self._left_group_act_ids), ("right", self._right_group_act_ids))):
+                for g in range(3):
+                    force = self._group_contact_force(side, g)
+                    ids = group_ids[g]
+                    if force > limit:
+                        self.data.ctrl[ids] = prev_group_ctrl[side_idx][g]
+                        self.last_safety_events.append((side, g, force))
+                    elif force > warn:
+                        self.data.ctrl[ids] = 0.5 * (self.data.ctrl[ids] + prev_group_ctrl[side_idx][g])
+            # Hand-hand collision (thumb-vs-thumb, direct trace found 40N+
+            # with nothing reacting) -- same substep-level treatment, but
+            # freezing BOTH thumb groups (whichever side is at fault is
+            # not distinguishable from a single aggregate force reading).
+            hh_force = self._hand_hand_contact_force()
+            if hh_force > limit:
+                self.data.ctrl[self._left_group_act_ids[0]] = prev_group_ctrl[0][0]
+                self.data.ctrl[self._right_group_act_ids[0]] = prev_group_ctrl[1][0]
+                self.last_safety_events.append(("hand_hand", 0, hh_force))
+            elif hh_force > warn:
+                self.data.ctrl[self._left_group_act_ids[0]] = 0.5 * (self.data.ctrl[self._left_group_act_ids[0]] + prev_group_ctrl[0][0])
+                self.data.ctrl[self._right_group_act_ids[0]] = 0.5 * (self.data.ctrl[self._right_group_act_ids[0]] + prev_group_ctrl[1][0])
 
         self._step_count += 1
         unstable = not (np.isfinite(self.data.qpos).all() and np.isfinite(self.data.qvel).all())

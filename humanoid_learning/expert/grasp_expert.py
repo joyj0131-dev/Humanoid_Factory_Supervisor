@@ -471,6 +471,22 @@ class GraspExpertConfig:
     # object -- removed once abduction moved to THUMB_CLEARANCE_PRESHAPE,
     # see _update_thumb1_override's docstring for the re-verification.)
     thumb1_override_rate: float = 0.05
+    # Dex3 Final Control Feasibility session, Section 8: deliberate
+    # vertical stagger between the two hands' grip targets, applied from
+    # CONTACT_ACQUIRE onward only (see _grip_targets' stagger parameter).
+    # Direct sweep on SIZE_12 (0.008/0.010/0.012/0.015/0.018/0.02/0.025/
+    # 0.03/0.035, same seed) found the relationship between stagger and
+    # outcome quality is NON-monotonic (small changes in initial contact
+    # geometry shift which discrete contact events occur, in a system
+    # already dominated by chattering finger-group contact) -- 0.015m
+    # gave the best result in that sweep on BOTH axes simultaneously
+    # (bilateral tripod streak 14, the best measured; hand-hand contact
+    # force 8.0N, the lowest measured, right at the safety limit).
+    # Smaller (0.008-0.012) or larger (0.02-0.035) values each did worse
+    # on at least one axis. This is an empirically-selected value from a
+    # single-seed sweep, not a first-principles-derived constant --
+    # revisit if it doesn't generalize across seeds/sizes.
+    vertical_stagger: float = 0.015
     # Section 7: object must not be actively perturbed for a state to
     # accept a transition into finger closing/lifting.
     max_object_speed_for_transition: float = 0.05  # m/s
@@ -544,6 +560,8 @@ class GraspOutcome:
     right_thumb_contact_separation: float
     max_hand_hand_contact_streak: int
     max_hand_hand_force_raw: float
+    substep_safety_event_count: int
+    max_substep_safety_force: float
     left_first_finger_contact_step: int | None
     right_first_finger_contact_step: int | None
     bilateral_first_finger_contact_step: int | None
@@ -663,6 +681,8 @@ class BimanualSidePinchExpert:
         self.max_hand_hand_force_raw = 0.0
         self._hand_hand_streak = 0
         self.max_hand_hand_contact_streak = 0
+        self.substep_safety_event_count = 0
+        self.max_substep_safety_force = 0.0
 
         self._coupled_traj: _MinJerkJointTrajectory | None = None  # None = not tracking a coupled trajectory
         self._coupled_last_result: CoupledIKResult | None = None
@@ -1609,7 +1629,9 @@ class BimanualSidePinchExpert:
         ori_tol = np.radians(self.config.coupled_ori_tol_deg)
         return pos_ok and lo < ori_tol and ro < ori_tol
 
-    def _grip_targets(self, base_pos: np.ndarray, z: float, half_width: float | None = None) -> tuple[np.ndarray, np.ndarray]:
+    def _grip_targets(
+        self, base_pos: np.ndarray, z: float, half_width: float | None = None, stagger: float = 0.0
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Returns (left_palm_target, right_palm_target) -- the palm/wrist
         IK targets. The formula below computes the INTENDED FINGERTIP
         grasp-contact point (unchanged from every prior session's
@@ -1627,10 +1649,22 @@ class BimanualSidePinchExpert:
         mutating that shared state (e.g. FINGERTIP_PRECONTACT's small
         surface-normal approach to ``precontact_half_width``, distinct
         from the wide transport clearance every earlier state uses) can
-        pass one explicitly."""
+        pass one explicitly.
+
+        ``stagger`` (Dex3 Final Control Feasibility session, Section 8):
+        a DELIBERATE, fixed vertical offset -- left hand targets z+stagger,
+        right hand targets z-stagger -- separate from ``_z_sync_bias``
+        (which only ever corrects a small, UNINTENDED few-mm residual
+        gap back toward zero and would fight a real stagger if reused for
+        this). Default 0.0 leaves every existing caller (natural approach,
+        FINGER_PRESHAPE, etc.) byte-identical; only CONTACT_ACQUIRE
+        onward passes a nonzero value, so the two thumbs approach the
+        object at genuinely different heights instead of converging on
+        the same central point (the direct cause of the thumb-thumb
+        collision this session addresses)."""
         hw = half_width if half_width is not None else self.grip_half_width
-        left_fingertip_target = base_pos + np.array([0.0, self.grip_center + hw, z + self._z_sync_bias])
-        right_fingertip_target = base_pos + np.array([0.0, self.grip_center - hw, z - self._z_sync_bias])
+        left_fingertip_target = base_pos + np.array([0.0, self.grip_center + hw, z + stagger + self._z_sync_bias])
+        right_fingertip_target = base_pos + np.array([0.0, self.grip_center - hw, z - stagger - self._z_sync_bias])
         left = self._fingertip_target_to_palm_target(left_fingertip_target, self.left_R, "left")
         right = self._fingertip_target_to_palm_target(right_fingertip_target, self.right_R, "right")
         return left, right
@@ -2290,8 +2324,13 @@ class BimanualSidePinchExpert:
             # shared grip_half_width used elsewhere (see HandSubstate
             # docstring for why sharing it here built up an asymmetric
             # squeeze while one hand waited for the other).
-            left_fingertip_goal = z_ref + np.array([0.0, self.grip_center + self.left_approach_offset, self.grasp_z_offset + self._z_sync_bias])
-            right_fingertip_goal = z_ref + np.array([0.0, self.grip_center - self.right_approach_offset, self.grasp_z_offset - self._z_sync_bias])
+            # Vertical stagger (Section 8) applied starting HERE, not at
+            # THUMB_OPPOSE, so index/middle already acquire contact at the
+            # staggered height -- introducing the offset only once thumb
+            # starts closing would be a state-transition target jump
+            # (explicitly prohibited, Section 16).
+            left_fingertip_goal = z_ref + np.array([0.0, self.grip_center + self.left_approach_offset, self.grasp_z_offset + cfg.vertical_stagger + self._z_sync_bias])
+            right_fingertip_goal = z_ref + np.array([0.0, self.grip_center - self.right_approach_offset, self.grasp_z_offset - cfg.vertical_stagger - self._z_sync_bias])
             left_goal = self._fingertip_target_to_palm_target(left_fingertip_goal, self.left_R, "left")
             right_goal = self._fingertip_target_to_palm_target(right_fingertip_goal, self.right_R, "right")
             self.left_tracker.set_goal(left_goal)
@@ -2438,7 +2477,7 @@ class BimanualSidePinchExpert:
             self._update_z_sync()
             if left_c.finger.touched and right_c.finger.touched:
                 self._contact_ref = obj.copy()
-            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset)
+            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=cfg.vertical_stagger)
             self.left_tracker.set_goal(left_goal)
             self.right_tracker.set_goal(right_goal)
 
@@ -2517,7 +2556,7 @@ class BimanualSidePinchExpert:
             self._update_z_sync()
             if left_c.finger.touched and right_c.finger.touched:
                 self._contact_ref = obj.copy()
-            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset)
+            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=cfg.vertical_stagger)
             self.left_tracker.set_goal(left_goal)
             self.right_tracker.set_goal(right_goal)
 
@@ -2657,7 +2696,7 @@ class BimanualSidePinchExpert:
             # Ordinary rate-limited tracking is both smooth and, per
             # max_target_step, already about as fast a retreat as the arm
             # can safely make.
-            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset)
+            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=cfg.vertical_stagger)
             self.left_tracker.set_goal(left_goal)
             self.right_tracker.set_goal(right_goal)
 
@@ -2732,7 +2771,7 @@ class BimanualSidePinchExpert:
                     -cfg.grip_center_max_correction, cfg.grip_center_max_correction,
                 ))
 
-            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset)
+            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=cfg.vertical_stagger)
             self.left_tracker.set_goal(left_goal)
             self.right_tracker.set_goal(right_goal)
 
@@ -2880,6 +2919,9 @@ class BimanualSidePinchExpert:
             self._update_thumb1_override()
             qpos_before = self.env.data.qpos[self.env._arm_qpos_adr].copy()
             self.env.step(a)
+            for _side, _group, _force in self.env.last_safety_events:
+                self.substep_safety_event_count += 1
+                self.max_substep_safety_force = max(self.max_substep_safety_force, _force)
             qpos_after = self.env.data.qpos[self.env._arm_qpos_adr].copy()
             delta = np.abs(qpos_after - qpos_before)
             self.total_joint_travel += float(delta.sum())
@@ -2966,6 +3008,8 @@ class BimanualSidePinchExpert:
             right_thumb_contact_separation=self.right_thumb_contact_separation,
             max_hand_hand_contact_streak=self.max_hand_hand_contact_streak,
             max_hand_hand_force_raw=self.max_hand_hand_force_raw,
+            substep_safety_event_count=self.substep_safety_event_count,
+            max_substep_safety_force=self.max_substep_safety_force,
             left_first_finger_contact_step=self.left_first_finger_contact_step,
             right_first_finger_contact_step=self.right_first_finger_contact_step,
             bilateral_first_finger_contact_step=self.bilateral_first_finger_contact_step,

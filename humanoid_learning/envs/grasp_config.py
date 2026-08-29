@@ -62,6 +62,22 @@ class GraspEnvConfig:
     # only softens the arm, not the fingers making the actual contact).
     hand_kp: float = 80.0
 
+    # Dex3 Final Control Feasibility session: direct measurement found
+    # per-group raw force reaching 25-30N despite grasp_expert.py's own
+    # 8N safety regulation, because that regulation only reads/reacts to
+    # contact force ONCE per outer env.step() call, AFTER all frame_skip
+    # (5) physics substeps have already run -- a spike that builds up and
+    # even partially decays entirely WITHIN that 5-substep window is
+    # invisible to the control-tick-level check. These two fields let
+    # step() itself watch and react to force at EVERY physics substep,
+    # inside this grasp-specific env only (Foundation's BimanualReachEnv/
+    # WholeBodyEnv step() are untouched). finger_force_warning_ratio *
+    # finger_force_safety_limit is the "slow down" threshold; the limit
+    # itself is a hard "stop closing this group any further this tick"
+    # ceiling, not a threshold to relax.
+    finger_force_safety_limit: float = 8.0
+    finger_force_warning_ratio: float = 0.7
+
     object_pos: tuple[float, float, float] = (0.27, 0.0, 0.0)  # z resolved at reset (on table surface)
     # 2x every linear dimension of the Foundation object (0.03 -> 0.06,
     # i.e. 6cm cube -> 12cm cube) -- see PROJECT_CONTEXT.md Phase 4 Grasp
