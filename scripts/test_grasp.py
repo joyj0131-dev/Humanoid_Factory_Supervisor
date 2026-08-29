@@ -48,6 +48,7 @@ from humanoid_learning.expert.grasp_expert import (
     GraspExpertConfig,
     GraspState,
     make_side_pinch_orientation,
+    sim_time_to_steps,
 )
 
 
@@ -1255,6 +1256,128 @@ def test_size6_gate_a_tripod_contact():
 def test_size12_gate_a_tripod_contact():
     from humanoid_learning.envs.grasp_config import SIZE_12_HALF
     _run_gate_a_tripod_check(SIZE_12_HALF)
+
+
+# ---------------------------------------------------------------------
+# Four-Face Diagonal Corner Grasp session (Section 14/15/17/20/22): the
+# NEW global four-face Gate A, and the real Candidate A/B/C measurements
+# that motivate/document this session's actual geometry work.
+# ---------------------------------------------------------------------
+
+def test_sim_time_to_steps_uses_real_timestep_not_hardcoded():
+    """Section 15/17: Gate B (2.0s) / Gate D (5.0s) step counts must be
+    DERIVED from model.opt.timestep * frame_skip, not a hardcoded number
+    like 500 -- this verifies the formula itself against the env's real
+    timestep/frame_skip (no rollout needed, this is pure arithmetic)."""
+    env = make_env(object_pos=(0.27, 0.0, 0.0), arm_kp=120.0)
+    env.reset(seed=0)
+    dt = env.model.opt.timestep * env.config.frame_skip
+    assert sim_time_to_steps(env, 2.0) == int(np.ceil(2.0 / dt))
+    assert sim_time_to_steps(env, 5.0) == int(np.ceil(5.0 / dt))
+    # Regression guard: at the documented timestep=0.002/frame_skip=5,
+    # 5.0s should be ~500 steps -- verifies the formula's magnitude is
+    # sane, not just self-consistent with its own inputs.
+    assert 400 <= sim_time_to_steps(env, 5.0) <= 600
+
+
+def _run_four_face_gate_a_check(object_half_size: float, cfg: GraspExpertConfig, label: str):
+    """Runs one candidate's REAL rollout and reports the Section 12/20
+    global four-face metrics against Gate A's literal requirement
+    (Section 22): max_four_face_contact_streak >= 30, where four_face_
+    coverage itself requires +X/-X AND +Y/-Y contacted in the SAME
+    step (Section 10 -- not accumulated across different moments)."""
+    env = make_env(object_pos=(0.27, 0.0, 0.0), arm_kp=120.0, object_half_size=object_half_size)
+    env.reset(seed=0)
+    expert = BimanualSidePinchExpert(env, cfg)
+    outcome = expert.run(max_total_steps=6000)
+    print(
+        f"    [{label}] final_state={outcome.state.name} reason={outcome.failure_reason}\n"
+        f"    max_four_face_contact_streak={outcome.max_four_face_contact_streak} "
+        f"contacted_side_faces={sorted(outcome.contacted_side_faces)} "
+        f"opposing(x,y)=({outcome.opposing_x_pair},{outcome.opposing_y_pair})\n"
+        f"    wrench_rank={outcome.global_grasp_wrench_rank} wrench_condition={outcome.global_grasp_wrench_condition:.1f} "
+        f"net_force={np.round(outcome.global_net_force, 2).tolist()} "
+        f"net_torque={np.round(outcome.global_net_torque, 3).tolist()}"
+    )
+    assert outcome.max_four_face_contact_streak >= 30, (
+        f"[{label}] Gate A (four-face) FAILED: max_four_face_contact_streak="
+        f"{outcome.max_four_face_contact_streak}, need >= 30 "
+        f"(final state {outcome.state.name}, reason={outcome.failure_reason})"
+    )
+
+
+def test_candidate_a_symmetric_four_face_gate_a_size12():
+    """Candidate A (Section 21): symmetric baseline, vertical_stagger=0.
+    Real measurement (Four-Face Diagonal Corner Grasp session): both
+    hands' thumbs land on the SAME face (FACE_NEG_X, the near-approach
+    face) -- structurally cannot produce an opposing X pair. EXPECTED TO
+    FAIL until Candidate C's actual diagonal geometry converges (see
+    test_candidate_c_diagonal_corner_four_face_gate_a_size12 below for
+    why that does not yet work either) -- left visible, not adjusted
+    away, per project convention."""
+    from humanoid_learning.envs.grasp_config import SIZE_12_HALF
+    _run_four_face_gate_a_check(SIZE_12_HALF, GraspExpertConfig(vertical_stagger=0.0), "Candidate A: symmetric")
+
+
+def test_candidate_b_vertical_stagger_four_face_gate_a_size12():
+    """Candidate B (Section 21): existing default vertical_stagger=0.015m
+    (preserved, NOT rolled back, per Section 3). Real measurement: same
+    structural limitation as Candidate A (both thumbs on FACE_NEG_X) --
+    vertical stagger only changes Z, never gives either hand's thumb the
+    opposite X face, so this also cannot pass the four-face Gate A.
+    EXPECTED TO FAIL, left visible per project convention."""
+    from humanoid_learning.envs.grasp_config import SIZE_12_HALF
+    _run_four_face_gate_a_check(SIZE_12_HALF, GraspExpertConfig(), "Candidate B: vertical stagger 0.015m")
+
+
+def test_candidate_c_diagonal_corner_four_face_gate_a_size12():
+    """Candidate C (Section 3/4/7): four-face diagonal corner topology,
+    vertical_stagger forced to 0 (topology="diagonal_corner").
+
+    HONEST NEGATIVE RESULT (Four-Face Diagonal Corner Grasp session):
+    direct sweep found that BOTH tested mechanisms for getting one
+    hand's thumb onto the FAR (currently untouched) X face break this
+    controller's existing, historically-tuned pipeline rather than
+    fixing the four-face gap:
+
+    1. Diagonal X-offset alone (self._diagonal_x_offset, orientation
+       UNCHANGED): x_offset=0.0 reproduces Candidate A/B exactly (no-op,
+       verified byte-identical). x_offset=0.02m already breaks
+       CONTACT_ACQUIRE -> THUMB_OPPOSE (fails SINGLE_HAND_CONTACT_ONLY).
+       x_offset>=0.04m breaks convergence even earlier (TIMEOUT before
+       CONTACT_ACQUIRE) -- pushing the fingertip-centroid target further
+       in X pushes index/middle PAST the object's far edge while thumb
+       still never reaches it (thumb sits ~0.11-0.14m BEHIND the
+       centroid target along the approach axis, a much larger gap than
+       any offset that keeps fingers on-object).
+    2. Rotating left_R's closing axis toward X (make_side_pinch_
+       orientation with a different closing_world/approach_hint, swept
+       from a full 90-degree swap down to a 10-degree partial yaw):
+       EVERY tested angle (10/20/30/45/90 degrees) broke convergence
+       already in NATURAL_ARM_LIFT (TIMEOUT, never even reaches
+       FOREARM_LATERAL_APPROACH) -- root-caused to the "natural_lift"
+       coupled-IK role's ori_task_weight=0.1 (_coupled_role_profile)
+       fighting its own rest_gain pull toward the neutral stand pose
+       once the commanded orientation deviates from the one this whole
+       pipeline was tuned against, even though that role's OWN
+       convergence gate does not require orientation to match
+       (require_orientation=False for natural_lift/forearm_lateral/
+       forearm_descend).
+
+    This is real evidence (Section 3's "실제 G1 reachability, joint
+    limits와 collision을 검사") that a real fix needs Section 5's
+    posture-based multi-start IK (a genuinely different SEED/rest
+    posture for the reoriented hand, not a small perturbation of the
+    single existing seed) -- NOT yet implemented (time constraint, see
+    PROJECT_CONTEXT.md). This test intentionally uses x_offset=0.02 (the
+    least-broken setting found) so the assertion failure below documents
+    the CURRENT real ceiling, not a worst case."""
+    from humanoid_learning.envs.grasp_config import SIZE_12_HALF
+    _run_four_face_gate_a_check(
+        SIZE_12_HALF,
+        GraspExpertConfig(topology="diagonal_corner", diagonal_x_offset=0.02),
+        "Candidate C: diagonal corner (x_offset=0.02, orientation unchanged)",
+    )
 
 
 if __name__ == "__main__":

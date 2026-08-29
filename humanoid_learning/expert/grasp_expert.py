@@ -148,6 +148,19 @@ class FailureReason(Enum):
     THUMB_CONTACT_FAILED = auto()
 
 
+def sim_time_to_steps(env, seconds: float) -> int:
+    """Converts a REAL simulation-time duration into a control-step count
+    (Four-Face Diagonal Corner Grasp session, Section 15/17: "숫자 500을
+    직접 하드코딩하지 마라"). One control step advances
+    ``env.config.frame_skip`` physics substeps of ``env.model.opt.
+    timestep`` seconds each, so ``steps = ceil(seconds / (timestep *
+    frame_skip))`` -- e.g. Gate B's 2.0s and Gate D's 5.0s hold
+    requirements are derived from this, not a hardcoded step count, so
+    they stay correct if timestep/frame_skip ever change."""
+    step_duration = env.model.opt.timestep * env.config.frame_skip
+    return int(np.ceil(seconds / step_duration))
+
+
 def make_side_pinch_orientation(closing_world: np.ndarray, approach_hint: np.ndarray = np.array([1.0, 0.0, 0.0])) -> np.ndarray:
     closing = closing_world / np.linalg.norm(closing_world)
     approach = approach_hint - np.dot(approach_hint, closing) * closing
@@ -487,6 +500,21 @@ class GraspExpertConfig:
     # single-seed sweep, not a first-principles-derived constant --
     # revisit if it doesn't generalize across seeds/sizes.
     vertical_stagger: float = 0.015
+    # Four-Face Diagonal Corner Grasp session, Section 4/13/21: selects
+    # which grip topology _grip_targets/CONTACT_ACQUIRE produce.
+    # "vertical_stagger" (default) is the EXISTING, unchanged Candidate
+    # A/B behavior (vertical_stagger above still applies, diagonal_x_
+    # offset below is forced to 0.0 regardless of its own value -- see
+    # BimanualSidePinchExpert.__init__). "diagonal_corner" is the NEW
+    # Candidate C/D four-face topology: forces vertical_stagger's effect
+    # to 0 (Section 4: "vertical stagger = 0" for Candidate C's first
+    # implementation) and activates diagonal_x_offset instead.
+    topology: str = "vertical_stagger"
+    # Candidate C/D diagonal corner offset (left hand +x, right hand -x,
+    # see _grip_targets) -- only active when topology=="diagonal_corner".
+    # 0.0 default is inert; a real value is set per-experiment (Section 3
+    # requires testing this empirically, not assuming a single formula).
+    diagonal_x_offset: float = 0.0
     # Section 7: object must not be actively perturbed for a state to
     # accept a transition into finger closing/lifting.
     max_object_speed_for_transition: float = 0.05  # m/s
@@ -712,6 +740,19 @@ class BimanualSidePinchExpert:
         self.global_net_torque = np.zeros(3, dtype=np.float64)
         self.global_grasp_wrench_rank = 0
         self.global_grasp_wrench_condition = float("inf")
+        # Four-Face Diagonal Corner Grasp session, Section 4/7: Candidate C
+        # diagonal offset (left hand +x, right hand -x, see _grip_targets).
+        # 0.0 reproduces Candidate A/B (existing symmetric/vertical-stagger
+        # topology) byte-for-byte; set to a nonzero, size-conditioned value
+        # only when cfg.topology == "diagonal_corner".
+        self._diagonal_x_offset = cfg.diagonal_x_offset if cfg.topology == "diagonal_corner" else 0.0
+        # Section 4: "Candidate C의 첫 구현에서는 vertical stagger = 0" --
+        # forced here (not by mutating cfg.vertical_stagger itself, which
+        # stays available unchanged for anyone still reading it directly)
+        # so every one of the 6 call sites that used to read cfg.vertical_
+        # stagger picks up 0.0 automatically under diagonal_corner, while
+        # Candidate A/B (topology=="vertical_stagger") is untouched.
+        self._effective_vertical_stagger = 0.0 if cfg.topology == "diagonal_corner" else cfg.vertical_stagger
 
         self._coupled_traj: _MinJerkJointTrajectory | None = None  # None = not tracking a coupled trajectory
         self._coupled_last_result: CoupledIKResult | None = None
@@ -1802,8 +1843,16 @@ class BimanualSidePinchExpert:
         the same central point (the direct cause of the thumb-thumb
         collision this session addresses)."""
         hw = half_width if half_width is not None else self.grip_half_width
-        left_fingertip_target = base_pos + np.array([0.0, self.grip_center + hw, z + stagger + self._z_sync_bias])
-        right_fingertip_target = base_pos + np.array([0.0, self.grip_center - hw, z - stagger - self._z_sync_bias])
+        # Four-Face Diagonal Corner Grasp session, Section 4/7: a diagonal
+        # X-axis offset (left hand +x_off, right hand -x_off), read from
+        # self._diagonal_x_offset (0.0 for Candidate A/B, unchanged
+        # behavior) rather than threaded as a parameter -- every existing
+        # caller (approach waypoints, FINGERTIP_PRECONTACT, FINGER_CLOSE/
+        # FORCE_SETTLE via this same helper) picks it up automatically,
+        # exactly like ``stagger`` above already does for Z.
+        x_off = self._diagonal_x_offset
+        left_fingertip_target = base_pos + np.array([x_off, self.grip_center + hw, z + stagger + self._z_sync_bias])
+        right_fingertip_target = base_pos + np.array([-x_off, self.grip_center - hw, z - stagger - self._z_sync_bias])
         left = self._fingertip_target_to_palm_target(left_fingertip_target, self.left_R, "left")
         right = self._fingertip_target_to_palm_target(right_fingertip_target, self.right_R, "right")
         return left, right
@@ -2499,8 +2548,8 @@ class BimanualSidePinchExpert:
             # staggered height -- introducing the offset only once thumb
             # starts closing would be a state-transition target jump
             # (explicitly prohibited, Section 16).
-            left_fingertip_goal = z_ref + np.array([0.0, self.grip_center + self.left_approach_offset, self.grasp_z_offset + cfg.vertical_stagger + self._z_sync_bias])
-            right_fingertip_goal = z_ref + np.array([0.0, self.grip_center - self.right_approach_offset, self.grasp_z_offset - cfg.vertical_stagger - self._z_sync_bias])
+            left_fingertip_goal = z_ref + np.array([self._diagonal_x_offset, self.grip_center + self.left_approach_offset, self.grasp_z_offset + self._effective_vertical_stagger + self._z_sync_bias])
+            right_fingertip_goal = z_ref + np.array([-self._diagonal_x_offset, self.grip_center - self.right_approach_offset, self.grasp_z_offset - self._effective_vertical_stagger - self._z_sync_bias])
             left_goal = self._fingertip_target_to_palm_target(left_fingertip_goal, self.left_R, "left")
             right_goal = self._fingertip_target_to_palm_target(right_fingertip_goal, self.right_R, "right")
             self.left_tracker.set_goal(left_goal)
@@ -2647,7 +2696,7 @@ class BimanualSidePinchExpert:
             self._update_z_sync()
             if left_c.finger.touched and right_c.finger.touched:
                 self._contact_ref = obj.copy()
-            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=cfg.vertical_stagger)
+            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=self._effective_vertical_stagger)
             self.left_tracker.set_goal(left_goal)
             self.right_tracker.set_goal(right_goal)
 
@@ -2726,7 +2775,7 @@ class BimanualSidePinchExpert:
             self._update_z_sync()
             if left_c.finger.touched and right_c.finger.touched:
                 self._contact_ref = obj.copy()
-            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=cfg.vertical_stagger)
+            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=self._effective_vertical_stagger)
             self.left_tracker.set_goal(left_goal)
             self.right_tracker.set_goal(right_goal)
 
@@ -2866,7 +2915,7 @@ class BimanualSidePinchExpert:
             # Ordinary rate-limited tracking is both smooth and, per
             # max_target_step, already about as fast a retreat as the arm
             # can safely make.
-            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=cfg.vertical_stagger)
+            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=self._effective_vertical_stagger)
             self.left_tracker.set_goal(left_goal)
             self.right_tracker.set_goal(right_goal)
 
@@ -2941,7 +2990,7 @@ class BimanualSidePinchExpert:
                     -cfg.grip_center_max_correction, cfg.grip_center_max_correction,
                 ))
 
-            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=cfg.vertical_stagger)
+            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=self._effective_vertical_stagger)
             self.left_tracker.set_goal(left_goal)
             self.right_tracker.set_goal(right_goal)
 
