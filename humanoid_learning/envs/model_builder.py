@@ -33,6 +33,7 @@ import mujoco
 import numpy as np
 
 from humanoid_learning.envs import task_config as tc
+from humanoid_learning.envs import whole_body_config as wbc
 
 
 def build_model(config) -> mujoco.MjModel:
@@ -88,5 +89,225 @@ def build_model(config) -> mujoco.MjModel:
         rgba=[0.85, 0.15, 0.15, 1],
         mass=0.1,
     )
+
+    return spec.compile()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: whole-body (floating-base) and planar-debug builders.
+#
+# Both start from the same vendored g1_with_hands.xml and add the same
+# floor/EE-site/table/object pieces as build_model() above, but unlike
+# build_model() they do NOT delete floating_base_joint -- see
+# PROJECT_CONTEXT.md Phase 4, Section B. build_model() itself is untouched
+# above (Foundation preserved byte-for-byte; verified by regression tests).
+# ---------------------------------------------------------------------------
+
+
+def _add_ee_sites(spec: "mujoco.MjSpec") -> None:
+    spec.body("left_wrist_yaw_link").add_site(
+        name=tc.LEFT_EE_SITE, pos=list(tc.LEFT_EE_OFFSET), size=[0.01, 0.01, 0.01]
+    )
+    spec.body("right_wrist_yaw_link").add_site(
+        name=tc.RIGHT_EE_SITE, pos=list(tc.RIGHT_EE_OFFSET), size=[0.01, 0.01, 0.01]
+    )
+
+
+def _add_grasp_sites(spec: "mujoco.MjSpec") -> None:
+    """Palm-frame and fingertip reference sites -- see whole_body_config.py
+    for the empirically-derived convention (approach/closing/lateral axes).
+    Never modifies the stock XML; added via MjSpec like _add_ee_sites."""
+    spec.body("left_wrist_yaw_link").add_site(
+        name=wbc.LEFT_PALM_SITE,
+        pos=list(wbc.LEFT_PALM_LOCAL_POS),
+        quat=list(wbc.LEFT_PALM_LOCAL_QUAT),
+        size=[0.008, 0.008, 0.008],
+    )
+    spec.body("right_wrist_yaw_link").add_site(
+        name=wbc.RIGHT_PALM_SITE,
+        pos=list(wbc.RIGHT_PALM_LOCAL_POS),
+        quat=list(wbc.RIGHT_PALM_LOCAL_QUAT),
+        size=[0.008, 0.008, 0.008],
+    )
+    for site_name, body_name in wbc.FINGERTIP_SITE_BODIES.items():
+        spec.body(body_name).add_site(name=site_name, pos=[0.0, 0.0, 0.0], size=[0.004, 0.004, 0.004])
+
+
+def _add_floor(spec: "mujoco.MjSpec") -> None:
+    spec.worldbody.add_geom(
+        name="floor",
+        type=mujoco.mjtGeom.mjGEOM_PLANE,
+        size=[0, 0, 0.05],
+        pos=[0, 0, 0],
+        rgba=[0.28, 0.32, 0.37, 1],
+    )
+
+
+def _add_table_and_object(spec: "mujoco.MjSpec", config) -> None:
+    table = spec.worldbody.add_body(name=tc.TABLE_BODY, pos=list(config.table_pos))
+    table.add_geom(
+        name=tc.TABLE_GEOM,
+        type=mujoco.mjtGeom.mjGEOM_BOX,
+        size=list(config.table_half_size),
+        rgba=[0.55, 0.4, 0.25, 1],
+    )
+    obj = spec.worldbody.add_body(
+        name=tc.OBJECT_BODY,
+        pos=[
+            config.table_pos[0],
+            config.table_pos[1],
+            config.table_pos[2] + config.table_half_size[2] + tc.OBJECT_HALF_SIZE + tc.OBJECT_TABLE_GAP,
+        ],
+    )
+    obj.add_freejoint(name=tc.OBJECT_JOINT)
+    obj.add_geom(
+        name=tc.OBJECT_GEOM,
+        type=mujoco.mjtGeom.mjGEOM_BOX,
+        size=[tc.OBJECT_HALF_SIZE] * 3,
+        rgba=[0.85, 0.15, 0.15, 1],
+        mass=0.1,
+        # default friction (1 0.005 0.0001) is too low for a fingertip-sphere
+        # grasp to hold the box without slipping -- see Phase 4 grasp report.
+        friction=[1.5, 0.01, 0.0001],
+    )
+
+
+def build_whole_body_model(config, include_object: bool = False) -> mujoco.MjModel:
+    """Floating-base whole-body model: floating_base_joint is kept (NOT
+    deleted), so legs/waist/pelvis are all free to move under their own
+    position actuators + gravity + foot contact, exactly like the real
+    robot. The stand keyframe qpos is used as-authored (no 7-entry strip --
+    it already has the right length for a 50-dof floating-base model)."""
+    spec = mujoco.MjSpec.from_file(str(config.g1_xml_path))
+    _add_ee_sites(spec)
+    _add_grasp_sites(spec)
+    _add_floor(spec)
+    if include_object:
+        _add_table_and_object(spec, config)
+    return spec.compile()
+
+
+def build_grasp_model(config) -> mujoco.MjModel:
+    """Fixed-base grasp validation model: same lower-body-fixing approach as
+    build_model() (Foundation, proven stable), but the object's mass/
+    friction/size are configurable (GraspEnvConfig) instead of hard-coded,
+    and object placement is a single deterministic point (not a randomized
+    range) -- this env validates grasp PHYSICS, not reaching generalization.
+    """
+    spec = mujoco.MjSpec.from_file(str(config.g1_xml_path))
+
+    freejoint = spec.joint(tc.FLOATING_BASE_JOINT)
+    spec.delete(freejoint)
+    stand_key = spec.key(tc.STAND_KEYFRAME)
+    stand_key.qpos = np.asarray(stand_key.qpos)[7:].tolist()
+
+    _add_ee_sites(spec)
+    _add_grasp_sites(spec)
+    _add_floor(spec)
+
+    table = spec.worldbody.add_body(name=tc.TABLE_BODY, pos=list(config.table_pos))
+    table.add_geom(
+        name=tc.TABLE_GEOM,
+        type=mujoco.mjtGeom.mjGEOM_BOX,
+        size=list(config.table_half_size),
+        rgba=[0.55, 0.4, 0.25, 1],
+    )
+    obj_z = config.table_pos[2] + config.table_half_size[2] + config.object_half_size + tc.OBJECT_TABLE_GAP
+    obj = spec.worldbody.add_body(
+        name=tc.OBJECT_BODY,
+        pos=[config.object_pos[0], config.object_pos[1], obj_z],
+    )
+    obj.add_freejoint(name=tc.OBJECT_JOINT)
+    obj.add_geom(
+        name=tc.OBJECT_GEOM,
+        type=mujoco.mjtGeom.mjGEOM_BOX,
+        size=[config.object_half_size] * 3,
+        rgba=[0.85, 0.15, 0.15, 1],
+        mass=config.object_mass,
+        friction=list(config.object_friction),
+    )
+
+    model = spec.compile()
+    _apply_compliant_kp(model, tc.LEFT_ARM_JOINTS + tc.RIGHT_ARM_JOINTS, config.arm_kp)
+    finger_joints = [n for n, _, _ in wbc.LEFT_HAND_SYNERGY_TARGETS + wbc.RIGHT_HAND_SYNERGY_TARGETS]
+    _apply_compliant_kp(model, finger_joints, config.hand_kp)
+    return model
+
+
+def _apply_compliant_kp(model: mujoco.MjModel, joint_names: list[str], kp: float) -> None:
+    """Lowers the given actuators' position gain from whatever the stock
+    XML set (kp=500 for both arms and hands) to ``kp`` (grasp-model-only
+    compliance -- see grasp_config.py and PROJECT_CONTEXT.md Phase 4,
+    Section 6). kv is rescaled by sqrt(kp / old_kp) to keep the same
+    dampratio=1 critical-damping relationship the stock XML's
+    <position dampratio="1"/> establishes at kp=500, rather than becoming
+    under- or over-damped at the new kp.
+
+    Originally applied only to the 14 arm joints; extended to the finger
+    joints too after diagnosing (Phase 4 Grasp Track redesign) that a
+    STIFF kp=500 finger actuator was the actual cause of an 8-13N force
+    spike appearing within a single control step the instant a fingertip
+    first touched the object -- the compliant arm was never the
+    bottleneck for that particular spike, the untouched finger actuators
+    were."""
+    for name in joint_names:
+        aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+        assert aid >= 0, f"actuator not found: {name}"
+        old_kp = model.actuator_gainprm[aid, 0]
+        old_kv = -model.actuator_biasprm[aid, 2]
+        scale = np.sqrt(kp / old_kp)
+        model.actuator_gainprm[aid, 0] = kp
+        model.actuator_biasprm[aid, 1] = -kp
+        model.actuator_biasprm[aid, 2] = -(old_kv * scale)
+
+
+def build_planar_debug_model(config) -> mujoco.MjModel:
+    """DEBUG/FALLBACK ONLY -- see PROJECT_CONTEXT.md Section 8. Deletes
+    floating_base_joint (like the fixed-base builder) and replaces it with
+    3 new actuated joints directly on the pelvis body: planar_x (slide),
+    planar_y (slide), planar_yaw (hinge). Legs/waist/arms are held rigid at
+    the stand pose (their position actuators simply hold the stand ctrl,
+    exactly like the fixed-base env's _held_act_ids mechanism) -- nothing
+    about this is a walking gait. z height is not an actuated DOF: the
+    pelvis body's static height offset (0.793m, same as the fixed-base
+    model) is used, so the whole rigid body "slides" at a constant height
+    while x/y/yaw are tracked by high-gain position actuators (near-teleport
+    tracking, not physically grounded locomotion)."""
+    spec = mujoco.MjSpec.from_file(str(config.g1_xml_path))
+
+    freejoint = spec.joint(tc.FLOATING_BASE_JOINT)
+    spec.delete(freejoint)
+    stand_key = spec.key(tc.STAND_KEYFRAME)
+    stand_key.qpos = np.asarray(stand_key.qpos)[7:].tolist()
+
+    pelvis = spec.body("pelvis")
+    pelvis.add_joint(name="planar_x", type=mujoco.mjtJoint.mjJNT_SLIDE, axis=[1, 0, 0])
+    pelvis.add_joint(name="planar_y", type=mujoco.mjtJoint.mjJNT_SLIDE, axis=[0, 1, 0])
+    pelvis.add_joint(name="planar_yaw", type=mujoco.mjtJoint.mjJNT_HINGE, axis=[0, 0, 1])
+
+    _add_ee_sites(spec)
+    _add_floor(spec)
+
+    def pad10(values: list[float]) -> list[float]:
+        return list(values) + [0.0] * (10 - len(values))
+
+    kp_xy, kv_xy = 3000.0, 300.0
+    kp_yaw, kv_yaw = 1000.0, 100.0
+    for name, kp, kv, ctrlrange in [
+        ("planar_x", kp_xy, kv_xy, list(config.x_range)),
+        ("planar_y", kp_xy, kv_xy, list(config.y_range)),
+        ("planar_yaw", kp_yaw, kv_yaw, [-3.1416, 3.1416]),
+    ]:
+        spec.add_actuator(
+            name=name,
+            trntype=mujoco.mjtTrn.mjTRN_JOINT,
+            target=name,
+            gaintype=mujoco.mjtGain.mjGAIN_FIXED,
+            gainprm=pad10([kp]),
+            biastype=mujoco.mjtBias.mjBIAS_AFFINE,
+            biasprm=pad10([0, -kp, -kv]),
+            ctrllimited=True,
+            ctrlrange=ctrlrange,
+        )
 
     return spec.compile()
