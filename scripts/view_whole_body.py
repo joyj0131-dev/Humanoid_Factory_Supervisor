@@ -16,12 +16,19 @@ Modes:
                its known failure mode (the object gets knocked away during
                approach), because PROJECT_CONTEXT.md Phase 4 reports this
                honestly rather than hiding it.
+    --diagonal-feasibility  SIZE_12 diagonal four-face grasp: shows the
+               current BEST STATIC candidate from humanoid_learning.expert.
+               diagonal_feasibility's Stage U search as a frozen pose (not
+               a live/dynamic attempt -- see PROJECT_CONTEXT.md, this
+               candidate does not yet satisfy the intended fingertip-face
+               assignment).
 
 Run locally (needs a real display):
     python scripts/view_whole_body.py --stand
     python scripts/view_whole_body.py --posture
     python scripts/view_whole_body.py --planar
     python scripts/view_whole_body.py --grasp
+    python scripts/view_whole_body.py --diagonal-feasibility
 """
 
 from __future__ import annotations
@@ -161,6 +168,207 @@ def mode_planar():
     run_viewer(env.model, env.data, step, steps=len(path) + 20)
 
 
+def mode_diagonal_feasibility():
+    """SIZE_12 Contact-Driven Four-Face Whole-Body Feasibility session:
+    shows the CURRENT best static candidate found by humanoid_learning.
+    expert.diagonal_feasibility's Stage U search (NOT a live/dynamic
+    grasp attempt -- this is a frozen kinematic pose, mj_step is never
+    called, so the viewer just displays the exact qpos the offline IK
+    solve produced). Reruns the same coarse-to-fine search the test
+    suite runs (scripts/test_diagonal_feasibility.py) so what's shown is
+    always reproducible from the checked-in search code, not a
+    hardcoded snapshot -- as of this session, the best candidate is
+    collision-free with healthy wrist_yaw/elbow joint-limit margin (see
+    PROJECT_CONTEXT.md for the waist_weight finding behind that), but
+    does NOT yet satisfy the intended fingertip-face assignment -- the
+    printed diagnostics below say so explicitly; this is a known-
+    incomplete research candidate, not a claimed success."""
+    from humanoid_learning.envs.grasp_config import GraspEnvConfig, SIZE_12_HALF
+    from humanoid_learning.envs.grasp_env import FixedBaseGraspEnv
+    from humanoid_learning.expert.diagonal_feasibility import (
+        CANDIDATE_C1, CANDIDATE_C2, build_candidate_specific_seeds, build_posture_seeds,
+        evaluate_static_pose, hand_corner_target, measure_per_finger_local_offsets, score_result,
+    )
+    from humanoid_learning.expert.coupled_ik import CoupledBilateralIK
+    from humanoid_learning.expert.grasp_expert import GraspExpertConfig
+    from humanoid_learning.envs import hand_synergy
+
+    cfg = GraspEnvConfig(object_pos=(0.27, 0.0, 0.0), arm_kp=120.0, object_half_size=SIZE_12_HALF)
+    env = FixedBaseGraspEnv(cfg)
+    env.reset(seed=0)
+    model = env.model
+
+    left_palm_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, wbc.LEFT_PALM_SITE)
+    right_palm_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, wbc.RIGHT_PALM_SITE)
+    waist_jids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n) for n in wbc.WAIST_JOINTS]
+    waist_qpos_adr = np.array([model.jnt_qposadr[j] for j in waist_jids])
+    waist_dof_adr = np.array([model.jnt_dofadr[j] for j in waist_jids])
+    waist_low = model.jnt_range[waist_jids, 0].copy()
+    waist_high = model.jnt_range[waist_jids, 1].copy()
+    coupled = CoupledBilateralIK(
+        model, left_palm_id, right_palm_id,
+        waist_dof_adr, env._arm_dof_adr[:7], env._arm_dof_adr[7:],
+        waist_qpos_adr, env._arm_qpos_adr[:7], env._arm_qpos_adr[7:],
+        np.concatenate([waist_low, env._arm_ctrl_low[:7], env._arm_ctrl_low[7:]]),
+        np.concatenate([waist_high, env._arm_ctrl_high[:7], env._arm_ctrl_high[7:]]),
+    )
+    stand_q17 = np.concatenate([
+        env.data.qpos[waist_qpos_adr].copy(), env.data.qpos[env._arm_qpos_adr[:7]].copy(), env.data.qpos[env._arm_qpos_adr[7:]].copy(),
+    ])
+    obj_pos = env.data.qpos[env._object_qpos_adr:env._object_qpos_adr + 3].copy()
+    obj_quat = env.data.qpos[env._object_qpos_adr + 3:env._object_qpos_adr + 7].copy()
+    gcfg = GraspExpertConfig()
+    left_offsets = measure_per_finger_local_offsets(env, "left", gcfg.thumb1_abduct_pose_left)
+    right_offsets = measure_per_finger_local_offsets(env, "right", gcfg.thumb1_abduct_pose_right)
+    left_open = np.array(hand_synergy.left_hand_targets(0.0), dtype=float); left_open[1] = gcfg.thumb1_abduct_pose_left
+    right_open = np.array(hand_synergy.right_hand_targets(0.0), dtype=float); right_open[1] = gcfg.thumb1_abduct_pose_right
+    finger_adr = (env._left_finger_qpos_adr, env._right_finger_qpos_adr)
+    finger_targets = (left_open, right_open)
+    seeds = build_posture_seeds(stand_q17)
+    scratch = mujoco.MjData(model)
+
+    def solve_one(candidate, seed, yaw, standoff, waist_weight):
+        left_t = hand_corner_target(obj_pos, obj_quat, SIZE_12_HALF, candidate.left, palm_standoff=standoff, side="left", corner_yaw_deg=yaw)
+        right_t = hand_corner_target(obj_pos, obj_quat, SIZE_12_HALF, candidate.right, palm_standoff=standoff, side="right", corner_yaw_deg=yaw)
+        scratch.qpos[:] = env.data.qpos
+        scratch.qvel[:] = 0.0
+        return evaluate_static_pose(
+            coupled, scratch, model, env._object_body_id, obj_pos, obj_quat, candidate, seed, left_t, right_t,
+            left_offsets, right_offsets, finger_qpos_adr=finger_adr, finger_open_targets=finger_targets,
+            corner_yaw_deg=(yaw, yaw), waist_weight=waist_weight,
+        )
+
+    print("Searching the same coarse grid scripts/test_diagonal_feasibility.py uses (this may take ~1-2 minutes)...")
+    results = []
+    for candidate in (CANDIDATE_C1, CANDIDATE_C2):
+        all_seeds = seeds + build_candidate_specific_seeds(candidate.name, stand_q17)
+        for yaw in (15.0, 30.0, 45.0):
+            for standoff in (0.20, 0.24):
+                for waist_weight in (None, 1.0):
+                    for seed in all_seeds:
+                        results.append(solve_one(candidate, seed, yaw, standoff, waist_weight))
+
+    # Default to the WAIST-TWISTED result (waist_weight=1.0, waist let
+    # loose instead of the solver's own 6x anti-waist default) -- that is
+    # the specific comparison the user asked to see, not just whichever
+    # candidate score_result ranks first overall (score_result's face-
+    # assignment tie only breaks on raw error right now, which happened
+    # to prefer an UN-twisted, joint-limit-saturated candidate last time).
+    twisted = [r for r in results if r.waist_weight_used != 6.0]
+    results.sort(key=score_result)
+    twisted.sort(key=score_result)
+    best = twisted[0] if twisted else results[0]
+    best_default = results[0]
+
+    print(
+        f"\nShowing the WAIST-TWISTED candidate (waist_weight={best.waist_weight_used:.1f}, waist actually let loose)."
+    )
+    print(
+        f"For comparison, the untwisted default (waist_weight={best_default.waist_weight_used:.1f}) has "
+        f"wrist_yaw_margin={best_default.wrist_yaw_margin:.4f}/elbow_margin={best_default.elbow_margin:.4f} "
+        f"vs this candidate's wrist_yaw_margin={best.wrist_yaw_margin:.4f}/elbow_margin={best.elbow_margin:.4f}.\n"
+    )
+    print(
+        f"Best static candidate found: chirality={best.candidate} seed={best.seed_name} "
+        f"corner_yaw={best.corner_yaw_deg} waist_weight={best.waist_weight_used:.1f}\n"
+        f"  collision_free={best.collision_free}  face_assignment_satisfied={best.face_assignment_satisfied}\n"
+        f"  wrist_yaw_margin={best.wrist_yaw_margin:.4f}  elbow_margin={best.elbow_margin:.4f}\n"
+        f"  left_pos_error={best.left_pos_error:.4f}  right_pos_error={best.right_pos_error:.4f}\n"
+        f"  left_ori_error={best.left_ori_error:.4f}  right_ori_error={best.right_ori_error:.4f}\n"
+        f"  intended faces: L thumb={best.left_target_face_thumb} finger={best.left_target_face_finger}  "
+        f"R thumb={best.right_target_face_thumb} finger={best.right_target_face_finger}\n"
+        f"  ACTUAL faces:   L thumb={best.left_thumb_face_actual} finger={best.left_finger_face_actual}  "
+        f"R thumb={best.right_thumb_face_actual} finger={best.right_finger_face_actual}\n"
+    )
+    if not best.face_assignment_satisfied:
+        print("NOTE: fingertip face assignment is NOT yet correct (see PROJECT_CONTEXT.md 22nd-session report) --")
+        print("      this is a known-incomplete research candidate, shown as-is, not a claimed success.\n")
+
+    env.data.qpos[waist_qpos_adr] = best.q17[0:3]
+    env.data.qpos[env._arm_qpos_adr[:7]] = best.q17[3:10]
+    env.data.qpos[env._arm_qpos_adr[7:]] = best.q17[10:17]
+    env.data.qpos[finger_adr[0]] = finger_targets[0]
+    env.data.qpos[finger_adr[1]] = finger_targets[1]
+    env.data.ctrl[env._arm_dof_adr[:7]] = best.q17[3:10]
+    env.data.ctrl[env._arm_dof_adr[7:]] = best.q17[10:17]
+    mujoco.mj_forward(model, env.data)
+
+    print("Showing the frozen static pose (physics is NOT stepped -- this is the raw IK solution, not a held/settled")
+    print("pose). Close the viewer window to exit.")
+    with mujoco.viewer.launch_passive(model, env.data) as viewer:
+        while viewer.is_running():
+            viewer.sync()
+            time.sleep(0.02)
+
+
+def mode_whole_body_diagonal():
+    """SIZE_12 Full-Body Diagonal Reach session: runs the Stage W
+    (floating pelvis + legs + waist + arms) static feasibility search
+    from humanoid_learning.expert.whole_body_diagonal_feasibility and
+    reports the result.
+
+    IMPORTANT (Section 15's explicit rule): this session's search found
+    NO candidate that is simultaneously (a) kinematically reachable
+    (hand+foot task converged, joint limits safe), (b) collision-free,
+    (c) COM-support-margin-safe, AND (d) fingertip-face-correct -- Static
+    Full-Body Feasibility is therefore FAIL for now, per PROJECT_
+    CONTEXT.md's session report. Per the explicit instruction "Static
+    feasibility가 실패했다면 가짜 dynamic motion을 만들지 않는다", this mode
+    does NOT show a frozen pose or any motion -- it prints exactly which
+    criteria the best-found candidate failed and exits."""
+    from humanoid_learning.envs.whole_body_env import WholeBodyEnv
+    from humanoid_learning.envs.grasp_config import SIZE_12_HALF
+    from humanoid_learning.expert.diagonal_feasibility import CANDIDATE_C1, CANDIDATE_C2
+    from humanoid_learning.expert.whole_body_diagonal_feasibility import (
+        build_whole_body_setup, build_whole_body_posture_seeds, run_stage_w_search, stage_w_score,
+    )
+
+    print("Building the SIZE_12 whole-body Stage W search (floating pelvis + legs + waist + arms)...")
+    env = WholeBodyEnv(wbc.WholeBodyConfig(), include_object=True)
+    env.reset(seed=0)
+    setup = build_whole_body_setup(env, SIZE_12_HALF)
+    seeds = build_whole_body_posture_seeds(setup.stand_joints_q)
+    print(f"Searching {len(seeds)} posture families x 2 chiralities x 2 corner angles (this may take a few minutes)...")
+    results = run_stage_w_search(setup, (CANDIDATE_C1, CANDIDATE_C2), seeds, (30.0, 45.0), 0.20, env.data.qpos.copy())
+    results.sort(key=stage_w_score)
+    best = results[0]
+    n_full = sum(1 for r in results if r.fully_passed)
+
+    print(
+        f"\nBest Stage W candidate: chirality={best.candidate} seed={best.seed_name} corner_yaw={best.corner_yaw_deg}\n"
+        f"  kinematic reach converged (hands+feet, joint-limit safe): {best.ik.success}\n"
+        f"    left_hand_pos_error={best.ik.left_hand_pos_error:.4f}  right_hand_pos_error={best.ik.right_hand_pos_error:.4f}\n"
+        f"    left_foot_pos_error={best.ik.left_foot_pos_error:.4f}  right_foot_pos_error={best.ik.right_foot_pos_error:.4f}\n"
+        f"    joint_limit_margin={best.ik.joint_limit_margin:.4f}\n"
+        f"  collision_free={best.collision_free}  (pairs: {best.collision_pairs[:3]})\n"
+        f"  COM support margin={best.com_support_margin:.4f}  (negative = COM projects outside the support polygon)\n"
+        f"  fingertip face assignment satisfied={best.face_assignment_satisfied}\n"
+        f"    intended (L thumb, L finger, R thumb, R finger)=({best.candidate == 'C1' and ('FACE_POS_X','FACE_POS_Y','FACE_NEG_X','FACE_NEG_Y') or ('FACE_NEG_X','FACE_POS_Y','FACE_POS_X','FACE_NEG_Y')})\n"
+        f"    actual  ={best.actual_faces}\n"
+        f"  fully_passed (ALL of the above)={best.fully_passed}\n"
+    )
+    print(f"{n_full} / {len(results)} candidates fully passed Static Full-Body Feasibility.")
+
+    if n_full == 0:
+        print(
+            "\nSTATIC FULL-BODY FEASIBILITY: FAIL.\n"
+            "Per PROJECT_CONTEXT.md's session report: kinematic reach (hand/foot position+orientation, joint-limit\n"
+            "margin) IS achievable for several candidates, but every one of them fails at least one of the two NEW\n"
+            "Stage W criteria -- collision (the hip region grazes the table when hinging forward to reach) and COM\n"
+            "support margin (reaching the diagonal corner shifts the whole-body COM outside this session's simplified\n"
+            "bounding-box support-polygon estimate by several cm) -- and fingertip face precision is also not yet\n"
+            "exact. No dynamic motion is shown (Section 15: do not fake motion after a static FAIL). See\n"
+            "PROJECT_CONTEXT.md for the full numeric breakdown and the next concrete steps.\n"
+        )
+        return
+
+    # Only reached if a genuine Static PASS exists -- not the case as of
+    # this session, but kept so a future session's improved search can
+    # extend straight into this same viewer without another rewrite.
+    print("A genuine Static Full-Body PASS candidate was found -- dynamic trajectory playback is not yet implemented")
+    print("for this case (out of scope this session); re-run with the improved search once available.")
+
+
 def mode_grasp(object_pos_x: float = 0.27, object_half_size: float | None = None):
     """Bimanual side-pinch attempt with the redesigned 9-state controller
     (STABLE_START..HOLD, rate-limited targets, grip_center/grip_half_width
@@ -238,13 +446,15 @@ def main():
     parser.add_argument("--posture", action="store_true")
     parser.add_argument("--planar", action="store_true")
     parser.add_argument("--grasp", action="store_true")
+    parser.add_argument("--diagonal-feasibility", action="store_true", help="show the current best SIZE_12 diagonal four-face STATIC candidate (frozen pose, not a live grasp attempt)")
+    parser.add_argument("--whole-body-diagonal", action="store_true", help="run the SIZE_12 full-body (pelvis/legs/waist/arms) Stage W diagonal-reach static feasibility search and report the result")
     parser.add_argument("--object-pos-x", type=float, default=0.27, help="object x position, meters from robot origin (--grasp only)")
     parser.add_argument("--object-half-size", type=float, default=None, help="object half-size, meters (--grasp only; default: GraspEnvConfig's own default, 0.06)")
     args = parser.parse_args()
 
-    modes = [args.stand, args.posture, args.planar, args.grasp]
+    modes = [args.stand, args.posture, args.planar, args.grasp, args.diagonal_feasibility, args.whole_body_diagonal]
     if sum(bool(m) for m in modes) != 1:
-        parser.error("pass exactly one of --stand / --posture / --planar / --grasp")
+        parser.error("pass exactly one of --stand / --posture / --planar / --grasp / --diagonal-feasibility / --whole-body-diagonal")
 
     if args.stand:
         mode_stand()
@@ -254,6 +464,10 @@ def main():
         mode_planar()
     elif args.grasp:
         mode_grasp(object_pos_x=args.object_pos_x, object_half_size=args.object_half_size)
+    elif args.diagonal_feasibility:
+        mode_diagonal_feasibility()
+    elif args.whole_body_diagonal:
+        mode_whole_body_diagonal()
 
 
 if __name__ == "__main__":

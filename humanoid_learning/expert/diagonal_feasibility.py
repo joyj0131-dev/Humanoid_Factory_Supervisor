@@ -33,8 +33,23 @@ import numpy as np
 from humanoid_learning.envs import hand_synergy
 from humanoid_learning.envs import task_config as tc
 from humanoid_learning.envs import whole_body_config as wbc
+from humanoid_learning.expert import pose_ik
 from humanoid_learning.expert.coupled_ik import CoupledBilateralIK, CoupledIKResult
 from humanoid_learning.expert.grasp_expert import make_side_pinch_orientation
+
+# SIZE_12 Full-Body Diagonal Reach session, Section 4: the PROVEN-GOOD
+# baseline orientation each hand actually uses in the live controller
+# (grasp_expert.BimanualSidePinchExpert.__init__: self.left_R/right_R),
+# reproduced here byte-for-byte. corner_direction_local_at_yaw's yaw=0
+# case is now REQUIRED to reduce to this exact matrix (not merely "close
+# to" a finger-face-normal approximation, which the prior session's
+# version used and which was NOT the same orientation family -- see
+# PROJECT_CONTEXT.md's 22nd-session-follow-up report on why that broke
+# the yaw sweep's usefulness).
+HAND_BASELINE_R: dict[str, np.ndarray] = {
+    "left": make_side_pinch_orientation(np.array([0.0, -1.0, 0.0]), approach_hint=np.array([1.0, 0.0, 0.0])),
+    "right": make_side_pinch_orientation(np.array([0.0, 1.0, 0.0]), approach_hint=np.array([1.0, 0.0, 0.0])),
+}
 
 # Object-local outward face normals (Section 11 of the prior session's
 # face classifier uses the SAME convention: dominant local axis + sign).
@@ -120,22 +135,51 @@ def corner_direction_local_at_yaw(assignment: HandFaceAssignment, corner_yaw_deg
     return v / np.linalg.norm(v)
 
 
+def _bisector_orientation_world(assignment: HandFaceAssignment, obj_quat: np.ndarray) -> np.ndarray:
+    """The FULL (45-degree) diagonal-corner orientation, world-frame,
+    unchanged from the prior session's construction (approach = -corner
+    bisector direction, closing = tangent to the corner edge). Used only
+    as the yaw=45 ENDPOINT of the SO(3) interpolation in hand_corner_
+    target below -- never returned directly to a caller expecting
+    yaw < 45."""
+    R_obj = _quat_to_mat(obj_quat)
+    corner_dir_world = R_obj @ corner_direction_local(assignment)
+    corner_dir_world = corner_dir_world / np.linalg.norm(corner_dir_world)
+    approach_world = -corner_dir_world
+    closing_world = np.array([-corner_dir_world[1], corner_dir_world[0], 0.0])
+    n = np.linalg.norm(closing_world)
+    closing_world = np.array([0.0, 1.0, 0.0]) if n < 1e-6 else closing_world / n
+    return make_side_pinch_orientation(closing_world, approach_hint=approach_world)
+
+
 def hand_corner_target(
     obj_pos: np.ndarray, obj_quat: np.ndarray, half_size: float, assignment: HandFaceAssignment,
-    palm_standoff: float, height_offset: float = 0.0, corner_yaw_deg: float = 45.0,
+    palm_standoff: float, side: str, height_offset: float = 0.0, corner_yaw_deg: float = 45.0,
     wrist_pitch_adjust: float = 0.0, wrist_roll_adjust: float = 0.0,
 ) -> HandCornerTarget:
     """Builds the PALM (not fingertip) position/orientation for one hand's
-    corner pregrasp/final-contact pose (Section 6): palm sits OUTSIDE the
-    corner edge along the diagonal, approaching straight at the edge, with
-    the closing (thumb-vs-finger) axis tangent to the edge in the XY
-    plane -- so thumb and fingers spread along the corner's own edge
-    direction instead of along either face's normal individually.
+    corner pregrasp/final-contact pose (Section 6). POSITION: the palm
+    sits OUTSIDE the corner edge along a direction blended between the
+    finger face's own normal (corner_yaw_deg=0) and the full diagonal
+    bisector (corner_yaw_deg=45) -- see corner_direction_local_at_yaw.
 
-    ``corner_yaw_deg`` (new this session, Section 2/6): 45 reproduces the
-    prior session's fixed diagonal bisector exactly; smaller values bias
-    the approach/palm-position direction toward the finger face's own
-    normal (see corner_direction_local_at_yaw), asking less of wrist_yaw.
+    ORIENTATION (SIZE_12 Full-Body Diagonal Reach session, Section 4 --
+    REDESIGNED this session): a prior version derived orientation from
+    the SAME yaw-blended direction via approach=-direction/closing=
+    tangent, which does NOT reduce to this hand's proven-good baseline
+    orientation at yaw=0 (confirmed directly: that construction sits
+    roughly 90 degrees from the true baseline, since the tangent formula
+    has no notion of "this hand's own baseline chirality"). Fixed by
+    explicitly SO(3)-interpolating (geodesic, via pose_ik.so3_log/
+    so3_exp) from ``HAND_BASELINE_R[side]`` (yaw=0, byte-identical to
+    grasp_expert.BimanualSidePinchExpert's self.left_R/right_R) to the
+    full bisector orientation (yaw=45, unchanged from the prior
+    session's construction) -- guarantees yaw=0 equals the true baseline
+    exactly, yaw=45 equals the old bisector exactly, intermediate angles
+    are a single smooth rotation (no 90-degree axis discontinuity), and
+    the interpolation is a proper orthonormal det=+1 rotation by
+    construction (geodesic SO(3) interpolation of two rotations).
+
     ``wrist_pitch_adjust``/``wrist_roll_adjust`` (radians) apply a small
     extra rotation on top of the base orientation, independently per
     hand, matching Section 2's "wrist pitch/roll도 작은 범위에서 독립적으로
@@ -149,18 +193,18 @@ def hand_corner_target(
     corner_dir_world = R_obj @ corner_local
     corner_dir_world = corner_dir_world / np.linalg.norm(corner_dir_world)
 
-    approach_world = -corner_dir_world  # points INWARD, from outside the corner toward it
-    # Tangent to the edge in the XY plane (perpendicular to corner_dir,
-    # staying horizontal) -- the thumb/finger separation axis.
+    palm_pos = corner_edge_world + corner_dir_world * palm_standoff
+    approach_world = -corner_dir_world  # reported for diagnostics only (position/standoff direction)
     closing_world = np.array([-corner_dir_world[1], corner_dir_world[0], 0.0])
     closing_norm = np.linalg.norm(closing_world)
-    if closing_norm < 1e-6:
-        closing_world = np.array([0.0, 1.0, 0.0])
-    else:
-        closing_world = closing_world / closing_norm
+    closing_world = np.array([0.0, 1.0, 0.0]) if closing_norm < 1e-6 else closing_world / closing_norm
 
-    palm_pos = corner_edge_world + corner_dir_world * palm_standoff
-    palm_R = make_side_pinch_orientation(closing_world, approach_hint=approach_world)
+    R_baseline = HAND_BASELINE_R[side]
+    R_bisector = _bisector_orientation_world(assignment, obj_quat)
+    t = np.clip(corner_yaw_deg / 45.0, 0.0, 1.0)
+    delta = pose_ik.so3_log(R_bisector @ R_baseline.T)
+    palm_R = pose_ik.so3_exp(t * delta) @ R_baseline
+
     if wrist_pitch_adjust != 0.0 or wrist_roll_adjust != 0.0:
         # Small extra rotation about the palm's OWN local lateral (pitch)
         # and approach (roll) axes -- applied on the right so it composes
