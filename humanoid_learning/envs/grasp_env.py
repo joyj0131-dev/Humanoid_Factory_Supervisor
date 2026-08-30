@@ -217,6 +217,20 @@ class FixedBaseGraspEnv(gym.Env):
         # step()'s substep-level force safety loop. Empty means no group
         # exceeded finger_force_safety_limit during that step.
         self.last_safety_events: list[tuple[str, int, float]] = []
+        # SIZE_12 Thumb Contact-Loss Causality session: optional read-only
+        # callback invoked once per PHYSICS SUBSTEP (after that substep's
+        # mj_step + safety-rollback check, inside the frame_skip loop
+        # below), receiving this env instance itself so a diagnostic
+        # tracer can pull data.contact/data.ctrl/last_safety_events at
+        # substep granularity -- something no existing hook exposes
+        # (last_safety_events is only readable AFTER the full tick, once
+        # any within-tick rollback-then-reclosing pattern is no longer
+        # observable). None (default) costs one attribute read + is-None
+        # check per substep and changes no control-path behavior --
+        # verified by re-running scripts/test_grasp.py with it left at
+        # None (streak unchanged at 14). Never set by grasp_expert.py or
+        # any production call site.
+        self.substep_hook: object | None = None
 
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs(), self._get_info()
@@ -346,7 +360,7 @@ class FixedBaseGraspEnv(gym.Env):
         limit = self.config.finger_force_safety_limit
         warn = limit * self.config.finger_force_warning_ratio
         self.last_safety_events = []
-        for _ in range(self.config.frame_skip):
+        for _substep_idx in range(self.config.frame_skip):
             mujoco.mj_step(self.model, self.data)
             for side_idx, (side, group_ids) in enumerate((("left", self._left_group_act_ids), ("right", self._right_group_act_ids))):
                 for g in range(3):
@@ -369,6 +383,9 @@ class FixedBaseGraspEnv(gym.Env):
             elif hh_force > warn:
                 self.data.ctrl[self._left_group_act_ids[0]] = 0.5 * (self.data.ctrl[self._left_group_act_ids[0]] + prev_group_ctrl[0][0])
                 self.data.ctrl[self._right_group_act_ids[0]] = 0.5 * (self.data.ctrl[self._right_group_act_ids[0]] + prev_group_ctrl[1][0])
+
+            if self.substep_hook is not None:
+                self.substep_hook(self, _substep_idx, prev_group_ctrl)
 
         self._step_count += 1
         unstable = not (np.isfinite(self.data.qpos).all() and np.isfinite(self.data.qvel).all())
