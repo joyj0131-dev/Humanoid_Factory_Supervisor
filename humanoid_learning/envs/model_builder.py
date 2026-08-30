@@ -189,19 +189,32 @@ def build_whole_body_model(config, include_object: bool = False) -> mujoco.MjMod
     return spec.compile()
 
 
-def build_grasp_model(config) -> mujoco.MjModel:
+def build_grasp_model(config, hard_fixed_waist: bool = False) -> mujoco.MjModel:
     """Fixed-base grasp validation model: same lower-body-fixing approach as
     build_model() (Foundation, proven stable), but the object's mass/
     friction/size are configurable (GraspEnvConfig) instead of hard-coded,
     and object placement is a single deterministic point (not a randomized
     range) -- this env validates grasp PHYSICS, not reaching generalization.
-    """
+
+    ``hard_fixed_waist`` (Net-Torque Root Cause Isolation session, default
+    False -- the existing, unchanged behavior): when True, adds a physical
+    <equality joint> constraint pinning each of the 3 waist joints to their
+    stand-keyframe value, via the constraint solver (not a per-step qpos
+    teleport -- the waist actuators/kp are untouched, this is a genuine
+    holonomic constraint MuJoCo enforces every physics substep). Used ONLY
+    by the grasp-only diagnostic/experimental path (--grasp-experimental,
+    scripts/test_grasp.py's waist A/B comparison) to test whether the
+    small (~0.088 rad measured) waist drift under compliant position
+    control is a meaningful contributor to object net torque -- the
+    default fixed-base grasp model (hard_fixed_waist=False, what --grasp
+    and every existing test still use) is completely unaffected."""
     spec = mujoco.MjSpec.from_file(str(config.g1_xml_path))
 
     freejoint = spec.joint(tc.FLOATING_BASE_JOINT)
     spec.delete(freejoint)
     stand_key = spec.key(tc.STAND_KEYFRAME)
-    stand_key.qpos = np.asarray(stand_key.qpos)[7:].tolist()
+    stand_qpos = np.asarray(stand_key.qpos)[7:].tolist()
+    stand_key.qpos = stand_qpos
 
     _add_ee_sites(spec)
     _add_grasp_sites(spec)
@@ -228,6 +241,30 @@ def build_grasp_model(config) -> mujoco.MjModel:
         mass=config.object_mass,
         friction=list(config.object_friction),
     )
+
+    if hard_fixed_waist:
+        # spec.joint(name).qpos0 order matches tc's own qpos layout (post
+        # freejoint deletion) -- find each waist joint's stand-keyframe
+        # value by its position in the (now-headless) stand_qpos list via
+        # the SAME joint-name-to-index walk _apply_compliant_kp/the env
+        # itself use elsewhere (jnt_qposadr), done here at MjSpec level by
+        # re-deriving it from the compiled joint order below instead
+        # (simpler: pin to the joint's own default qpos0, which for a
+        # freshly-compiled spec still reflects the stand keyframe only if
+        # explicitly set -- so pin to the ACTUAL stand_qpos value looked
+        # up by name, computed after a throwaway compile pass would be
+        # circular; instead locate each waist joint's index directly in
+        # tc's known qpos ordering for this fixed-base spec).
+        all_joint_names_in_order = [j.name for j in spec.joints]
+        for wj in wbc.WAIST_JOINTS:
+            idx = all_joint_names_in_order.index(wj)
+            pin_value = float(stand_qpos[idx])
+            spec.add_equality(
+                type=mujoco.mjtEq.mjEQ_JOINT,
+                name1=wj,
+                objtype=mujoco.mjtObj.mjOBJ_JOINT,
+                data=[pin_value, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            )
 
     model = spec.compile()
     _apply_compliant_kp(model, tc.LEFT_ARM_JOINTS + tc.RIGHT_ARM_JOINTS, config.arm_kp)

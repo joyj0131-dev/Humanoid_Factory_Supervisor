@@ -99,7 +99,7 @@ class FixedBaseGraspEnv(gym.Env):
         self.config = config or gc.GraspEnvConfig()
         self.render_mode = render_mode
 
-        self.model = model_builder.build_grasp_model(self.config)
+        self.model = model_builder.build_grasp_model(self.config, hard_fixed_waist=self.config.hard_fixed_waist)
         self.data = mujoco.MjData(self.model)
         self._resolve_indices()
 

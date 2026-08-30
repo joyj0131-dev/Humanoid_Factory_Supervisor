@@ -105,6 +105,17 @@ class GraspEnvConfig:
 
     g1_xml_path: str = str(tc.G1_XML_PATH)
 
+    # Net-Torque Root Cause Isolation session: False (default) reproduces
+    # the existing --grasp/every current test's model exactly (waist held
+    # only by its own compliant position actuator, ~0.088 rad measured
+    # drift under grasp-time arm reaction forces). True builds the SAME
+    # model with an added physical <equality joint> constraint (see
+    # model_builder.build_grasp_model's hard_fixed_waist docstring) pinning
+    # each waist joint to its stand value -- a real, substep-enforced
+    # constraint, not a per-step qpos teleport -- used ONLY by this
+    # session's grasp-only A/B waist experiment.
+    hard_fixed_waist: bool = False
+
 
 def make_grasp_env_config(object_half_size: float, **overrides) -> GraspEnvConfig:
     """Builds a GraspEnvConfig for a given object size, holding everything

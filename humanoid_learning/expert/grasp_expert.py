@@ -515,6 +515,36 @@ class GraspExpertConfig:
     # 0.0 default is inert; a real value is set per-experiment (Section 3
     # requires testing this empirically, not assuming a single formula).
     diagonal_x_offset: float = 0.0
+    # Net-Torque Root Cause Isolation session, Section 8/12: False
+    # (default) is the EXISTING, unchanged behavior -- _contact_ref (the
+    # object-pose reference _grip_targets computes arm/palm targets from)
+    # keeps re-capturing the object's CURRENT pose every step for as long
+    # as both hands hold finger contact, from TRIPOD_SETTLE onward. True
+    # freezes _contact_ref at whatever it was the instant TRIPOD_SETTLE is
+    # entered (this experiment's "B2: frozen target" condition) -- arm/
+    # palm targets stop tracking the object's live position from that
+    # point on, and only finger-group force regulation (unaffected by
+    # this flag) continues to react to the actual contact. Tests the
+    # TARGET_CHASING hypothesis: does continuously re-centering the arm
+    # target on a drifting/rotating object inject the sustained
+    # oscillation this session's diagnostic measured, rather than the
+    # object settling once genuine contact is established.
+    freeze_arm_target_after_tripod: bool = False
+    # Net-Torque Root Cause Isolation session, Section 11/12: direct
+    # per-group wrench measurement found BOTH thumbs are the dominant
+    # torque contributor during TRIPOD_SETTLE/FORCE_SETTLE (mean |torque|
+    # ~0.9-1.1 vs ~0.5-0.85 for index/middle) AND the least consistently
+    # in contact (21-23 samples vs 38-41 for index/middle in the same
+    # window) -- i.e. thumb's LARGER moment arm combined with
+    # intermittent re-engagement injects large torque impulses. 1.0
+    # (default) reproduces the existing uniform fine_step exactly
+    # (Candidate A/B unchanged). A value < 1.0 scales DOWN only the
+    # thumb group's force-regulation step size in TRIPOD_SETTLE/
+    # FORCE_SETTLE (index/middle unaffected), per Section 12's explicit
+    # guidance: suppress the dominant-torque group's closing rate first,
+    # without letting thumb support disappear entirely (this only slows
+    # thumb's OWN force correction rate, it never zeroes it out).
+    thumb_closing_rate_scale: float = 1.0
     # Section 7: object must not be actively perturbed for a state to
     # accept a transition into finger closing/lifting.
     max_object_speed_for_transition: float = 0.05  # m/s
@@ -892,6 +922,7 @@ class BimanualSidePinchExpert:
         self.lift_target_z = 0.0
         self._obj_ref: np.ndarray | None = None
         self._contact_ref: np.ndarray | None = None
+        self._target_frozen = False  # Net-Torque Root Cause Isolation session, see _maybe_update_contact_ref
 
         self.lift_left_start_pos: np.ndarray | None = None
         self.lift_right_start_pos: np.ndarray | None = None
@@ -1906,6 +1937,27 @@ class BimanualSidePinchExpert:
         gap = left_actual[2] - right_actual[2]
         self._z_sync_bias = np.clip(self._z_sync_bias - 0.3 * gap, -0.02, 0.02)
 
+    def _maybe_update_contact_ref(self, obj: np.ndarray, touched: bool) -> None:
+        """Net-Torque Root Cause Isolation session, Section 8 (the
+        TARGET_CHASING A/B condition): called ONLY from TRIPOD_SETTLE/
+        FINGER_CLOSE/FORCE_SETTLE (CONTACT_ACQUIRE/THUMB_OPPOSE keep their
+        own unconditional live-update calls, unaffected by this flag --
+        those earlier states are still genuinely acquiring contact, not
+        yet settled). With ``freeze_arm_target_after_tripod`` off (the
+        existing default), behaves exactly like the inlined ``if touched:
+        self._contact_ref = obj.copy()`` these call sites used to have.
+        With it on, the FIRST call from TRIPOD_SETTLE onward permanently
+        latches ``self._target_frozen`` and this becomes a no-op forever
+        after -- arm/palm targets stop tracking the object's live pose
+        from that point, matching Section 13's "object 현재 위치를 매
+        step 추격하지 않는다" requirement for this experiment."""
+        if self.config.freeze_arm_target_after_tripod:
+            if self._target_frozen:
+                return
+            self._target_frozen = True
+        if touched:
+            self._contact_ref = obj.copy()
+
     def _contact_acquire_hand_step(
         self, touch: bool, force: float, offset: float, substate: HandSubstate, reacquire_attempts: int, loss_grace: int
     ) -> tuple[float, HandSubstate, int, int]:
@@ -2773,22 +2825,22 @@ class BimanualSidePinchExpert:
             # sustained) before ever entering FORCE_SETTLE/LIFT -- Gate
             # A's literal requirement, not just "some finger touching".
             self._update_z_sync()
-            if left_c.finger.touched and right_c.finger.touched:
-                self._contact_ref = obj.copy()
+            self._maybe_update_contact_ref(obj, left_c.finger.touched and right_c.finger.touched)
             left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=self._effective_vertical_stagger)
             self.left_tracker.set_goal(left_goal)
             self.right_tracker.set_goal(right_goal)
 
             fine_step = 0.5 / cfg.finger_close_steps
+            fine_step_vec = np.array([fine_step * cfg.thumb_closing_rate_scale, fine_step, fine_step])
             over, under = cfg.max_safe_grip_force, cfg.target_grip_force
             left_thumb_before, right_thumb_before = self.left_group_synergy[0], self.right_group_synergy[0]
             self.left_group_synergy = np.where(
-                self.left_group_force_raw > over, np.maximum(0.0, self.left_group_synergy - fine_step),
-                np.where(self.left_group_force_raw < under, np.minimum(1.0, self.left_group_synergy + fine_step), self.left_group_synergy),
+                self.left_group_force_raw > over, np.maximum(0.0, self.left_group_synergy - fine_step_vec),
+                np.where(self.left_group_force_raw < under, np.minimum(1.0, self.left_group_synergy + fine_step_vec), self.left_group_synergy),
             )
             self.right_group_synergy = np.where(
-                self.right_group_force_raw > over, np.maximum(0.0, self.right_group_synergy - fine_step),
-                np.where(self.right_group_force_raw < under, np.minimum(1.0, self.right_group_synergy + fine_step), self.right_group_synergy),
+                self.right_group_force_raw > over, np.maximum(0.0, self.right_group_synergy - fine_step_vec),
+                np.where(self.right_group_force_raw < under, np.minimum(1.0, self.right_group_synergy + fine_step_vec), self.right_group_synergy),
             )
             # Hand-hand collision guard (same rationale as THUMB_OPPOSE):
             # never let this state's force regulation keep INCREASING
@@ -2855,8 +2907,7 @@ class BimanualSidePinchExpert:
             # distinction: that still solely depends on _obj_ref/state
             # transition bookkeeping recorded elsewhere, not on where this
             # tracker's target currently sits.
-            if left_c.finger.touched and right_c.finger.touched:
-                self._contact_ref = obj.copy()
+            self._maybe_update_contact_ref(obj, left_c.finger.touched and right_c.finger.touched)
 
             # Per-GROUP force regulation (Dynamic-Aware Multi-Start IK +
             # Multi-Finger Grasp/Lift/Hold session) -- direct measurement
@@ -2952,8 +3003,7 @@ class BimanualSidePinchExpert:
 
         elif self.state == GraspState.FORCE_SETTLE:
             self._update_z_sync()
-            if left_c.finger.touched and right_c.finger.touched:
-                self._contact_ref = obj.copy()
+            self._maybe_update_contact_ref(obj, left_c.finger.touched and right_c.finger.touched)
 
             step = cfg.settle_pressure_step
             # FINGER_CLOSE actively increases synergy every step while
@@ -2967,13 +3017,14 @@ class BimanualSidePinchExpert:
             # Per-GROUP fine trim -- same rationale as FINGER_CLOSE's
             # per-group regulation, gentler magnitude.
             fine_step = 0.5 / cfg.finger_close_steps
+            fine_step_vec = np.array([fine_step * cfg.thumb_closing_rate_scale, fine_step, fine_step])
             self.left_group_synergy = np.where(
-                self.left_group_force_raw > cfg.max_safe_grip_force, np.maximum(0.0, self.left_group_synergy - fine_step),
-                np.where(self.left_group_force_raw < cfg.target_grip_force, np.minimum(1.0, self.left_group_synergy + fine_step), self.left_group_synergy),
+                self.left_group_force_raw > cfg.max_safe_grip_force, np.maximum(0.0, self.left_group_synergy - fine_step_vec),
+                np.where(self.left_group_force_raw < cfg.target_grip_force, np.minimum(1.0, self.left_group_synergy + fine_step_vec), self.left_group_synergy),
             )
             self.right_group_synergy = np.where(
-                self.right_group_force_raw > cfg.max_safe_grip_force, np.maximum(0.0, self.right_group_synergy - fine_step),
-                np.where(self.right_group_force_raw < cfg.target_grip_force, np.minimum(1.0, self.right_group_synergy + fine_step), self.right_group_synergy),
+                self.right_group_force_raw > cfg.max_safe_grip_force, np.maximum(0.0, self.right_group_synergy - fine_step_vec),
+                np.where(self.right_group_force_raw < cfg.target_grip_force, np.minimum(1.0, self.right_group_synergy + fine_step_vec), self.right_group_synergy),
             )
             self._sync_scalar_synergy()
 
