@@ -312,10 +312,14 @@ def mode_whole_body_diagonal():
     (hand+foot task converged, joint limits safe), (b) collision-free,
     (c) COM-support-margin-safe, AND (d) fingertip-face-correct -- Static
     Full-Body Feasibility is therefore FAIL for now, per PROJECT_
-    CONTEXT.md's session report. Per the explicit instruction "Static
-    feasibility가 실패했다면 가짜 dynamic motion을 만들지 않는다", this mode
-    does NOT show a frozen pose or any motion -- it prints exactly which
-    criteria the best-found candidate failed and exits."""
+    CONTEXT.md's session report. This mode does NOT animate any motion
+    (Section 15: never fake dynamic motion after a static FAIL) -- but
+    it DOES open the MuJoCo viewer on the best-found candidate as a
+    FROZEN kinematic pose (mj_step is never called), matching mode_
+    diagonal_feasibility's precedent, so the actual geometry can be
+    inspected directly instead of only as printed numbers. The failure
+    is printed to the console FIRST and is unambiguous about what is and
+    is not being shown."""
     from humanoid_learning.envs.whole_body_env import WholeBodyEnv
     from humanoid_learning.envs.grasp_config import SIZE_12_HALF
     from humanoid_learning.expert.diagonal_feasibility import CANDIDATE_C1, CANDIDATE_C2
@@ -357,16 +361,26 @@ def mode_whole_body_diagonal():
             "Stage W criteria -- collision (the hip region grazes the table when hinging forward to reach) and COM\n"
             "support margin (reaching the diagonal corner shifts the whole-body COM outside this session's simplified\n"
             "bounding-box support-polygon estimate by several cm) -- and fingertip face precision is also not yet\n"
-            "exact. No dynamic motion is shown (Section 15: do not fake motion after a static FAIL). See\n"
-            "PROJECT_CONTEXT.md for the full numeric breakdown and the next concrete steps.\n"
+            "exact. No dynamic MOTION is shown (Section 15: never fake motion after a static FAIL) -- the viewer\n"
+            "below shows the BEST-FOUND candidate above as a single FROZEN pose so you can inspect the actual\n"
+            "geometry (it is NOT a success, NOT a held/settled pose, and NOT physics-stepped).\n"
         )
-        return
+    else:
+        print("A genuine Static Full-Body PASS candidate was found -- dynamic trajectory playback is not yet")
+        print("implemented for this case (out of scope this session); showing the PASS candidate as a frozen pose.")
 
-    # Only reached if a genuine Static PASS exists -- not the case as of
-    # this session, but kept so a future session's improved search can
-    # extend straight into this same viewer without another rewrite.
-    print("A genuine Static Full-Body PASS candidate was found -- dynamic trajectory playback is not yet implemented")
-    print("for this case (out of scope this session); re-run with the improved search once available.")
+    env.data.qpos[0:7] = best.ik.pelvis_qpos
+    env.data.qpos[setup.joints_qpos_adr] = best.ik.joints_qpos
+    env.data.qpos[setup.left_finger_qpos_adr] = setup.left_finger_open
+    env.data.qpos[setup.right_finger_qpos_adr] = setup.right_finger_open
+    env.data.ctrl[:] = 0.0
+    mujoco.mj_forward(setup.model, env.data)
+
+    print("\nClose the viewer window to exit.")
+    with mujoco.viewer.launch_passive(setup.model, env.data) as viewer:
+        while viewer.is_running():
+            viewer.sync()
+            time.sleep(0.02)
 
 
 def mode_grasp(object_pos_x: float = 0.27, object_half_size: float | None = None):
