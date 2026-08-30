@@ -307,19 +307,19 @@ def mode_whole_body_diagonal():
     from humanoid_learning.expert.whole_body_diagonal_feasibility and
     reports the result.
 
-    IMPORTANT (Section 15's explicit rule): this session's search found
-    NO candidate that is simultaneously (a) kinematically reachable
-    (hand+foot task converged, joint limits safe), (b) collision-free,
-    (c) COM-support-margin-safe, AND (d) fingertip-face-correct -- Static
-    Full-Body Feasibility is therefore FAIL for now, per PROJECT_
-    CONTEXT.md's session report. This mode does NOT animate any motion
-    (Section 15: never fake dynamic motion after a static FAIL) -- but
-    it DOES open the MuJoCo viewer on the best-found candidate as a
-    FROZEN kinematic pose (mj_step is never called), matching mode_
-    diagonal_feasibility's precedent, so the actual geometry can be
-    inspected directly instead of only as printed numbers. The failure
-    is printed to the console FIRST and is unambiguous about what is and
-    is not being shown."""
+    IMPORTANT: this session's search found NO candidate that is
+    simultaneously (a) kinematically reachable (hand+foot task
+    converged, joint limits safe), (b) collision-free, (c) COM-support-
+    margin-safe, AND (d) fingertip-face-correct -- Static Full-Body
+    Feasibility is FAIL for now, per PROJECT_CONTEXT.md's session
+    report. This is NOT a claim that the resulting motion below is a
+    successful grasp reach -- it is the robot ACTUALLY ATTEMPTING the
+    best-found (known-imperfect) candidate under real physics (mj_step,
+    driven by the leg/waist/arm position actuators, min-jerk from the
+    stand pose), so whatever genuinely happens -- reaching cleanly,
+    wobbling, or the pelvis/knee losing balance given the already-
+    measured negative COM support margin -- is shown as-is. The full
+    static breakdown is printed to the console FIRST."""
     from humanoid_learning.envs.whole_body_env import WholeBodyEnv
     from humanoid_learning.envs.grasp_config import SIZE_12_HALF
     from humanoid_learning.expert.diagonal_feasibility import CANDIDATE_C1, CANDIDATE_C2
@@ -361,26 +361,78 @@ def mode_whole_body_diagonal():
             "Stage W criteria -- collision (the hip region grazes the table when hinging forward to reach) and COM\n"
             "support margin (reaching the diagonal corner shifts the whole-body COM outside this session's simplified\n"
             "bounding-box support-polygon estimate by several cm) -- and fingertip face precision is also not yet\n"
-            "exact. No dynamic MOTION is shown (Section 15: never fake motion after a static FAIL) -- the viewer\n"
-            "below shows the BEST-FOUND candidate above as a single FROZEN pose so you can inspect the actual\n"
-            "geometry (it is NOT a success, NOT a held/settled pose, and NOT physics-stepped).\n"
+            "exact. The viewer below will actually DRIVE the robot toward this known-imperfect candidate under real\n"
+            "physics -- watch for wobbling, falling, or the knee/hip losing contact, which is the physical meaning\n"
+            "of the negative COM margin measured above, not a bug in the playback.\n"
         )
     else:
-        print("A genuine Static Full-Body PASS candidate was found -- dynamic trajectory playback is not yet")
-        print("implemented for this case (out of scope this session); showing the PASS candidate as a frozen pose.")
+        print("A genuine Static Full-Body PASS candidate was found -- driving the robot toward it below.")
 
-    env.data.qpos[0:7] = best.ik.pelvis_qpos
-    env.data.qpos[setup.joints_qpos_adr] = best.ik.joints_qpos
-    env.data.qpos[setup.left_finger_qpos_adr] = setup.left_finger_open
-    env.data.qpos[setup.right_finger_qpos_adr] = setup.right_finger_open
-    env.data.ctrl[:] = 0.0
-    mujoco.mj_forward(setup.model, env.data)
+    # Real dynamic playback (Section 13's structure, simplified to one
+    # combined min-jerk phase from stand -> best-found target, since no
+    # candidate reached the Static PASS bar that would justify staging
+    # the full lower-body/pelvis/shoulder/elbow/wrist sub-phases
+    # separately): actuator ctrl targets are min-jerk-interpolated over
+    # ~4 seconds and mj_step is called every physics tick -- the pelvis
+    # is NEVER written directly (it is unactuated; wherever it ends up
+    # is a real consequence of leg motion + gravity + foot contact).
+    target_leg = best.ik.joints_qpos[0:12]
+    target_waist = best.ik.joints_qpos[12:15]
+    target_arm = best.ik.joints_qpos[15:29]
+    start_leg = env.data.ctrl[env._leg_act_ids].copy()
+    start_waist = env.data.ctrl[env._waist_act_ids].copy()
+    start_arm = env.data.ctrl[env._arm_act_ids].copy()
+    env.data.ctrl[env._left_hand_act_ids] = setup.left_finger_open
+    env.data.ctrl[env._right_hand_act_ids] = setup.right_finger_open
 
-    print("\nClose the viewer window to exit.")
+    duration_steps = int(4.0 / (setup.model.opt.timestep * env.config.frame_skip))
+    print(f"Driving toward the candidate over {duration_steps} control steps (~4.0s simulated time)...")
+    print("Close the viewer window to exit; the attempt repeats once it settles or falls.")
+
+    def reset_to_stand():
+        env.reset(seed=0)
+        build_whole_body_setup(env, SIZE_12_HALF)  # re-applies the SIZE_12 object resize/placement
+        env.data.ctrl[env._leg_act_ids] = start_leg
+        env.data.ctrl[env._waist_act_ids] = start_waist
+        env.data.ctrl[env._arm_act_ids] = start_arm
+        mujoco.mj_forward(setup.model, env.data)
+
+    reset_to_stand()
+    state = {"i": 0, "reported_outcome": False}
+
+    def step(_i):
+        i = state["i"]
+        t = min(1.0, i / duration_steps)
+        s = 10 * t**3 - 15 * t**4 + 6 * t**5  # minimum-jerk profile
+        env.data.ctrl[env._leg_act_ids] = start_leg + s * (target_leg - start_leg)
+        env.data.ctrl[env._waist_act_ids] = start_waist + s * (target_waist - start_waist)
+        env.data.ctrl[env._arm_act_ids] = start_arm + s * (target_arm - start_arm)
+        for _ in range(env.config.frame_skip):
+            mujoco.mj_step(setup.model, env.data)
+        pelvis_z = env.data.xpos[mujoco.mj_name2id(setup.model, mujoco.mjtObj.mjOBJ_BODY, wbc.PELVIS_BODY)][2]
+        fallen = pelvis_z < 0.4
+        if i % 60 == 0:
+            print(f"  step {i:4d}/{duration_steps} t={t:.2f} pelvis_z={pelvis_z:.3f} fallen={fallen}")
+        if fallen and not state["reported_outcome"]:
+            print(f"  >>> robot fell (pelvis_z={pelvis_z:.3f}) while attempting this candidate -- resetting shortly.")
+            state["reported_outcome"] = True
+        state["i"] += 1
+        if state["i"] >= duration_steps + 120:  # ~2s hold at the end, then restart
+            if not state["reported_outcome"]:
+                print(f"  >>> attempt finished without falling (pelvis_z={pelvis_z:.3f}); resetting to show it again.")
+            reset_to_stand()
+            state["i"] = 0
+            state["reported_outcome"] = False
+
     with mujoco.viewer.launch_passive(setup.model, env.data) as viewer:
         while viewer.is_running():
+            step_start = time.time()
+            step(state["i"])
             viewer.sync()
-            time.sleep(0.02)
+            elapsed = time.time() - step_start
+            target_dt = setup.model.opt.timestep * env.config.frame_skip
+            if elapsed < target_dt:
+                time.sleep(target_dt - elapsed)
 
 
 def mode_grasp(object_pos_x: float = 0.27, object_half_size: float | None = None):
