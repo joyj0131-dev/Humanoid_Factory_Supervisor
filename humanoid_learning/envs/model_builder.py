@@ -113,10 +113,14 @@ def _add_ee_sites(spec: "mujoco.MjSpec") -> None:
     )
 
 
-def _add_grasp_sites(spec: "mujoco.MjSpec") -> None:
-    """Palm-frame and fingertip reference sites -- see whole_body_config.py
-    for the empirically-derived convention (approach/closing/lateral axes).
-    Never modifies the stock XML; added via MjSpec like _add_ee_sites."""
+def _add_palm_sites(spec: "mujoco.MjSpec") -> None:
+    """The wrist "palm frame" sites ONLY -- see whole_body_config.py for
+    the empirically-derived convention (approach/closing/lateral axes).
+    This frame is defined on {side}_wrist_yaw_link itself, so it is
+    reusable UNCHANGED regardless of which hand is mounted there (Dex3 or
+    Sharpa) -- split out of _add_grasp_sites (which also adds Dex3-
+    specific fingertip sites) so the Sharpa path can reuse just this
+    part."""
     spec.body("left_wrist_yaw_link").add_site(
         name=wbc.LEFT_PALM_SITE,
         pos=list(wbc.LEFT_PALM_LOCAL_POS),
@@ -129,6 +133,12 @@ def _add_grasp_sites(spec: "mujoco.MjSpec") -> None:
         quat=list(wbc.RIGHT_PALM_LOCAL_QUAT),
         size=[0.008, 0.008, 0.008],
     )
+
+
+def _add_grasp_sites(spec: "mujoco.MjSpec") -> None:
+    """Palm-frame and Dex3 fingertip reference sites. Never modifies the
+    stock XML; added via MjSpec like _add_ee_sites."""
+    _add_palm_sites(spec)
     for site_name, body_name in wbc.FINGERTIP_SITE_BODIES.items():
         spec.body(body_name).add_site(
             name=site_name, pos=list(wbc.FINGERTIP_SITE_LOCAL_POS[site_name]), size=[0.004, 0.004, 0.004]
@@ -465,16 +475,35 @@ def attach_sharpa_hands(spec: "mujoco.MjSpec") -> None:
         spec.attach(sharpa_spec, prefix=f"{side}_", site=mount_site)
 
 
+def _add_sharpa_grasp_sites(spec: "mujoco.MjSpec") -> None:
+    """[35th session, Stage 4] The palm-frame sites (reused unchanged --
+    see _add_palm_sites) plus a fingertip reference site for each of the
+    10 Sharpa fingertips, placed at that fingertip's real elastomer
+    collision geom's own local position (the actual compliant contact
+    pad, not a hand-tuned offset like Dex3's FINGERTIP_SITE_LOCAL_POS)."""
+    from humanoid_learning.envs import sharpa_config as sc
+
+    _add_palm_sites(spec)
+    for side in sc.SIDES:
+        for finger in sc.FINGERS:
+            dp_body = sc.sharpa_body(side, finger, "DP")
+            elastomer_geom_name = sc.sharpa_elastomer_geom(side, finger)
+            geom = next(g for g in spec.body(dp_body).geoms if g.name == elastomer_geom_name)
+            spec.body(dp_body).add_site(
+                name=f"{side}_{finger}_sharpa_tip", pos=list(geom.pos), size=[0.004, 0.004, 0.004]
+            )
+
+
 def build_grasp_model_sharpa(config) -> mujoco.MjModel:
-    """[35th session, Stage 2] Same fixed-base grasp validation structure
-    as build_grasp_model() (lower-body fixing, EE/grasp sites, floor,
-    table+object), but with the Dex3 hand replaced by Sharpa Wave via
-    attach_sharpa_hands(). NOT wired into GraspEnvConfig/FixedBaseGraspEnv
-    yet -- those resolve Dex3-specific joint/actuator names (hand
-    synergy targets, fingertip sites) that only make sense once a
-    Sharpa-specific controller exists (Stage 4, deferred). This function
-    is model-only: it must compile cleanly and be collision-free at the
-    stand pose, which is as far as Stage 2 goes."""
+    """[35th session, Stage 2/4] Same fixed-base grasp validation
+    structure as build_grasp_model() (lower-body fixing, EE/grasp sites,
+    floor, table+object), but with the Dex3 hand replaced by Sharpa Wave
+    via attach_sharpa_hands(). Stage 4 adds fingertip sites
+    (_add_sharpa_grasp_sites) so sharpa_grasp_env.py/sharpa_grasp_expert.py
+    can reference real Sharpa contact points -- still NOT wired into the
+    Dex3-specific GraspEnvConfig/FixedBaseGraspEnv (those keep resolving
+    Dex3 joint/actuator names unchanged); Sharpa gets its OWN env/expert
+    pair instead (sharpa_grasp_env.py)."""
     spec = mujoco.MjSpec.from_file(str(config.g1_xml_path))
 
     freejoint = spec.joint(tc.FLOATING_BASE_JOINT)
@@ -484,6 +513,7 @@ def build_grasp_model_sharpa(config) -> mujoco.MjModel:
 
     attach_sharpa_hands(spec)
     _add_ee_sites(spec)
+    _add_sharpa_grasp_sites(spec)
     _add_floor(spec)
 
     table = spec.worldbody.add_body(name=tc.TABLE_BODY, pos=list(config.table_pos))
