@@ -1,15 +1,19 @@
-"""Sharpa Wave multi-finger grasp controller (Phase 4, 35th session, Stage 4).
+"""sharpa_single: SINGLE-HAND Sharpa grasp controller -- EXPLORATORY
+DIAGNOSTIC ONLY, NOT the Phase 4 official target (Phase 4, 35th session,
+Stage 4; re-labeled 36th session after an independent audit found the
+35th session's own report had described this prototype as "Stage 4"
+without stating clearly enough that the user-approved goal is BIMANUAL
+grasp -- see docs/history/PHASE4_GRASP_SESSION_35.md's correction note
+and sharpa_bimanual_grasp_expert.py, which is the actual official path).
 
-NOT a port of BimanualSidePinchExpert/THUMB_OPPOSE-TRIPOD_SETTLE -- that
-controller is built around Dex3's 3-finger (thumb/index/middle) per-hand
-topology and a BIMANUAL side-pinch (both hands' thumbs meeting at the
-object's center). Sharpa's 5-finger, 22-DoF hand can encircle a 12cm cube
-with ONE hand (thumb opposing index/middle, ring/pinky wrapping the far
-side) -- this controller drives a SINGLE hand (the right hand; the left
-stays at its stand pose) through a top-down power/precision grasp. This
-is a genuine, disclosed morphological difference from Dex3's bimanual
-approach, not an attempt to make the comparison "easier" -- Stage 6's
-report must say so explicitly, not blend the two conditions.
+Do not use SharpaSingleHandGraspExpert's results as a Sharpa-vs-Dex3
+comparison or as evidence of Sharpa's bimanual grasp feasibility -- it
+grasps with ONE hand only (the other stays at stand pose), which is a
+different task than Dex3's approved bimanual side-pinch. Kept here,
+unmodified in its own methodology, purely as a preserved diagnostic
+(the self-collision-avoidance geometry it discovered -- Y offset/height
+grid search -- was reused as a starting point for the bimanual
+controller's own, separately-verified geometry).
 
 State machine (13 states, Stage 4's own prescribed structure):
     STABLE_START -> NATURAL_ARM_LIFT -> FOREARM_APPROACH -> WRIST_ALIGN
@@ -128,7 +132,7 @@ class SharpaGraspOutcome:
     gate_d: bool
 
 
-class SharpaGraspExpert:
+class SharpaSingleHandGraspExpert:
     """Drives a SharpaGraspEnv through the 13-state grasp sequence. Call
     .step() once per control tick (mirrors BimanualSidePinchExpert's
     interface); .run() loops until a terminal state or step budget."""

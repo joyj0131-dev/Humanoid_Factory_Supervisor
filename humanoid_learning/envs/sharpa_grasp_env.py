@@ -70,7 +70,26 @@ class SharpaGraspEnv(gym.Env):
         self._resolve_indices()
 
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(ACTION_DIM,), dtype=np.float32)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(N_ARMS * 2 + 6 + 3,), dtype=np.float32)
+        # [36th session correction] The single-hand prototype's 37-dim
+        # observation (arm qpos/qvel + EE pos + object pos only) omitted
+        # hand joint state, object orientation/angular velocity, and
+        # per-group contact/force -- an independent audit found this
+        # would block sharing this SAME env across a future Expert/BC/PPO
+        # pipeline for this recovery skill (project rule: same env,
+        # same observation contract for all of them). Dimension is
+        # computed from the REAL compiled model, never hard-coded, and
+        # locked by a test (test_sharpa_bimanual_grasp.py).
+        self._n_curl_joints_per_side = sum(len(self._group_qpos_adr["left"][g]) for g in range(N_GROUPS_PER_HAND))
+        obs_dim = (
+            N_ARMS * 2  # arm qpos + qvel, both sides
+            + 2 * self._n_curl_joints_per_side * 2  # curl qpos + qvel, both sides
+            + 3 + 9  # left palm pos + xmat(9)
+            + 3 + 9  # right palm pos + xmat(9)
+            + 3 + 4  # object pos + quat
+            + 3 + 3  # object linear + angular velocity
+            + N_HAND_GROUPS  # per-(side,group) net contact force
+        )
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
         self._arm_target = np.zeros(N_ARMS, dtype=np.float64)
         self._waist_target = np.zeros(N_WAIST, dtype=np.float64)
@@ -116,13 +135,14 @@ class SharpaGraspEnv(gym.Env):
         # CLOSE_FRACTION for why close is not the hard upper limit.
         self._group_act_ids: dict[str, list[np.ndarray]] = {"left": [], "right": []}
         self._group_qpos_adr: dict[str, list[np.ndarray]] = {"left": [], "right": []}
+        self._group_dof_adr: dict[str, list[np.ndarray]] = {"left": [], "right": []}
         self._group_open: dict[str, list[np.ndarray]] = {"left": [], "right": []}
         self._group_close: dict[str, list[np.ndarray]] = {"left": [], "right": []}
         self._preshape_act_ids: dict[str, np.ndarray] = {}
         self._preshape_targets: dict[str, np.ndarray] = {}
         for side in sc.SIDES:
             for group in sc.GROUPS:
-                aids, qadrs, opens, closes = [], [], [], []
+                aids, qadrs, dadrs, opens, closes = [], [], [], [], []
                 for finger in sc.GROUP_FINGERS[group]:
                     for suffix in sc.curl_suffixes(finger):
                         jname = sc.sharpa_joint(side, finger, suffix)
@@ -131,10 +151,12 @@ class SharpaGraspEnv(gym.Env):
                         lo, hi = model.jnt_range[jid]
                         aids.append(act_id(aname))
                         qadrs.append(qpos_adr(jname))
+                        dadrs.append(dof_adr(jname))
                         opens.append(lo)
                         closes.append(lo + sc.CLOSE_FRACTION * (hi - lo))
                 self._group_act_ids[side].append(np.array(aids))
                 self._group_qpos_adr[side].append(np.array(qadrs))
+                self._group_dof_adr[side].append(np.array(dadrs))
                 self._group_open[side].append(np.array(opens))
                 self._group_close[side].append(np.array(closes))
 
@@ -405,10 +427,22 @@ class SharpaGraspEnv(gym.Env):
     def _get_obs(self) -> np.ndarray:
         arm_qpos = self.data.qpos[self._arm_qpos_adr]
         arm_qvel = self.data.qvel[self._arm_dof_adr]
-        left_ee = self.data.site_xpos[self._left_ee_site]
-        right_ee = self.data.site_xpos[self._right_ee_site]
+        parts = [arm_qpos, arm_qvel]
+        for side in sc.SIDES:
+            for g in range(N_GROUPS_PER_HAND):
+                parts.append(self.data.qpos[self._group_qpos_adr[side][g]])
+                parts.append(self.data.qvel[self._group_dof_adr[side][g]])
+        left_pos, left_R = self.palm_pose("left")
+        right_pos, right_R = self.palm_pose("right")
+        parts += [left_pos, left_R.flatten(), right_pos, right_R.flatten()]
         obj_pos = self.data.qpos[self._object_qpos_adr : self._object_qpos_adr + 3]
-        return np.concatenate([arm_qpos, arm_qvel, left_ee, right_ee, obj_pos]).astype(np.float32)
+        obj_quat = self.data.qpos[self._object_qpos_adr + 3 : self._object_qpos_adr + 7]
+        obj_linvel = self.data.qvel[self._object_dof_adr : self._object_dof_adr + 3]
+        obj_angvel = self.data.qvel[self._object_dof_adr + 3 : self._object_dof_adr + 6]
+        parts += [obj_pos, obj_quat, obj_linvel, obj_angvel]
+        group_forces = [self._group_contact_force(side, group)[1] for side in sc.SIDES for group in sc.GROUPS]
+        parts.append(np.array(group_forces))
+        return np.concatenate(parts).astype(np.float32)
 
     def _get_info(self) -> dict[str, Any]:
         touched, max_force = self._hand_object_contact()

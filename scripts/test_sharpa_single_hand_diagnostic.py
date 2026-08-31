@@ -1,14 +1,18 @@
-"""SharpaGraspEnv + SharpaGraspExpert tests (Phase 4, 35th session, Stage 4).
+"""sharpa_single diagnostic tests: SharpaGraspEnv + SharpaSingleHandGraspExpert
+(Phase 4, 35th session; re-labeled 36th session -- this is an EXPLORATORY
+SINGLE-HAND diagnostic, NOT the Phase 4 official bimanual path. See
+scripts/test_sharpa_bimanual_grasp.py for the official target's tests.
 
 Run AFTER test_sharpa_wave_model.py and test_sharpa_g1_integration.py.
 Run with:
-    python3 scripts/test_sharpa_grasp.py
+    python3 scripts/test_sharpa_single_hand_diagnostic.py
 
-REAL FINDING (this session): the first working end-to-end rollout makes
-genuine multi-finger contact (thumb/middle/wrap groups, 1.7-4.9N peak
-force) but currently loses that contact (CONTACT_LOST) during
-FORCE_SETTLE -- SIZE_12 Gate A is NOT yet achieved. This is reported
-honestly (not forced to pass) -- see docs/history/PHASE4_GRASP_SESSION_35.md.
+REAL FINDING (35th session): the first working end-to-end single-hand
+rollout makes genuine multi-finger contact (thumb/middle/wrap groups,
+1.7-4.9N peak force) but currently loses that contact (CONTACT_LOST)
+during FORCE_SETTLE. This is a single-hand exploratory result -- it does
+NOT establish or refute Sharpa's BIMANUAL grasp feasibility, and must
+never be compared directly against Dex3's bimanual results.
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ import numpy as np
 
 from humanoid_learning.envs.grasp_config import GraspEnvConfig, SIZE_12_HALF
 from humanoid_learning.envs.sharpa_grasp_env import SharpaGraspEnv, ACTION_DIM
-from humanoid_learning.expert.sharpa_grasp_expert import SharpaGraspExpert, SharpaGraspState, SharpaFailureReason
+from humanoid_learning.expert.sharpa_grasp_expert import SharpaSingleHandGraspExpert, SharpaGraspState, SharpaFailureReason
 
 
 def make_env(max_episode_steps: int = 8000) -> SharpaGraspEnv:
@@ -58,10 +62,10 @@ def test_set_preshape_moves_only_preshape_joints_of_the_named_side():
 
 def test_deterministic_rollout_reproducible():
     env1 = make_env()
-    expert1 = SharpaGraspExpert(env1)
+    expert1 = SharpaSingleHandGraspExpert(env1)
     outcome1 = expert1.run(max_total_steps=2000)
     env2 = make_env()
-    expert2 = SharpaGraspExpert(env2)
+    expert2 = SharpaSingleHandGraspExpert(env2)
     outcome2 = expert2.run(max_total_steps=2000)
     assert outcome1.state == outcome2.state
     assert outcome1.step_count == outcome2.step_count
@@ -88,7 +92,7 @@ def test_full_rollout_runs_to_a_terminal_state_without_crashing():
     """Headless rollout smoke test -- does NOT assert Gate A success
     (see this file's module docstring: Gate A is not yet achieved)."""
     env = make_env()
-    expert = SharpaGraspExpert(env)
+    expert = SharpaSingleHandGraspExpert(env)
     outcome = expert.run(max_total_steps=8000)
     assert outcome.state in (SharpaGraspState.SUCCESS, SharpaGraspState.FAILURE)
     print(f"    rollout reached terminal state {outcome.state.name} "
@@ -103,7 +107,7 @@ def test_real_multi_finger_contact_force_is_achieved_even_though_gate_a_is_not()
     before Gate A's stability requirement is met. This test locks in the
     CURRENT honest state: some contact, not yet a passing Gate A."""
     env = make_env()
-    expert = SharpaGraspExpert(env)
+    expert = SharpaSingleHandGraspExpert(env)
     outcome = expert.run(max_total_steps=8000)
     n_contacted = sum(outcome.group_contact.values())
     print(f"    groups ever contacted: {outcome.group_contact}, "
@@ -113,14 +117,14 @@ def test_real_multi_finger_contact_force_is_achieved_even_though_gate_a_is_not()
 
 def test_gate_a_is_not_falsely_reported_true_after_a_failure():
     """REAL BUG found and fixed this session: an earlier version of
-    SharpaGraspExpert.run() computed gate_a as `state NOT IN <early
+    SharpaSingleHandGraspExpert.run() computed gate_a as `state NOT IN <early
     states>`, which is True for FAILURE too (FAILURE is not one of the
     excluded early states) -- so a rollout that reached THUMB_OPPOSE and
     then failed with CONTACT_LOST incorrectly reported gate_a=True. This
     locks in the fix: gate_a must be False whenever the terminal state is
     FAILURE."""
     env = make_env()
-    expert = SharpaGraspExpert(env)
+    expert = SharpaSingleHandGraspExpert(env)
     outcome = expert.run(max_total_steps=8000)
     if outcome.state == SharpaGraspState.FAILURE:
         assert outcome.gate_a is False, "gate_a must never be True when the rollout ended in FAILURE"
