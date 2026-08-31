@@ -6,10 +6,10 @@
 > 성공으로 표현하지 않는다. Dex3 비교(Stage 5/6)는 Gate A 통과 전까지
 > 시작하지 않는다.
 >
-> **Phase 4.5의 시작 커밋은 `d038c5b`다.** 현재 tip은 `69276b3`이며,
-> `69276b3`은 시작점이 아니라 이 트랙의 가장 최근 검증 커밋일 뿐이다.
-> 공식 브랜치는 `phase4.5/sharpa-wave`(tip `69276b3`, 역사적 시작점
-> `d038c5b`). 상세 커밋 경계/브랜치/태그 표는
+> **Phase 4.5의 시작 커밋은 `d038c5b`다.** `69276b3`은 시작점이 아니라
+> 이 트랙의 최신 controller checkpoint다. 공식 브랜치는
+> `phase4.5/sharpa-wave`이며 이후 문서·빌드 수정으로 HEAD가 전진할 수
+> 있다. 역사적 시작점은 계속 `d038c5b`다. 상세 경계/브랜치/태그 표는
 > [`GIT_WORKFLOW.md`](GIT_WORKFLOW.md) 참고. 세션별 상세 기록은
 > `docs/history/PHASE4_GRASP_SESSION_35.md`/`_36.md`/
 > `_37_GIT_CLEANUP.md`(전부 로컬 전용, `.gitignore`).
@@ -61,20 +61,19 @@ baseline으로 `phase4/dex3-grasp` 브랜치에 보존한다.
 
 G1+Sharpa 통합 모델이 실제로 컴파일된다: 자기충돌 0, Sharpa 손 무게
 하중에서 arm 처짐 없음, 통합 테스트 스위트(`test_sharpa_g1_integration.py`)
-6/6 통과. 좌/우 각 손은 `attach_sharpa_hands()`(`model_builder.py`)가
+통과. 좌/우 각 손은 `attach_sharpa_hands()`(`model_builder.py`)가
 `prefix=f"{side}_"`로 부착하며, 벤더 XML 자체가 이미 `left_`/`right_`
 접두사를 갖고 있어 최종 body/joint/actuator 이름이 `left_left_...`/
 `right_right_...`로 이중 접두사가 된다(오타 아님, 의도된 결과 — 상세는
 `humanoid_learning/envs/sharpa_config.py` 모듈 docstring 참고).
 
-> **[37차 세션에 새로 발견한 빌드 전제조건]** `model_builder.
-> build_grasp_model_sharpa()`는 `GraspEnvConfig.effective_object_half_extents`를
-> 참조하는데, 이 속성은 아직 `grasp_config.py`에 정식 커밋되지 않았다
-> (Dex3 rectangular-object 실험용으로 uncommitted 상태로만 존재 —
-> `git log -S`로 확인한 결과 이 의존성은 540c9a4부터 이미 있었다). 순수
-> committed 코드만으로 `phase4.5/sharpa-wave`를 clean checkout하면
-> `SharpaGraspEnv` 생성 시 `AttributeError`가 난다. 다음 세션은 이
-> 속성을 Sharpa 트랙에 필요한 최소 형태로 정식 커밋해야 한다.
+> **[37차 감사 후 수정한 빌드 전제조건]** `model_builder.
+> build_grasp_model_sharpa()`가 540c9a4부터 참조해 온
+> `GraspEnvConfig.effective_object_half_extents`가 committed config에 없어
+> clean checkout이 `AttributeError`로 실패하는 문제를 확인했다. 공식
+> 브랜치에는 canonical cube의 세 축을 반환하는 최소 property와 회귀
+> 테스트만 추가했다. WIP의 `object_half_extents` 직육면체 옵션은 가져오지
+> 않았으므로 controller/IK/Gate 기준과 canonical geometry는 불변이다.
 
 ## Action mapping / 전체 G1+Sharpa 차원 — 실측 완료
 

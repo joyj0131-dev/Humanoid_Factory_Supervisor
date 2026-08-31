@@ -24,7 +24,9 @@ env/
 # =========================
 # Claude / local AI context
 # =========================
-.claude/
+# Do not ignore *.md globally: README and public project/design documents
+# are versioned. Only the explicit local operational context below is ignored.
+/.claude
 CLAUDE.md
 PROJECT_CONTEXT.md
 
@@ -47,7 +49,7 @@ results/manifold_grasp_collision_aware_ab.json
 # Local-only detailed session history (docs/ itself stays tracked for
 # future public documentation -- only the internal history archive is
 # ignored, same posture as PROJECT_CONTEXT.md below)
-docs/history/
+/docs/history
 PROJECT_CONTEXT.md.BACKUP_*
 
 # =========================
@@ -69,7 +71,7 @@ PROJECT_CONTEXT.md.BACKUP_*
 # =========================
 # MuJoCo / Robot Assets
 # =========================
-assets/robots/g1/
+/assets/robots/g1
 
 # Sharpa Wave hand MJCF/mesh assets (35th session) -- vendored subset is
 # ~23MB of upstream binary STL meshes, deliberately NOT committed to
@@ -78,8 +80,8 @@ assets/robots/g1/
 # scripts/install_sharpa_wave_assets.py reproduces the ignored content
 # below bit-for-bit from the pinned upstream commit (verified: see
 # docs/history/PHASE4_GRASP_SESSION_35.md).
-assets/robots/sharpa_wave/left_sharpa_wave/
-assets/robots/sharpa_wave/right_sharpa_wave/
+/assets/robots/sharpa_wave/left_sharpa_wave
+/assets/robots/sharpa_wave/right_sharpa_wave
 
 # =========================
 # Misc
