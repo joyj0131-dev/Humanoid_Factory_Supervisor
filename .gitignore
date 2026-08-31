@@ -39,6 +39,15 @@ logs/
 results/videos/
 results/*.mp4
 results/*.gif
+results/grasp_feasibility_map/
+results/tripod_closure_geometry_audit.json
+results/manifold_grasp_multistart.json
+
+# Local-only detailed session history (docs/ itself stays tracked for
+# future public documentation -- only the internal history archive is
+# ignored, same posture as PROJECT_CONTEXT.md below)
+docs/history/
+PROJECT_CONTEXT.md.BACKUP_*
 
 # =========================
 # Temporary / cache
