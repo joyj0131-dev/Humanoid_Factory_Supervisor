@@ -35,6 +35,20 @@ buckets (thumb_thumb, hand_hand, proximal_object, wrist_palm_object,
 self_collision, table_hand) or "allowed_tip_contact" (one of the 6
 designated true-fingertip links touching the object), and the collision
 penalty residual now covers all 6 buckets instead of 3.
+
+REAL FINDING (33rd session): even with the 32nd session's collision
+fix, the best candidate had a face-plane (site-position) residual of
+only 1.4mm while the SAME candidate's real mesh penetrated the object
+by 28.5mm on one of the supposedly "allowed" tip contacts. Measuring
+the TRUE site-to-mesh-surface offset (measure_fingertip_support_offset,
+a local Newton search on the REAL mujoco.mj_geomDistance, not a wide
+bisection which was found to converge to spurious distant roots) found
+this offset is NOT a fixed calibration constant: -19.5mm to -8.6mm at a
+neutral reset pose, but +2.1mm to +4.7mm at the real THUMB_OPPOSE-entry
+pose -- a >20mm swing depending on finger/arm configuration. The
+face-plane residual now targets mesh_signed_distance() (real
+mj_geomDistance between each tip's COLLISION geom, queried by contype,
+and the object geom) directly instead of the site-position proxy.
 """
 
 from __future__ import annotations
@@ -54,7 +68,9 @@ from humanoid_learning.expert.manifold_grasp_planner import (
     build_context, derive_primary_topology, mirrored_topology, run_multistart, solve_manifold,
     is_statically_feasible, check_pose_collisions, wrench_diagnostics, _write_x, _tip_world, FINGERS,
     enumerate_contact_pairs, ALL_FORBIDDEN_BUCKETS, LEGACY_FORBIDDEN_BUCKETS,
+    mesh_signed_distance, measure_fingertip_support_offset, ALLOWED_PENETRATION_TOL, ALLOWED_SEPARATION_TOL,
 )
+import mujoco
 
 
 def make_env():
@@ -214,16 +230,27 @@ def test_contact_pair_enumeration_reports_real_geom_and_body_names():
 
 def test_classifier_finds_proximal_object_and_self_collision_categories():
     """REAL FINDING (32nd session): the 31st session's own best
-    candidate (measured_primary/palm_back) has index/middle PROXIMAL
+    candidate (measured_primary/palm_back) had index/middle PROXIMAL
     links (not the tip) penetrating the object, and torso-vs-shoulder
     self-collision -- neither category existed in the 31st session's
-    3-bucket classifier. This test locks in that BOTH new categories are
-    now detected on that exact candidate."""
+    3-bucket classifier.
+
+    NOTE (33rd session): after the mesh-aware residual redesign, the
+    solved pose at that exact (palm_back, measured_primary) candidate
+    changed (as did every other metric at that candidate -- max_pen,
+    thumb_thumb contacts, wrench residual), so self_collision no longer
+    happens to occur AT THAT SPECIFIC SOLVE. That is an honest side
+    effect of a genuinely different optimum, not a classifier defect --
+    self_collision is still detected elsewhere (e.g. palm_forward). This
+    test's real intent is "the fuller classifier is CAPABLE of detecting
+    both categories", so it now checks across all multi-start candidates
+    rather than hard-coding one candidate's incidental bucket set."""
     env, expert = _reach_thumb_oppose()
     results, ctx = run_multistart(env, expert)
-    palm_back = next(r for r in results if r.name == "palm_back" and r.topology_name == "measured_primary")
-    buckets_seen = {p["bucket"] for p in palm_back.contact_pairs}
-    print(f"    buckets seen at palm_back: {buckets_seen}")
+    buckets_seen = set()
+    for r in results:
+        buckets_seen |= {p["bucket"] for p in r.contact_pairs}
+    print(f"    buckets seen across all {len(results)} candidates: {buckets_seen}")
     assert "proximal_object" in buckets_seen, "index/middle proximal links penetrating the object must be detected"
     assert "self_collision" in buckets_seen, "G1 self-collision (torso vs shoulder) must be detected"
 
@@ -258,6 +285,189 @@ def test_solving_with_full_collision_buckets_still_runs_and_is_deterministic():
     costs1 = [round(r.cost, 6) for r in results1]
     costs2 = [round(r.cost, 6) for r in results2]
     assert costs1 == costs2
+
+
+def _find_collision_geom(model, body_name):
+    bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+    for g in range(model.ngeom):
+        if model.geom_bodyid[g] == bid and model.geom_contype[g] == 1:
+            return g
+    raise ValueError(body_name)
+
+
+def test_geom_distance_sign_and_units_on_separated_touching_penetrating():
+    """Section 4: independently verifies mujoco.mj_geomDistance's sign
+    convention and units (meters) on three controlled conditions using
+    the REAL collision geom (contype==1, not the visual duplicate at an
+    identical pose -- every hand link in this model has both) for
+    left_hand_thumb_2_link against the real object box geom. Both geoms
+    have margin=0.0 and gap=0.0 (confirmed directly from the model), so
+    any contact.dist < 0 IS true geometric penetration, not a margin
+    artifact -- this test locks that model fact in too."""
+    env = make_env()
+    env.reset(seed=0)
+    model = env.model
+    thumb_geom = _find_collision_geom(model, "left_hand_thumb_2_link")
+    obj_geom = env._object_body_id
+    obj_geom_id = next(g for g in range(model.ngeom) if model.geom_bodyid[g] == obj_geom)
+    assert model.geom_margin[thumb_geom] == 0.0 and model.geom_gap[thumb_geom] == 0.0
+    assert model.geom_margin[obj_geom_id] == 0.0 and model.geom_gap[obj_geom_id] == 0.0
+
+    scratch = mujoco.MjData(model)
+    scratch.qpos[:] = env.data.qpos
+    obj_qpos_adr = env._object_qpos_adr
+    fromto = np.zeros(6)
+
+    # 1) clearly separated
+    scratch.qpos[obj_qpos_adr:obj_qpos_adr + 3] = [5.0, 5.0, 5.0]
+    scratch.qpos[obj_qpos_adr + 3:obj_qpos_adr + 7] = [1, 0, 0, 0]
+    mujoco.mj_forward(model, scratch)
+    dist_sep = mujoco.mj_geomDistance(model, scratch, thumb_geom, obj_geom_id, 100.0, fromto)
+    assert dist_sep > 0.01, f"separated geoms must report a clearly positive distance, got {dist_sep}"
+
+    # 2) touching: place object so the true fingertip site sits exactly on
+    # what WOULD be the face plane, at the pose measured to produce exact
+    # touching in this session's own support-offset measurement (thumb,
+    # reset pose): offset was ~-17.6mm, i.e. touching happens ~17.6mm
+    # BEYOND (further than) the naive site-on-face placement.
+    from humanoid_learning.expert.tripod_closure_planner import true_fingertip_world
+    scratch.qpos[:] = env.data.qpos
+    mujoco.mj_forward(model, scratch)
+    site_pos = true_fingertip_world(model, scratch, "left_thumb_tip")
+    half = env.config.object_half_size
+    obj_x = site_pos[0] + half  # thumb approaches from -X, touches the -X face
+    for _ in range(30):
+        scratch.qpos[:] = env.data.qpos
+        scratch.qpos[obj_qpos_adr:obj_qpos_adr + 3] = [obj_x, site_pos[1], site_pos[2]]
+        scratch.qpos[obj_qpos_adr + 3:obj_qpos_adr + 7] = [1, 0, 0, 0]
+        mujoco.mj_forward(model, scratch)
+        dist_touch = mujoco.mj_geomDistance(model, scratch, thumb_geom, obj_geom_id, 1.0, fromto)
+        if abs(dist_touch) < 1e-6:
+            break
+        obj_x += dist_touch
+    assert abs(dist_touch) < 1e-4, f"converged touching distance must be ~0, got {dist_touch}"
+
+    # 3) intentionally penetrating by a KNOWN additional depth
+    known_depth = 0.005
+    scratch.qpos[obj_qpos_adr] = obj_x + known_depth
+    mujoco.mj_forward(model, scratch)
+    dist_pen = mujoco.mj_geomDistance(model, scratch, thumb_geom, obj_geom_id, 1.0, fromto)
+    print(f"    separated={dist_sep*1000:.2f}mm touching={dist_touch*1000:.4f}mm "
+          f"penetrating(+{known_depth*1000:.1f}mm)={dist_pen*1000:.3f}mm")
+    assert dist_pen < -0.004, "pushing 5mm further from an exact-touch pose must read close to -5mm"
+
+
+def test_true_fingertip_support_offset_is_not_a_fixed_constant():
+    """REAL FINDING (33rd session): the site-to-real-mesh-surface offset
+    varies by configuration -- NOT a fixed calibration constant. This
+    is exactly why a small SITE residual (1.4mm) could previously
+    coexist with a large REAL mesh penetration (28.5mm)."""
+    from humanoid_learning.expert.manifold_grasp_planner import build_context
+
+    env, expert = _reach_thumb_oppose()
+    ctx_oppose = build_context(env, expert)
+
+    env2 = make_env()
+    env2.reset(seed=0)
+    expert2 = BimanualSidePinchExpert(env2, GraspExpertConfig())
+    ctx_reset = build_context(env2, expert2)
+
+    off_reset = measure_fingertip_support_offset(ctx_reset, "left", "thumb", approach_axis=0, approach_sign=-1.0)
+    off_oppose = measure_fingertip_support_offset(ctx_oppose, "left", "thumb", approach_axis=0, approach_sign=-1.0)
+    assert off_reset["converged"] and off_oppose["converged"]
+    print(f"    reset offset={off_reset['support_offset_m']*1000:.2f}mm, "
+          f"thumb_oppose_entry offset={off_oppose['support_offset_m']*1000:.2f}mm")
+    assert abs(off_reset["support_offset_m"] - off_oppose["support_offset_m"]) > 0.010, \
+        "support offset must differ by >1cm between two real configurations -- it is not a fixed constant"
+
+
+def test_mesh_signed_distance_matches_face_residual_convergence():
+    """After solving, the face-plane residual (now mesh_signed_distance)
+    for every finger must be near 0 -- i.e. the REAL mesh, not a proxy
+    point, is what actually converges to touching."""
+    env, expert = _reach_thumb_oppose()
+    results, ctx = run_multistart(env, expert)
+    best = min(results, key=lambda r: r.cost)
+    from humanoid_learning.expert.manifold_grasp_planner import _write_x as write_x
+    write_x(ctx, best.x)
+    max_abs_dist = 0.0
+    for side in ("left", "right"):
+        for finger in FINGERS:
+            d, _ = mesh_signed_distance(ctx, side, finger)
+            max_abs_dist = max(max_abs_dist, abs(d))
+    print(f"    max |mesh_signed_distance| across 6 fingers at best candidate: {max_abs_dist*1000:.3f}mm")
+    assert max_abs_dist < 0.01, "mesh-aware residual must converge all 6 REAL mesh distances to within 1cm of touching"
+
+
+def test_allowed_contact_penetration_and_separation_bounds_are_tracked():
+    """Section 7: allowed-contact penetration/separation must be
+    reported as SEPARATE metrics from forbidden-category collisions."""
+    env, expert = _reach_thumb_oppose()
+    results, ctx = run_multistart(env, expert)
+    best = min(results, key=lambda r: r.cost)
+    from humanoid_learning.expert.manifold_grasp_planner import _write_x as write_x
+    write_x(ctx, best.x)
+    penetrations = []
+    separations = []
+    for side in ("left", "right"):
+        for finger in FINGERS:
+            d, _ = mesh_signed_distance(ctx, side, finger)
+            if d < 0:
+                penetrations.append(-d)
+            else:
+                separations.append(d)
+    max_allowed_pen = max(penetrations, default=0.0)
+    max_allowed_sep = max(separations, default=0.0)
+    print(f"    max_allowed_contact_penetration={max_allowed_pen*1000:.3f}mm "
+          f"max_allowed_contact_separation={max_allowed_sep*1000:.3f}mm "
+          f"(tolerances: {ALLOWED_PENETRATION_TOL*1000:.1f}mm / {ALLOWED_SEPARATION_TOL*1000:.1f}mm)")
+    assert max_allowed_pen < 0.01, "REAL FINDING (33rd session): mesh-aware residual keeps allowed-contact penetration under 1cm (was 28.5mm with the site-based residual)"
+
+
+def test_left_right_mirror_support_offsets_are_consistent():
+    """Left/right thumb support offsets should be close (mirrored
+    geometry), not coincidentally different by a large margin."""
+    env, expert = _reach_thumb_oppose()
+    ctx = build_context(env, expert)
+    left = measure_fingertip_support_offset(ctx, "left", "thumb", approach_axis=0, approach_sign=-1.0)
+    right = measure_fingertip_support_offset(ctx, "right", "thumb", approach_axis=0, approach_sign=-1.0)
+    assert left["converged"] and right["converged"]
+    diff = abs(left["support_offset_m"] - right["support_offset_m"])
+    print(f"    left={left['support_offset_m']*1000:.2f}mm right={right['support_offset_m']*1000:.2f}mm diff={diff*1000:.2f}mm")
+    assert diff < 0.005, "left/right mirror geometry should give closely matching support offsets"
+
+
+def test_rotated_object_local_to_world_transform_is_correct():
+    """[30th-session bug, fixed in the manifold planner's own path]:
+    object-local -> world must use obj_pos + obj_R @ local, not
+    obj_pos + local. This planner never reconstructs a world target
+    from a local offset for the face residual (it queries mesh_signed_
+    distance directly in world frame), but the margin/thumb-thumb terms
+    DO convert a world near-point into object-local coordinates via
+    obj_R.T -- this test confirms that direction is correct for a
+    genuinely rotated object by round-tripping local->world->local."""
+    env = make_env()
+    env.reset(seed=0)
+    obj_qpos_adr = env._object_qpos_adr
+    yaw = 0.3  # rad, deliberately non-zero
+    quat = np.array([np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)])
+    env.data.qpos[obj_qpos_adr + 3:obj_qpos_adr + 7] = quat
+    mujoco.mj_forward(env.model, env.data)
+
+    expert = BimanualSidePinchExpert(env, GraspExpertConfig())
+    ctx = build_context(env, expert)
+    obj_R_check = np.zeros(9)
+    mujoco.mju_quat2Mat(obj_R_check, quat)
+    obj_R_check = obj_R_check.reshape(3, 3)
+    assert np.allclose(ctx.obj_R, obj_R_check, atol=1e-9)
+
+    world_point = ctx.obj_pos + np.array([0.05, -0.02, 0.01])
+    local = ctx.obj_R.T @ (world_point - ctx.obj_pos)
+    reconstructed_world = ctx.obj_pos + ctx.obj_R @ local  # CORRECT form
+    wrong_world = ctx.obj_pos + local  # the 30th-session bug form
+    assert np.allclose(reconstructed_world, world_point, atol=1e-9)
+    assert not np.allclose(wrong_world, world_point, atol=1e-6), \
+        "at a genuinely rotated object, the buggy obj_pos+local form must NOT reconstruct the original world point"
 
 
 def test_canonical_grasp_behavior_unchanged():

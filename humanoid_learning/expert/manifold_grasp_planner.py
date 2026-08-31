@@ -80,6 +80,21 @@ def build_hand_dofs(env, side: str) -> HandDofs:
     return hd
 
 
+def _collision_geom_of_body(model: mujoco.MjModel, body_name: str) -> int:
+    """[33rd session] Finds the ACTUAL collision geom (contype==1) for a
+    body -- every hand link in this model has two geoms at identical
+    pose (an even-indexed contype=0/conaffinity=0 VISUAL duplicate and
+    an odd-indexed contype=1/conaffinity=1 COLLISION geom); using the
+    visual geom's id would silently query a geom real physics never
+    touches. Queried by scanning contype, never guessed by index
+    parity or name."""
+    bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+    for g in range(model.ngeom):
+        if model.geom_bodyid[g] == bid and model.geom_contype[g] == 1:
+            return g
+    raise ValueError(f"no collision geom found for body {body_name!r}")
+
+
 @dataclass
 class PlannerContext:
     env: object
@@ -91,6 +106,45 @@ class PlannerContext:
     x0: np.ndarray  # 28-dim reference pose (CONTACT_ACQUIRE-end), for regularization
     jnt_lo: np.ndarray
     jnt_hi: np.ndarray
+    obj_geom_id: int
+    table_geom_id: int
+    tip_collision_geom: dict  # (side, finger) -> collision geom id
+    use_waist: bool = False
+    waist_qpos_adr: np.ndarray | None = None
+    waist_x0: np.ndarray | None = None
+    waist_lo: np.ndarray | None = None
+    waist_hi: np.ndarray | None = None
+
+
+WAIST_SOFT_RANGE = 0.15  # rad, small soft deviation band around the canonical stand-pose waist value (Section 10)
+
+
+def enable_waist(ctx: PlannerContext) -> PlannerContext:
+    """[33rd session, Section 10] Adds the 3 waist joints (yaw/roll/
+    pitch) as GLOBAL (not per-hand) decision variables, appended after
+    the existing 28. Only invoked when 0/14 candidates are statically
+    feasible with the mesh-aware target alone (Section 10's explicit
+    gate) -- never combined with widening topology/posture search or
+    collision tolerance in the same comparison. Pelvis/legs are not
+    touched (this is the fixed-base grasp env; there is no pelvis/leg
+    DOF to begin with) and this does not become a whole-body reach:
+    the waist range is soft-bounded to +-WAIST_SOFT_RANGE rad around
+    the CURRENT (canonical stand-pose) waist qpos, not its full
+    mechanical range."""
+    model = ctx.env.model
+    jids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n) for n in wbc.WAIST_JOINTS]
+    qpos_adr = np.array([model.jnt_qposadr[j] for j in jids])
+    waist_x0 = ctx.scratch.qpos[qpos_adr].copy()
+    mech_lo = np.array([model.jnt_range[j][0] for j in jids])
+    mech_hi = np.array([model.jnt_range[j][1] for j in jids])
+    waist_lo = np.maximum(mech_lo, waist_x0 - WAIST_SOFT_RANGE)
+    waist_hi = np.minimum(mech_hi, waist_x0 + WAIST_SOFT_RANGE)
+    ctx.use_waist = True
+    ctx.waist_qpos_adr = qpos_adr
+    ctx.waist_x0 = waist_x0
+    ctx.waist_lo = waist_lo
+    ctx.waist_hi = waist_hi
+    return ctx
 
 
 def build_context(env, expert) -> PlannerContext:
@@ -110,18 +164,55 @@ def build_context(env, expert) -> PlannerContext:
     x0 = scratch.qpos[qpos_adr_all].copy()
     ranges = np.vstack([hands["left"].jnt_range, hands["right"].jnt_range])
 
+    obj_body = env._object_body_id
+    obj_geom_id = next(g for g in range(model.ngeom) if model.geom_bodyid[g] == obj_body)
+    table_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "table")
+    table_geom_id = next(g for g in range(model.ngeom) if model.geom_bodyid[g] == table_body)
+    tip_collision_geom = {}
+    for side in ("left", "right"):
+        for finger in FINGERS:
+            site = getattr(wbc, f"{'LEFT' if side == 'left' else 'RIGHT'}_{finger.upper()}_TIP_SITE")
+            body_name = wbc.FINGERTIP_SITE_BODIES[site]
+            tip_collision_geom[(side, finger)] = _collision_geom_of_body(model, body_name)
+
     return PlannerContext(
         env=env, scratch=scratch, obj_pos=obj_pos, obj_R=obj_R, half=env.config.object_half_size,
         hands=hands, x0=x0, jnt_lo=ranges[:, 0], jnt_hi=ranges[:, 1],
+        obj_geom_id=obj_geom_id, table_geom_id=table_geom_id, tip_collision_geom=tip_collision_geom,
     )
+
+
+def mesh_signed_distance(ctx: PlannerContext, side: str, finger: str) -> tuple[float, np.ndarray]:
+    """[33rd session] The ACTUAL fingertip-mesh-to-object signed distance
+    via mujoco.mj_geomDistance -- positive when separated, negative when
+    the real collision geometry penetrates. This replaces the 31st/32nd
+    session's site-position-vs-face-plane proxy, which this session
+    measured to disagree with the real mesh by a CONFIGURATION-DEPENDENT
+    amount (-19.5mm to +4.7mm across two tested poses, not a fixed
+    calibration constant) -- see measure_fingertip_support_offset's
+    docstring for the full measurement."""
+    fromto = np.zeros(6)
+    tip_geom = ctx.tip_collision_geom[(side, finger)]
+    dist = mujoco.mj_geomDistance(ctx.env.model, ctx.scratch, tip_geom, ctx.obj_geom_id, 1.0, fromto)
+    return float(dist), fromto
 
 
 def _write_x(ctx: PlannerContext, x: np.ndarray) -> None:
     left_adr = ctx.hands["left"].qpos_adr
     right_adr = ctx.hands["right"].qpos_adr
     ctx.scratch.qpos[left_adr] = x[:N_PER_HAND]
-    ctx.scratch.qpos[right_adr] = x[N_PER_HAND:]
+    ctx.scratch.qpos[right_adr] = x[N_PER_HAND:N_TOTAL]
+    if ctx.use_waist and len(x) > N_TOTAL:
+        ctx.scratch.qpos[ctx.waist_qpos_adr] = x[N_TOTAL:N_TOTAL + 3]
     mujoco.mj_forward(ctx.env.model, ctx.scratch)
+
+
+def x0_with_waist(ctx: PlannerContext) -> np.ndarray:
+    """x0 extended with the waist's current (canonical) value -- callers
+    that enable_waist() should use this instead of ctx.x0 directly for
+    the initial/regularization vector."""
+    assert ctx.use_waist
+    return np.concatenate([ctx.x0, ctx.waist_x0])
 
 
 def _tip_world(ctx: PlannerContext, side: str, finger: str) -> np.ndarray:
@@ -175,13 +266,65 @@ def mirrored_topology(base: Topology) -> Topology:
 
 
 # ---------------------------------------------------------------------
+# Section 5 (33rd session): TRUE fingertip support-offset measurement.
+# Read-only diagnostic -- moves ONLY the scratch object's qpos along one
+# world axis via a local Newton/fixed-point iteration on the REAL
+# mj_geomDistance, never touches finger/arm qpos or the live env.
+# ---------------------------------------------------------------------
+
+def measure_fingertip_support_offset(ctx: PlannerContext, side: str, finger: str, approach_axis: int,
+                                      approach_sign: float, max_iters: int = 30) -> dict:
+    """Finds, via a LOCAL fixed-point search (NOT a wide-range binary
+    search -- a first attempt at this using bisection over a wide
+    [-0.5, 0.5] object-position range converged to spurious, distant
+    roots since mj_geomDistance is not globally monotonic; this instead
+    starts from the object placed as if the TRUE FINGERTIP SITE point
+    were already touching and repeatedly shifts the object by exactly
+    the measured real mesh distance -- valid because the function is
+    monotonic in a small neighborhood of the actual contact), the object
+    position along ``approach_axis`` (in ``approach_sign`` direction)
+    where the REAL collision geom (not the site proxy) has
+    mj_geomDistance == 0 against the object. Returns the support offset
+    (site position minus true-touch position, along the approach axis,
+    signed positive when the site sits BEYOFND the real mesh surface --
+    i.e. the site would already be inside the object by that amount when
+    the real mesh is exactly touching) and the final measured distance
+    (should be ~0, confirming convergence). This function only moves the
+    SCRATCH object qpos -- finger/arm qpos and env.data are untouched."""
+    model = ctx.env.model
+    tip_geom = ctx.tip_collision_geom[(side, finger)]
+    site_pos = _tip_world(ctx, side, finger)
+    obj_qpos_adr = ctx.env._object_qpos_adr
+    saved_obj_qpos = ctx.scratch.qpos[obj_qpos_adr:obj_qpos_adr + 7].copy()
+
+    other_axes = [a for a in range(3) if a != approach_axis]
+    obj_pos_probe = site_pos.copy()
+    obj_pos_probe[approach_axis] = site_pos[approach_axis] - approach_sign * ctx.half
+    dist = None
+    for it in range(max_iters):
+        ctx.scratch.qpos[obj_qpos_adr:obj_qpos_adr + 3] = obj_pos_probe
+        ctx.scratch.qpos[obj_qpos_adr + 3:obj_qpos_adr + 7] = [1.0, 0.0, 0.0, 0.0]
+        mujoco.mj_forward(model, ctx.scratch)
+        dist, _ = mesh_signed_distance(ctx, side, finger)
+        if abs(dist) < 1e-6:
+            break
+        obj_pos_probe[approach_axis] -= approach_sign * dist
+
+    face_at_touch = obj_pos_probe[approach_axis] - approach_sign * ctx.half
+    offset = (site_pos[approach_axis] - face_at_touch) * approach_sign
+
+    ctx.scratch.qpos[obj_qpos_adr:obj_qpos_adr + 7] = saved_obj_qpos
+    mujoco.mj_forward(model, ctx.scratch)
+    return dict(support_offset_m=offset, final_mesh_dist_m=dist, n_iters=it + 1, converged=abs(dist) < 1e-4)
+
+
+# ---------------------------------------------------------------------
 # Residual construction
 # ---------------------------------------------------------------------
 
 MARGIN = 0.010          # face-interior margin, m
 JOINT_LIMIT_SAFE = 0.05  # rad, soft joint-limit proximity band
 THUMB_THUMB_SAFE = 0.04  # m, target minimum separation (> ~2x finger half-width ~0.015m each)
-W_FACE = 8.0
 W_MARGIN = 5.0
 W_TT = 6.0
 W_JOINT = 2.0
@@ -189,6 +332,7 @@ W_REG_ARM = 0.3
 W_REG_FINGER_INDEXMID = 0.15   # soft regularization only, NOT a hard hold
 W_REG_FINGER_THUMB = 0.02      # thumb is the one we WANT to move -- tiny reg only
 W_WRIST_EXTREME = 0.4
+W_WAIST_REG = 0.5  # small soft pull toward canonical waist value (Section 10)
 W_REAL_COLLISION = 40.0  # real mesh penetration depth is meters-scale and must dominate the cost when active
 
 
@@ -321,17 +465,32 @@ def _real_collision_penalty_rows(ctx: PlannerContext, buckets: tuple[str, ...] =
     return [W_REAL_COLLISION * v for v in pen_by_bucket.values()]
 
 
+ALLOWED_PENETRATION_TOL = 0.001  # m (1mm) -- geom margin/gap are both 0.0 (measured), so any
+# real negative mj_geomDistance IS true geometric penetration, not a margin artifact;
+# 1mm is a generous solver-convergence band, not a physically-motivated "safe" depth.
+ALLOWED_SEPARATION_TOL = 0.001   # m (1mm) -- symmetric band for "not yet touching"
+W_MESH_FACE = 200.0  # dominates: this residual now targets a REAL geometric distance in meters, not a
+# proxy that was already pre-scaled; must outweigh regularization/joint terms at this scale.
+W_ALLOWED_PENETRATION_BOUND = 500.0
+
+
 def residuals(x: np.ndarray, ctx: PlannerContext, topology: Topology, use_real_collision: bool = True,
               forbidden_buckets: tuple[str, ...] = ALL_FORBIDDEN_BUCKETS) -> np.ndarray:
+    """[33rd session] The face-plane term now targets the REAL fingertip
+    mesh-to-object signed distance (mesh_signed_distance, via
+    mujoco.mj_geomDistance) instead of the 31st/32nd session's true-
+    fingertip-SITE-vs-face-plane proxy -- measured this session to
+    diverge from the real mesh by a configuration-dependent -19.5mm to
+    +4.7mm (not a fixed calibration constant), which is exactly why a
+    site residual of 1.4mm could coexist with 28.5mm of real mesh
+    penetration. Face-interior margin now uses the REAL near-contact
+    point (mj_geomDistance's fromto) instead of the site point."""
     _write_x(ctx, x)
     rows = []
 
-    tt_dist = None
     tip_world = {}
     for side in ("left", "right"):
         for finger in FINGERS:
-            local = ctx.obj_R.T @ (_tip_world(ctx, side, finger) - ctx.obj_pos)
-            tip_world[(side, finger)] = local
             axis = topology.face_axis[finger]
             # NOTE: both hands were measured (Stage 1 audit) to target the
             # SAME object faces (index/middle both near +X, both thumbs
@@ -339,8 +498,22 @@ def residuals(x: np.ndarray, ctx: PlannerContext, topology: Topology, use_real_c
             # opposing face pair, not a left/right mirrored face
             # assignment, so the topology's sign is NOT flipped per side.
             sign = topology.face_sign[finger]
-            # face-plane residual: pull the assigned axis onto the face
-            rows.append(W_FACE * (local[axis] - sign * ctx.half))
+            dist, fromto = mesh_signed_distance(ctx, side, finger)
+            # face-plane residual: drive the REAL mesh distance to 0 (touching, not penetrating/separated)
+            rows.append(W_MESH_FACE * dist)
+            # explicit asymmetric bound (Section 7): penalize crossing the
+            # allowed penetration/separation tolerance harder than the
+            # smooth dist->0 term alone would, so the optimizer feels a
+            # sharp wall at the tolerance rather than a shallow gradient
+            over_pen = max(0.0, -dist - ALLOWED_PENETRATION_TOL)
+            over_sep = max(0.0, dist - ALLOWED_SEPARATION_TOL)
+            rows.append(W_ALLOWED_PENETRATION_BOUND * over_pen)
+            rows.append(W_ALLOWED_PENETRATION_BOUND * over_sep)
+            # face-interior margin: use the REAL near-point on the object
+            # (fromto[3:6], object-local frame), not the site proxy
+            near_on_object = fromto[3:6]
+            local = ctx.obj_R.T @ (near_on_object - ctx.obj_pos)
+            tip_world[(side, finger)] = local
             other_axes = [a for a in range(3) if a != axis]
             for a in other_axes:
                 over = abs(local[a]) - (ctx.half - MARGIN)
@@ -352,14 +525,16 @@ def residuals(x: np.ndarray, ctx: PlannerContext, topology: Topology, use_real_c
     tt_dist = float(np.linalg.norm(lt - rt))
     rows.append(W_TT * max(0.0, THUMB_THUMB_SAFE - tt_dist))
 
-    # joint-limit soft proximity (hinge, both directions)
-    lo, hi = ctx.jnt_lo, ctx.jnt_hi
+    # joint-limit soft proximity (hinge, both directions) -- lo/hi extended
+    # with the waist's own soft-range bounds when enable_waist() was called
+    lo, hi = _full_bounds(ctx)
     below = np.maximum(0.0, (lo + JOINT_LIMIT_SAFE) - x)
     above = np.maximum(0.0, x - (hi - JOINT_LIMIT_SAFE))
     rows.extend((W_JOINT * below).tolist())
     rows.extend((W_JOINT * above).tolist())
 
     # regularization toward the CONTACT_ACQUIRE-end reference pose
+    x0_full = _full_x0(ctx)
     for i in range(N_TOTAL):
         local_i = i % N_PER_HAND
         if local_i < N_ARM:
@@ -368,7 +543,7 @@ def residuals(x: np.ndarray, ctx: PlannerContext, topology: Topology, use_real_c
             finger_slot = local_i - N_ARM
             is_thumb = finger_slot < 3
             w = W_REG_FINGER_THUMB if is_thumb else W_REG_FINGER_INDEXMID
-        rows.append(w * (x[i] - ctx.x0[i]))
+        rows.append(w * (x[i] - x0_full[i]))
 
     # wrist-extremity penalty (deviation from neutral 0, on top of the reg-to-x0 term above)
     for side_idx in (0, 1):
@@ -376,10 +551,29 @@ def residuals(x: np.ndarray, ctx: PlannerContext, topology: Topology, use_real_c
         for k in range(3):
             rows.append(W_WRIST_EXTREME * x[base + k])
 
+    # waist soft-deviation regularization (Section 10): a SMALL pull back
+    # toward the canonical stand-pose waist value, on top of the hard
+    # soft-range bound already enforced via lo/hi above.
+    if ctx.use_waist and len(x) > N_TOTAL:
+        waist_x = x[N_TOTAL:N_TOTAL + 3]
+        rows.extend((W_WAIST_REG * (waist_x - x0_full[N_TOTAL:N_TOTAL + 3])).tolist())
+
     if use_real_collision:
         rows.extend(_real_collision_penalty_rows(ctx, buckets=forbidden_buckets))
 
     return np.array(rows)
+
+
+def _full_bounds(ctx: PlannerContext) -> tuple[np.ndarray, np.ndarray]:
+    if ctx.use_waist:
+        return np.concatenate([ctx.jnt_lo, ctx.waist_lo]), np.concatenate([ctx.jnt_hi, ctx.waist_hi])
+    return ctx.jnt_lo, ctx.jnt_hi
+
+
+def _full_x0(ctx: PlannerContext) -> np.ndarray:
+    if ctx.use_waist:
+        return np.concatenate([ctx.x0, ctx.waist_x0])
+    return ctx.x0
 
 
 def solve_manifold(ctx: PlannerContext, x_init: np.ndarray, topology: Topology,
@@ -393,26 +587,28 @@ def solve_manifold(ctx: PlannerContext, x_init: np.ndarray, topology: Topology,
     bug-prone than deriving each term's gradient by hand, and at this
     dimensionality (28 decision vars) remains cheap (pure forward
     kinematics, no contact dynamics)."""
+    n_dims = len(x_init)
+    lo, hi = _full_bounds(ctx)
     x = x_init.copy()
-    x = np.clip(x, ctx.jnt_lo, ctx.jnt_hi)
+    x = np.clip(x, lo, hi)
     r = residuals(x, ctx, topology, forbidden_buckets=forbidden_buckets)
     cost = float(np.dot(r, r))
     history = [cost]
 
     for it in range(max_iters):
         n_r = len(r)
-        J = np.zeros((n_r, N_TOTAL))
-        for j in range(N_TOTAL):
-            dx = np.zeros(N_TOTAL)
+        J = np.zeros((n_r, n_dims))
+        for j in range(n_dims):
+            dx = np.zeros(n_dims)
             dx[j] = fd_eps
-            r_plus = residuals(np.clip(x + dx, ctx.jnt_lo, ctx.jnt_hi), ctx, topology, forbidden_buckets=forbidden_buckets)
-            r_minus = residuals(np.clip(x - dx, ctx.jnt_lo, ctx.jnt_hi), ctx, topology, forbidden_buckets=forbidden_buckets)
+            r_plus = residuals(np.clip(x + dx, lo, hi), ctx, topology, forbidden_buckets=forbidden_buckets)
+            r_minus = residuals(np.clip(x - dx, lo, hi), ctx, topology, forbidden_buckets=forbidden_buckets)
             J[:len(r_plus), j] = (r_plus - r_minus) / (2 * fd_eps)
 
-        JTJ = J.T @ J + damping * np.eye(N_TOTAL)
+        JTJ = J.T @ J + damping * np.eye(n_dims)
         step = np.linalg.solve(JTJ, -J.T @ r) * gain
         step = np.clip(step, -0.15, 0.15)
-        x_new = np.clip(x + step, ctx.jnt_lo, ctx.jnt_hi)
+        x_new = np.clip(x + step, lo, hi)
         r_new = residuals(x_new, ctx, topology, forbidden_buckets=forbidden_buckets)
         cost_new = float(np.dot(r_new, r_new))
         if cost_new < cost:
@@ -565,15 +761,21 @@ class MultiStartResult:
     joint_margins_rad: dict
     joint_travel_from_canonical: float
     contact_pairs: list = field(default_factory=list)
+    waist_delta_rad: np.ndarray | None = None  # [33rd session] None unless use_waist=True
 
 
 def run_multistart(env, expert, topologies: list[Topology] | None = None,
-                    forbidden_buckets: tuple[str, ...] = ALL_FORBIDDEN_BUCKETS) -> tuple[list[MultiStartResult], PlannerContext]:
+                    forbidden_buckets: tuple[str, ...] = ALL_FORBIDDEN_BUCKETS,
+                    use_waist: bool = False) -> tuple[list[MultiStartResult], PlannerContext]:
     ctx = build_context(env, expert)
+    if use_waist:
+        ctx = enable_waist(ctx)
     if topologies is None:
         primary = derive_primary_topology(ctx)
         topologies = [primary, mirrored_topology(primary)]
     families = build_posture_families(ctx)
+    if use_waist:
+        families = {name: np.concatenate([x, ctx.waist_x0]) for name, x in families.items()}
 
     results = []
     for topo in topologies:
@@ -600,11 +802,13 @@ def run_multistart(env, expert, topologies: list[Topology] | None = None,
                 base = (0 if side == "left" else 1) * N_PER_HAND
                 for k, jn in enumerate(names):
                     margins[jn] = float(min(sol["x"][base + k] - lo[base + k], hi[base + k] - sol["x"][base + k]))
-            travel = float(np.linalg.norm(sol["x"] - ctx.x0))
+            travel = float(np.linalg.norm(sol["x"] - _full_x0(ctx)))
+            waist_delta = (sol["x"][N_TOTAL:N_TOTAL + 3] - ctx.waist_x0) if use_waist else None
 
             results.append(MultiStartResult(
                 name=name, topology_name=topo.name, x=sol["x"], cost=sol["cost"], n_iters=sol["n_iters"],
                 converged=sol["converged"], collisions=coll, per_finger_face_residual=face_res,
+                waist_delta_rad=waist_delta,
                 thumb_thumb_distance=tt_dist, joint_margins_rad=margins, joint_travel_from_canonical=travel,
                 contact_pairs=pairs,
             ))
