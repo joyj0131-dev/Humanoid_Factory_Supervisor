@@ -379,3 +379,136 @@ def build_planar_debug_model(config) -> mujoco.MjModel:
         )
 
     return spec.compile()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4, 35th session: Sharpa Wave end-effector (replaces Dex3 as the
+# active development target; g1_with_hands.xml -- and build_model()/
+# build_grasp_model() above -- are UNTOUCHED and keep building the Dex3
+# configuration, preserved as the legacy comparison baseline).
+#
+# Mount-transform derivation (Stage 2): the existing, empirically-validated
+# "palm frame" convention (whole_body_config.py) defines, for a site on
+# {side}_wrist_yaw_link: approach axis = wrist local +X (fingers point
+# outward), closing axis = wrist local -Y (left) / +Y (right), lateral
+# axis = approach x closing. The vendored Sharpa MJCF has its OWN local
+# convention instead (measured directly from the compiled standalone
+# model, see assets/robots/sharpa_wave/README.md): fingers extend along
+# the hand root body's own local +Z, and the four non-thumb fingers are
+# laterally spread along the root's own local +Y. To reuse the validated
+# palm frame rather than inventing a new one, SHARPA_TO_PALM_AXES maps
+# Sharpa's local frame onto the palm frame's axes (Z_sharpa -> X_palm
+# "approach", Y_sharpa -> Z_palm "lateral", and X_sharpa -> Y_palm
+# "closing" follows from requiring a proper right-handed rotation) --
+# composed with each side's own already-mirrored LEFT/RIGHT_PALM_LOCAL_QUAT
+# to get the final wrist-local mount quaternion for that hand.
+#
+# Verified this session (scripts/test_sharpa_g1_integration.py): compiles,
+# no NaN, left/right are exact mirrors (within ~10 micrometers of solver
+# noise), ZERO real self-collision anywhere in the model at the stand
+# pose (table<->object resting contact excluded -- see that test file's
+# docstring), and the wrist drifts <8mm over 3 simulated seconds even at
+# this env's COMPLIANT grasp-model gain (arm_kp=120, softer than the
+# stock XML's kp=500) holding the stand pose against the added
+# ~1.25kg-per-hand weight -- i.e. no arm-sag problem was found.
+_SHARPA_TO_PALM_AXES = np.array([
+    [0.0, 0.0, 1.0],
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+])  # columns: R@ex_sharpa=(0,1,0)=Y_palm(closing), R@ey_sharpa=(0,0,1)=Z_palm(lateral), R@ez_sharpa=(1,0,0)=X_palm(approach)
+
+_SHARPA_MOUNT_POS = (0.0, 0.0, 0.0)  # at the wrist_yaw_link's own origin -- the
+# _with_wrist Sharpa variant already models the physical wrist-adapter
+# standoff as part of its own geometry (see assets/robots/sharpa_wave/README.md)
+
+def _sharpa_xml_path(side: str) -> Path:
+    project_root = Path(__file__).resolve().parents[2]
+    return project_root / "assets" / "robots" / "sharpa_wave" / f"{side}_sharpa_wave" / f"{side}_sharpa_wave_with_wrist.xml"
+
+
+def _sharpa_mount_quat(side: str) -> list[float]:
+    palm_quat = wbc.LEFT_PALM_LOCAL_QUAT if side == "left" else wbc.RIGHT_PALM_LOCAL_QUAT
+    r_wrist_palm = np.zeros(9)
+    mujoco.mju_quat2Mat(r_wrist_palm, np.array(palm_quat, dtype=float))
+    r_wrist_palm = r_wrist_palm.reshape(3, 3)
+    r_wrist_sharpa = r_wrist_palm @ _SHARPA_TO_PALM_AXES
+    q = np.zeros(4)
+    mujoco.mju_mat2Quat(q, r_wrist_sharpa.flatten())
+    return q.tolist()
+
+
+def attach_sharpa_hands(spec: "mujoco.MjSpec") -> None:
+    """[35th session, Stage 2] Removes the Dex3 hand (finger-root bodies +
+    palm-plate geom) from each {side}_wrist_yaw_link and attaches the
+    vendored Sharpa Wave hand in its place, via a mount SITE (MjSpec.attach
+    requires a site or frame) using the derived quat above. The
+    {side}_wrist_yaw_link body's OWN mesh geoms (the real G1 wrist joint
+    housing, present even in the bare no-hand G1 model) are left
+    untouched -- only Dex3-specific geometry is removed. Sharpa's own
+    shared (non-side-prefixed) mesh names (e.g. "MCP_VL", "elastomer")
+    collide between left/right if both are attached to the same spec, so
+    MjSpec.attach's ``prefix`` is used -- this makes the resulting body/
+    joint names "{side}_{side}_..." (e.g. "left_left_thumb_CMC_FE"), a
+    known cosmetic redundancy from the already-side-prefixed source XML,
+    not a bug (verified: does not collide with any other name)."""
+    for side in ("left", "right"):
+        wrist = spec.body(f"{side}_wrist_yaw_link")
+        for finger_root in (f"{side}_hand_thumb_0_link", f"{side}_hand_middle_0_link", f"{side}_hand_index_0_link"):
+            spec.delete(spec.body(finger_root))
+        for g in list(wrist.geoms):
+            if g.meshname == f"{side}_hand_palm_link":
+                spec.delete(g)
+        mount_site = wrist.add_site(
+            name=f"{side}_sharpa_mount", pos=list(_SHARPA_MOUNT_POS), quat=_sharpa_mount_quat(side)
+        )
+        sharpa_spec = mujoco.MjSpec.from_file(str(_sharpa_xml_path(side)))
+        spec.attach(sharpa_spec, prefix=f"{side}_", site=mount_site)
+
+
+def build_grasp_model_sharpa(config) -> mujoco.MjModel:
+    """[35th session, Stage 2] Same fixed-base grasp validation structure
+    as build_grasp_model() (lower-body fixing, EE/grasp sites, floor,
+    table+object), but with the Dex3 hand replaced by Sharpa Wave via
+    attach_sharpa_hands(). NOT wired into GraspEnvConfig/FixedBaseGraspEnv
+    yet -- those resolve Dex3-specific joint/actuator names (hand
+    synergy targets, fingertip sites) that only make sense once a
+    Sharpa-specific controller exists (Stage 4, deferred). This function
+    is model-only: it must compile cleanly and be collision-free at the
+    stand pose, which is as far as Stage 2 goes."""
+    spec = mujoco.MjSpec.from_file(str(config.g1_xml_path))
+
+    freejoint = spec.joint(tc.FLOATING_BASE_JOINT)
+    spec.delete(freejoint)
+    stand_key = spec.key(tc.STAND_KEYFRAME)
+    stand_key.qpos = np.asarray(stand_key.qpos)[7:].tolist()
+
+    attach_sharpa_hands(spec)
+    _add_ee_sites(spec)
+    _add_floor(spec)
+
+    table = spec.worldbody.add_body(name=tc.TABLE_BODY, pos=list(config.table_pos))
+    table.add_geom(
+        name=tc.TABLE_GEOM,
+        type=mujoco.mjtGeom.mjGEOM_BOX,
+        size=list(config.table_half_size),
+        rgba=[0.55, 0.4, 0.25, 1],
+    )
+    object_half_extents = config.effective_object_half_extents
+    obj_z = config.table_pos[2] + config.table_half_size[2] + object_half_extents[2] + tc.OBJECT_TABLE_GAP
+    obj = spec.worldbody.add_body(
+        name=tc.OBJECT_BODY,
+        pos=[config.object_pos[0], config.object_pos[1], obj_z],
+    )
+    obj.add_freejoint(name=tc.OBJECT_JOINT)
+    obj.add_geom(
+        name=tc.OBJECT_GEOM,
+        type=mujoco.mjtGeom.mjGEOM_BOX,
+        size=list(object_half_extents),
+        rgba=[0.85, 0.15, 0.15, 1],
+        mass=config.object_mass,
+        friction=list(config.object_friction),
+    )
+
+    model = spec.compile()
+    _apply_compliant_kp(model, tc.LEFT_ARM_JOINTS + tc.RIGHT_ARM_JOINTS, config.arm_kp)
+    return model
