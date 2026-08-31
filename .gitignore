@@ -71,6 +71,16 @@ PROJECT_CONTEXT.md.BACKUP_*
 # =========================
 assets/robots/g1/
 
+# Sharpa Wave hand MJCF/mesh assets (35th session) -- vendored subset is
+# ~23MB of upstream binary STL meshes, deliberately NOT committed to
+# history; assets/robots/sharpa_wave/{LICENSE,NOTICE,UPSTREAM_README,
+# checksums.sha256} ARE tracked, and
+# scripts/install_sharpa_wave_assets.py reproduces the ignored content
+# below bit-for-bit from the pinned upstream commit (verified: see
+# docs/history/PHASE4_GRASP_SESSION_35.md).
+assets/robots/sharpa_wave/left_sharpa_wave/
+assets/robots/sharpa_wave/right_sharpa_wave/
+
 # =========================
 # Misc
 # =========================
