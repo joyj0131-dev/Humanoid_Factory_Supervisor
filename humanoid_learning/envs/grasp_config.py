@@ -77,6 +77,22 @@ class GraspEnvConfig:
     # ceiling, not a threshold to relax.
     finger_force_safety_limit: float = 8.0
     finger_force_warning_ratio: float = 0.7
+    # True: an over-limit group is actively unloaded by setting its
+    # position target to the current joint pose.  False preserves the old
+    # "previous target" rollback for controlled comparison.
+    unload_finger_on_force_limit: bool = False
+    force_unload_fraction: float = 1.0
+    persist_safety_synergy_rollback: bool = False
+    # Experimental corrected metric; False preserves the calibrated
+    # legacy max-single-contact convention until its thresholds are
+    # re-derived end-to-end.
+    use_net_group_force: bool = False
+    # Optional grasp-only end-effector collision model: retain the real
+    # Dex3 kinematics/actuators but replace irregular hand-mesh contacts
+    # with compliant high-friction pads at the six measured fingertips.
+    use_fingertip_collision_pads: bool = False
+    fingertip_pad_radius: float = 0.012
+    fingertip_pad_friction: tuple[float, float, float] = (2.0, 0.02, 0.001)
 
     object_pos: tuple[float, float, float] = (0.27, 0.0, 0.0)  # z resolved at reset (on table surface)
     # 2x every linear dimension of the Foundation object (0.03 -> 0.06,

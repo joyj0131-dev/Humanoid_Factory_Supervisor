@@ -421,6 +421,21 @@ class GraspExpertConfig:
     finger_force_limit: float = 8.0
     target_grip_force: float = 3.0
     max_safe_grip_force: float = 8.0
+    # Thumb has a longer moment arm and two thumbs act in the same global
+    # fore/aft direction in this grasp.  Give it its own settle band so
+    # the generic 8N ceiling is not mistaken for a useful holding force.
+    thumb_target_grip_force: float = 3.0
+    thumb_release_force: float = 8.0
+    # Diagnostic/production option for a position-latched tripod: once
+    # all required contacts exist, preserve the exact six group targets
+    # instead of running six independent bang-bang force loops against a
+    # moving rigid body.
+    lock_synergy_after_tripod: bool = False
+    # Once a thumb establishes a safe object contact, latch that group's
+    # aperture instead of letting the outer force loop re-close it after
+    # every substep rollback.  This directly breaks the measured
+    # rollback/reclose/re-impact limit cycle.
+    latch_thumb_after_first_contact: bool = False
     lift_force_limit: float = 12.0
     settle_pressure_step: float = 0.0004
     force_ema_alpha: float = 0.3  # EMA smoothing factor for logged/regulated force
@@ -451,6 +466,55 @@ class GraspExpertConfig:
     # 30 stable steps before ever letting thumb engage was requiring the
     # very stability thumb exists to provide.
     thumb_oppose_entry_debounce_steps: int = 4
+    # During THUMB_OPPOSE, index/middle already have the only job they
+    # need: keep the two light precontacts acquired in CONTACT_ACQUIRE.
+    # Re-closing them at the full finger-close rate while the thumbs are
+    # still travelling pushes the unsupported object away.  Regulate
+    # them around the low CONTACT_ACQUIRE hold force with the much slower
+    # settle-pressure rate instead.  This flag keeps the old behaviour
+    # available as a controlled A/B baseline.
+    hold_opposing_fingers_during_thumb_oppose: bool = False
+    # Shared world +X shift applied once thumb opposition starts.  The
+    # preshape target is based on the three-tip centroid; on SIZE_12 the
+    # measured index/middle tips sit near the front face while both thumb
+    # tips remain about 4cm behind the back face.  Without this standoff
+    # correction, the old controller could make thumb contact only after
+    # index/middle had pushed the object backward.  Kept as an explicit
+    # parameter for the measured sweep and for size conditioning later.
+    thumb_intercept_forward_offset: float = 0.0
+    # THUMB_OPPOSE is a transient interception motion, not the later
+    # force-settling loop.  A scale above one shortens the unsupported
+    # index/middle-only interval; physics-substep force rollback remains
+    # the hard safety authority.  Kept separate from
+    # thumb_closing_rate_scale, which tunes the already-contacting thumb
+    # during TRIPOD_SETTLE/FORCE_SETTLE.
+    thumb_oppose_rate_scale: float = 1.0
+    # Optional temporary left/right Z separation used only while the two
+    # thumbs cross their mutual collision corridor.  CONTACT_ACQUIRE and
+    # the settled grasp retain ``vertical_stagger``; the target tracker
+    # rate-limits both entry and return, so this is a path waypoint rather
+    # than a discontinuous joint command.
+    thumb_crossing_vertical_stagger: float | None = None
+    thumb_crossing_settle_steps: int = 0
+    # Asymmetric claw lead established while both hands are still at the
+    # high clearance waypoint.  Keeping one thumb ahead of the other
+    # avoids the symmetric thumb-tip crossing corridor without requiring
+    # a collision or a forceful pass-through near the object.
+    lead_thumb_preshape_synergy: float = 0.0
+    trailing_thumb_preshape_synergy: float = 0.0
+    # Optional trailing-thumb head start applied only after bilateral
+    # index/middle contact is confirmed.  Unlike the high-clearance
+    # preshape above, this cannot perturb the approach geometry.
+    trailing_thumb_entry_synergy: float = 0.0
+    # Transient contact dropout allowance while the trailing thumb is
+    # still approaching.  This does not count toward any grasp gate: the
+    # controller must still form real bilateral tripod contact afterward.
+    thumb_oppose_contact_loss_grace_steps: int = 0
+    tripod_contact_loss_grace_steps: int = 5
+    # Do not turn incidental object motion during the unsupported thumb
+    # approach into a moving arm target.  When enabled, CONTACT_ACQUIRE's
+    # last reference remains the fixed anchor through THUMB_OPPOSE.
+    freeze_contact_ref_during_thumb_oppose: bool = False
     # Thumb Opposition + Claw-Style Bimanual Grasp session: matches Gate
     # A's literal "bilateral tripod contact >= 30 step" requirement for
     # TRIPOD_SETTLE, same duration as both_ready_stable_steps above but
@@ -552,6 +616,9 @@ class GraspExpertConfig:
     # Section 5: grip_center/grip_half_width control coordinate limits.
     grip_center_max_correction: float = 0.02  # m, anti-windup cap on cumulative center bias
     force_deadband: float = 0.5  # N, ignore force error smaller than this
+    postcontact_x_position_gain: float = 0.0
+    postcontact_x_velocity_gain: float = 0.0
+    postcontact_x_correction_limit: float = 0.03
 
 
 @dataclass
@@ -567,10 +634,23 @@ class ContactCategory:
     # each other, not both pushing from the same side).
     world_normal: np.ndarray | None = None
     world_point: np.ndarray | None = None
+    # True physical resultant on the object, summed over every MuJoCo
+    # contact point belonging to this category.  A finger mesh typically
+    # produces several simultaneous points; max(single point) is not a
+    # valid group-force measurement.
+    world_force_sum: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
 
     @property
     def resultant(self) -> float:
+        # Largest single contact-point resultant, retained for legacy
+        # impact/contact gates whose thresholds were calibrated in this
+        # convention.
         return float(np.hypot(self.normal_force, self.tangential_force))
+
+    @property
+    def net_resultant(self) -> float:
+        """Physical category resultant summed over all contact points."""
+        return float(np.linalg.norm(self.world_force_sum))
 
 
 @dataclass
@@ -841,6 +921,10 @@ class BimanualSidePinchExpert:
         # independently regulated (see PROJECT_CONTEXT.md).
         self.left_group_synergy = np.zeros(3, dtype=np.float64)  # (thumb, index, middle)
         self.right_group_synergy = np.zeros(3, dtype=np.float64)
+        self._left_thumb_latched = False
+        self._right_thumb_latched = False
+        self._left_thumb_latched_synergy = 0.0
+        self._right_thumb_latched_synergy = 0.0
         self.left_desired_synergy = 0.0
         self.right_desired_synergy = 0.0
         self.max_dual_contact_streak = 0
@@ -1407,10 +1491,14 @@ class BimanualSidePinchExpert:
             frame_normal = np.array(c.frame[0:3], dtype=np.float64)
             world_normal = frame_normal if model.geom_bodyid[c.geom1] == obj_body else -frame_normal
             world_point = np.array(c.pos, dtype=np.float64)
+            contact_R = np.asarray(c.frame, dtype=np.float64).reshape(3, 3)
+            force_on_geom2 = contact_R.T @ force6[:3]
+            force_on_object = -force_on_geom2 if model.geom_bodyid[c.geom1] == obj_body else force_on_geom2
 
             def _accum(key: str):
                 cat = cats[key]
                 cat.touched = True
+                cat.world_force_sum += force_on_object
                 cat.normal_force = max(cat.normal_force, abs(normal))
                 cat.tangential_force = max(cat.tangential_force, tangential)
                 if resultant >= cat_max_resultant[key]:
@@ -1958,6 +2046,18 @@ class BimanualSidePinchExpert:
         if touched:
             self._contact_ref = obj.copy()
 
+    def _postcontact_x_correction(self, obj: np.ndarray) -> float:
+        """Small common hand-target shift opposing object X drift."""
+        if self._contact_ref is None:
+            return 0.0
+        vx = float(self.env.data.qvel[self.env._object_dof_adr])
+        raw = (
+            self.config.postcontact_x_position_gain * float(self._contact_ref[0] - obj[0])
+            - self.config.postcontact_x_velocity_gain * vx
+        )
+        lim = self.config.postcontact_x_correction_limit
+        return float(np.clip(raw, -lim, lim))
+
     def _contact_acquire_hand_step(
         self, touch: bool, force: float, offset: float, substate: HandSubstate, reacquire_attempts: int, loss_grace: int
     ) -> tuple[float, HandSubstate, int, int]:
@@ -2035,6 +2135,17 @@ class BimanualSidePinchExpert:
         left_c = self._contact("left")
         right_c = self._contact("right")
         self._last_left_contact, self._last_right_contact = left_c, right_c
+        # A safety latch is a contact-hold mode, not a permanent aperture
+        # lock.  If the physical thumb contact is gone, retaining the old
+        # safe aperture prevents the existing reacquisition loop from
+        # closing the thumb again and guarantees CONTACT_LOST.  Release
+        # only the affected side on measured contact loss; while contact
+        # remains present the latch still breaks rollback/reclose cycling.
+        if cfg.latch_thumb_after_first_contact:
+            if self._left_thumb_latched and not left_c.thumb.touched:
+                self._left_thumb_latched = False
+            if self._right_thumb_latched and not right_c.thumb.touched:
+                self._right_thumb_latched = False
         left_touch, left_force_raw = left_c.any_touch, left_c.max_force
         right_touch, right_force_raw = right_c.any_touch, right_c.max_force
         self.hand_hand_touched, self.hand_hand_force_raw = self._hand_hand_contact()
@@ -2286,6 +2397,15 @@ class BimanualSidePinchExpert:
                     right_actual, _ = self.right_ctrl.current_pose(self.env.data)
                     self.left_tracker.snap(left_actual)
                     self.right_tracker.snap(right_actual)
+                    self.left_group_synergy[0] = max(
+                        self.left_group_synergy[0],
+                        float(np.clip(cfg.lead_thumb_preshape_synergy, 0.0, 1.0)),
+                    )
+                    self.right_group_synergy[0] = max(
+                        self.right_group_synergy[0],
+                        float(np.clip(cfg.trailing_thumb_preshape_synergy, 0.0, 1.0)),
+                    )
+                    self._sync_scalar_synergy()
                     self._transition(GraspState.FOREARM_DESCEND)
 
         elif self.state == GraspState.FOREARM_DESCEND:
@@ -2723,6 +2843,11 @@ class BimanualSidePinchExpert:
                 # continuous with wherever the two independent offsets
                 # ended up.
                 self.grip_half_width = 0.5 * (self.left_approach_offset + self.right_approach_offset)
+                self.right_group_synergy[0] = max(
+                    self.right_group_synergy[0],
+                    float(np.clip(cfg.trailing_thumb_entry_synergy, 0.0, 1.0)),
+                )
+                self._sync_scalar_synergy()
                 self._transition(GraspState.THUMB_OPPOSE)
             elif both_terminally_lost or (
                 self.left_approach_offset <= self.grip_half_width_min
@@ -2746,15 +2871,31 @@ class BimanualSidePinchExpert:
             # np.where pattern FINGER_CLOSE/FORCE_SETTLE already use) so
             # they don't drift/over-squeeze while thumb catches up.
             self._update_z_sync()
-            if left_c.finger.touched and right_c.finger.touched:
+            if (
+                not cfg.freeze_contact_ref_during_thumb_oppose
+                and left_c.finger.touched
+                and right_c.finger.touched
+            ):
                 self._contact_ref = obj.copy()
-            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=self._effective_vertical_stagger)
+            crossing_stagger = (
+                self._effective_vertical_stagger
+                if cfg.thumb_crossing_vertical_stagger is None
+                else cfg.thumb_crossing_vertical_stagger
+            )
+            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=crossing_stagger)
+            left_goal[0] += cfg.thumb_intercept_forward_offset
+            right_goal[0] += cfg.thumb_intercept_forward_offset
             self.left_tracker.set_goal(left_goal)
             self.right_tracker.set_goal(right_goal)
 
             step_size = 1.0 / cfg.finger_close_steps
+            thumb_step_size = step_size * cfg.thumb_oppose_rate_scale
             over, under = cfg.max_safe_grip_force, cfg.finger_force_limit
-            # thumb (group 0): actively ramp closed unless already over
+            # thumb (group 0): actively ramp closed unless already over.
+            # When a crossing waypoint is configured, first give the arm
+            # trackers a few control ticks to establish that clearance;
+            # otherwise thumb curl begins while the hands are still on
+            # the old, colliding path and the waypoint arrives too late.
             # force -- OR the two hands are touching EACH OTHER (direct
             # trace found both thumbs colliding with each other,
             # left_hand_thumb_2_link vs right_hand_thumb_2_link, for
@@ -2766,23 +2907,76 @@ class BimanualSidePinchExpert:
             # contact, and retreating both would just give up a real
             # grip over a self-collision at the wrist/edge).
             hand_hand_blocked = self.hand_hand_touched
-            for side_syn, side_force in (
-                (self.left_group_synergy, self.left_group_force_raw),
-                (self.right_group_synergy, self.right_group_force_raw),
+            if cfg.latch_thumb_after_first_contact:
+                prior_events = getattr(self.env, "last_safety_events", ())
+                left_thumb_safety = any(
+                    ev[0] == "left" and ev[1] == 0 for ev in prior_events
+                )
+                right_thumb_safety = any(
+                    ev[0] == "right" and ev[1] == 0 for ev in prior_events
+                )
+                if left_c.thumb.touched and left_thumb_safety and not self._left_thumb_latched:
+                    self._left_thumb_latched = True
+                    self._left_thumb_latched_synergy = float(self.env._hand_group_synergy[0])
+                if right_c.thumb.touched and right_thumb_safety and not self._right_thumb_latched:
+                    self._right_thumb_latched = True
+                    self._right_thumb_latched_synergy = float(self.env._hand_group_synergy[3])
+            for side_syn, side_force, latched, latch_name in (
+                (self.left_group_synergy, self.left_group_force_raw, self._left_thumb_latched, "left"),
+                (self.right_group_synergy, self.right_group_force_raw, self._right_thumb_latched, "right"),
             ):
+                if self.state_step <= cfg.thumb_crossing_settle_steps:
+                    continue
+                if cfg.latch_thumb_after_first_contact and latched:
+                    latched_value = self._left_thumb_latched_synergy if latch_name == "left" else self._right_thumb_latched_synergy
+                    if side_force[0] > over:
+                        latched_value = max(0.0, latched_value - thumb_step_size)
+                    side_syn[0] = latched_value
+                    if latch_name == "left":
+                        self._left_thumb_latched_synergy = latched_value
+                    else:
+                        self._right_thumb_latched_synergy = latched_value
+                    continue
                 if side_force[0] > over or hand_hand_blocked:
-                    side_syn[0] = max(0.0, side_syn[0] - step_size) if side_force[0] > over else side_syn[0]
+                    side_syn[0] = max(0.0, side_syn[0] - thumb_step_size) if side_force[0] > over else side_syn[0]
                 elif side_force[0] < under:
-                    side_syn[0] = min(1.0, side_syn[0] + step_size)
-            # index/middle (groups 1,2): gentle hold, same regulation FINGER_CLOSE uses
-            self.left_group_synergy[1:] = np.where(
-                self.left_group_force_raw[1:] > over, np.maximum(0.0, self.left_group_synergy[1:] - step_size),
-                np.where(self.left_group_force_raw[1:] < under, np.minimum(1.0, self.left_group_synergy[1:] + step_size), self.left_group_synergy[1:]),
-            )
-            self.right_group_synergy[1:] = np.where(
-                self.right_group_force_raw[1:] > over, np.maximum(0.0, self.right_group_synergy[1:] - step_size),
-                np.where(self.right_group_force_raw[1:] < under, np.minimum(1.0, self.right_group_synergy[1:] + step_size), self.right_group_synergy[1:]),
-            )
+                    side_syn[0] = min(1.0, side_syn[0] + thumb_step_size)
+            # index/middle (groups 1,2): preserve the light contact
+            # acquired in CONTACT_ACQUIRE while thumb travels.  The
+            # former ``force < 8N => close at 1/finger_close_steps`` rule
+            # was not a hold at all: it advanced both hands for ~20
+            # control steps without opposing thumb support and displaced
+            # SIZE_12 by centimetres before either thumb could intercept
+            # the back face.  Use a low-force, slow maintenance loop;
+            # safety relief remains able to open an over-force group.
+            if cfg.hold_opposing_fingers_during_thumb_oppose:
+                self.left_group_synergy[1:] = np.where(
+                    self.left_group_force_raw[1:] > over,
+                    np.maximum(0.0, self.left_group_synergy[1:] - step_size),
+                    np.where(
+                        self.left_group_force_raw[1:] < cfg.contact_acquire_hold_force,
+                        np.minimum(1.0, self.left_group_synergy[1:] + cfg.settle_pressure_step),
+                        self.left_group_synergy[1:],
+                    ),
+                )
+                self.right_group_synergy[1:] = np.where(
+                    self.right_group_force_raw[1:] > over,
+                    np.maximum(0.0, self.right_group_synergy[1:] - step_size),
+                    np.where(
+                        self.right_group_force_raw[1:] < cfg.contact_acquire_hold_force,
+                        np.minimum(1.0, self.right_group_synergy[1:] + cfg.settle_pressure_step),
+                        self.right_group_synergy[1:],
+                    ),
+                )
+            else:
+                self.left_group_synergy[1:] = np.where(
+                    self.left_group_force_raw[1:] > over, np.maximum(0.0, self.left_group_synergy[1:] - step_size),
+                    np.where(self.left_group_force_raw[1:] < under, np.minimum(1.0, self.left_group_synergy[1:] + step_size), self.left_group_synergy[1:]),
+                )
+                self.right_group_synergy[1:] = np.where(
+                    self.right_group_force_raw[1:] > over, np.maximum(0.0, self.right_group_synergy[1:] - step_size),
+                    np.where(self.right_group_force_raw[1:] < under, np.minimum(1.0, self.right_group_synergy[1:] + step_size), self.right_group_synergy[1:]),
+                )
             self._sync_scalar_synergy()
 
             # Active relief for hand-hand collision (not just capping
@@ -2800,7 +2994,12 @@ class BimanualSidePinchExpert:
             left_thumb_ready = left_c.thumb.touched and self.left_group_force_raw[0] < over
             right_thumb_ready = right_c.thumb.touched and self.right_group_force_raw[0] < over
 
-            if not (left_touch and right_touch):
+            if left_touch and right_touch:
+                self._contact_loss_grace = 0
+            else:
+                self._contact_loss_grace += 1
+
+            if self._contact_loss_grace > cfg.thumb_oppose_contact_loss_grace_steps:
                 self.failure_reason = FailureReason.CONTACT_LOST
                 self.state = GraspState.FAILURE
             elif left_thumb_ready and right_thumb_ready:
@@ -2826,22 +3025,41 @@ class BimanualSidePinchExpert:
             # A's literal requirement, not just "some finger touching".
             self._update_z_sync()
             self._maybe_update_contact_ref(obj, left_c.finger.touched and right_c.finger.touched)
-            left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=self._effective_vertical_stagger)
+            left_goal, right_goal = self._grip_targets(
+                self._contact_ref,
+                self.grasp_z_offset,
+                stagger=self._effective_vertical_stagger,
+            )
+            x_correction = cfg.thumb_intercept_forward_offset + self._postcontact_x_correction(obj)
+            left_goal[0] += x_correction
+            right_goal[0] += x_correction
             self.left_tracker.set_goal(left_goal)
             self.right_tracker.set_goal(right_goal)
 
             fine_step = 0.5 / cfg.finger_close_steps
             fine_step_vec = np.array([fine_step * cfg.thumb_closing_rate_scale, fine_step, fine_step])
-            over, under = cfg.max_safe_grip_force, cfg.target_grip_force
+            if cfg.lock_synergy_after_tripod:
+                fine_step_vec[:] = 0.0
+            over_vec = np.array([cfg.thumb_release_force, cfg.max_safe_grip_force, cfg.max_safe_grip_force])
+            under_vec = np.array([cfg.thumb_target_grip_force, cfg.target_grip_force, cfg.target_grip_force])
             left_thumb_before, right_thumb_before = self.left_group_synergy[0], self.right_group_synergy[0]
             self.left_group_synergy = np.where(
-                self.left_group_force_raw > over, np.maximum(0.0, self.left_group_synergy - fine_step_vec),
-                np.where(self.left_group_force_raw < under, np.minimum(1.0, self.left_group_synergy + fine_step_vec), self.left_group_synergy),
+                self.left_group_force_raw > over_vec, np.maximum(0.0, self.left_group_synergy - fine_step_vec),
+                np.where(self.left_group_force_raw < under_vec, np.minimum(1.0, self.left_group_synergy + fine_step_vec), self.left_group_synergy),
             )
             self.right_group_synergy = np.where(
-                self.right_group_force_raw > over, np.maximum(0.0, self.right_group_synergy - fine_step_vec),
-                np.where(self.right_group_force_raw < under, np.minimum(1.0, self.right_group_synergy + fine_step_vec), self.right_group_synergy),
+                self.right_group_force_raw > over_vec, np.maximum(0.0, self.right_group_synergy - fine_step_vec),
+                np.where(self.right_group_force_raw < under_vec, np.minimum(1.0, self.right_group_synergy + fine_step_vec), self.right_group_synergy),
             )
+            if cfg.latch_thumb_after_first_contact:
+                if self._left_thumb_latched:
+                    if self.left_group_force_raw[0] > cfg.max_safe_grip_force:
+                        self._left_thumb_latched_synergy = max(0.0, self._left_thumb_latched_synergy - fine_step_vec[0])
+                    self.left_group_synergy[0] = self._left_thumb_latched_synergy
+                if self._right_thumb_latched:
+                    if self.right_group_force_raw[0] > cfg.max_safe_grip_force:
+                        self._right_thumb_latched_synergy = max(0.0, self._right_thumb_latched_synergy - fine_step_vec[0])
+                    self.right_group_synergy[0] = self._right_thumb_latched_synergy
             # Hand-hand collision guard (same rationale as THUMB_OPPOSE):
             # never let this state's force regulation keep INCREASING
             # thumb curl once the two hands are touching each other --
@@ -2884,7 +3102,11 @@ class BimanualSidePinchExpert:
             self.max_bilateral_tripod_streak = max(self.max_bilateral_tripod_streak, self._bilateral_tripod_streak)
 
             self.settle_stable_streak = self.settle_stable_streak + 1 if both_tripod else 0
-            if not (left_touch and right_touch):
+            if left_touch and right_touch:
+                self._contact_loss_grace = 0
+            else:
+                self._contact_loss_grace += 1
+            if self._contact_loss_grace > cfg.tripod_contact_loss_grace_steps:
                 self.failure_reason = FailureReason.CONTACT_LOST
                 self.state = GraspState.FAILURE
             elif self.settle_stable_streak >= cfg.tripod_settle_stable_steps:
@@ -2967,6 +3189,9 @@ class BimanualSidePinchExpert:
             # max_target_step, already about as fast a retreat as the arm
             # can safely make.
             left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=self._effective_vertical_stagger)
+            x_correction = cfg.thumb_intercept_forward_offset + self._postcontact_x_correction(obj)
+            left_goal[0] += x_correction
+            right_goal[0] += x_correction
             self.left_tracker.set_goal(left_goal)
             self.right_tracker.set_goal(right_goal)
 
@@ -2994,7 +3219,7 @@ class BimanualSidePinchExpert:
                 # period matches the object's own settle timescale, not an
                 # arbitrarily long tolerance.
                 self._contact_loss_grace += 1
-            if self._contact_loss_grace > 5:
+            if self._contact_loss_grace > cfg.tripod_contact_loss_grace_steps:
                 self.failure_reason = FailureReason.CONTACT_LOST
                 self.state = GraspState.FAILURE
             elif self.settle_stable_streak >= 10:
@@ -3018,14 +3243,23 @@ class BimanualSidePinchExpert:
             # per-group regulation, gentler magnitude.
             fine_step = 0.5 / cfg.finger_close_steps
             fine_step_vec = np.array([fine_step * cfg.thumb_closing_rate_scale, fine_step, fine_step])
+            if cfg.lock_synergy_after_tripod:
+                fine_step_vec[:] = 0.0
+            over_vec = np.array([cfg.thumb_release_force, cfg.max_safe_grip_force, cfg.max_safe_grip_force])
+            under_vec = np.array([cfg.thumb_target_grip_force, cfg.target_grip_force, cfg.target_grip_force])
             self.left_group_synergy = np.where(
-                self.left_group_force_raw > cfg.max_safe_grip_force, np.maximum(0.0, self.left_group_synergy - fine_step_vec),
-                np.where(self.left_group_force_raw < cfg.target_grip_force, np.minimum(1.0, self.left_group_synergy + fine_step_vec), self.left_group_synergy),
+                self.left_group_force_raw > over_vec, np.maximum(0.0, self.left_group_synergy - fine_step_vec),
+                np.where(self.left_group_force_raw < under_vec, np.minimum(1.0, self.left_group_synergy + fine_step_vec), self.left_group_synergy),
             )
             self.right_group_synergy = np.where(
-                self.right_group_force_raw > cfg.max_safe_grip_force, np.maximum(0.0, self.right_group_synergy - fine_step_vec),
-                np.where(self.right_group_force_raw < cfg.target_grip_force, np.minimum(1.0, self.right_group_synergy + fine_step_vec), self.right_group_synergy),
+                self.right_group_force_raw > over_vec, np.maximum(0.0, self.right_group_synergy - fine_step_vec),
+                np.where(self.right_group_force_raw < under_vec, np.minimum(1.0, self.right_group_synergy + fine_step_vec), self.right_group_synergy),
             )
+            if cfg.latch_thumb_after_first_contact:
+                if self._left_thumb_latched:
+                    self.left_group_synergy[0] = self._left_thumb_latched_synergy
+                if self._right_thumb_latched:
+                    self.right_group_synergy[0] = self._right_thumb_latched_synergy
             self._sync_scalar_synergy()
 
             if left_force > cfg.max_safe_grip_force or right_force > cfg.max_safe_grip_force:
@@ -3042,6 +3276,8 @@ class BimanualSidePinchExpert:
                 ))
 
             left_goal, right_goal = self._grip_targets(self._contact_ref, self.grasp_z_offset, stagger=self._effective_vertical_stagger)
+            left_goal[0] += cfg.thumb_intercept_forward_offset
+            right_goal[0] += cfg.thumb_intercept_forward_offset
             self.left_tracker.set_goal(left_goal)
             self.right_tracker.set_goal(right_goal)
 

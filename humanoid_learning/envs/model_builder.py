@@ -135,6 +135,33 @@ def _add_grasp_sites(spec: "mujoco.MjSpec") -> None:
         )
 
 
+def _use_fingertip_collision_pads(spec: "mujoco.MjSpec", config) -> None:
+    """Grasp-only Dex3 collision proxy with six compliant tip pads.
+
+    Visual meshes and all joints/actuators remain untouched.  Only their
+    collision participation is disabled; one sphere at each measured
+    fingertip becomes the physical contact surface.  This avoids several
+    simultaneous hard mesh contacts masquerading as one low-force finger
+    reading and represents a plausible rubber-pad end-effector upgrade.
+    """
+    for body in spec.bodies:
+        if body.name.startswith("left_hand") or body.name.startswith("right_hand"):
+            for geom in body.geoms:
+                geom.contype = 0
+                geom.conaffinity = 0
+    for site_name, body_name in wbc.FINGERTIP_SITE_BODIES.items():
+        spec.body(body_name).add_geom(
+            name=f"{site_name}_collision_pad",
+            type=mujoco.mjtGeom.mjGEOM_SPHERE,
+            pos=list(wbc.FINGERTIP_SITE_LOCAL_POS[site_name]),
+            size=[config.fingertip_pad_radius, 0.0, 0.0],
+            friction=list(config.fingertip_pad_friction),
+            condim=4,
+            solref=[0.03, 1.0],
+            rgba=[0.08, 0.08, 0.08, 1.0],
+        )
+
+
 def _add_floor(spec: "mujoco.MjSpec") -> None:
     spec.worldbody.add_geom(
         name="floor",
@@ -218,6 +245,8 @@ def build_grasp_model(config, hard_fixed_waist: bool = False) -> mujoco.MjModel:
 
     _add_ee_sites(spec)
     _add_grasp_sites(spec)
+    if config.use_fingertip_collision_pads:
+        _use_fingertip_collision_pads(spec, config)
     _add_floor(spec)
 
     table = spec.worldbody.add_body(name=tc.TABLE_BODY, pos=list(config.table_pos))

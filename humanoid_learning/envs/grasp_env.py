@@ -151,6 +151,8 @@ class FixedBaseGraspEnv(gym.Env):
         # order every group-indexed array in this file/grasp_expert.py uses.
         self._left_group_act_ids = [np.array([act_id(n) for n, _, _ in g]) for g in _LEFT_GROUP_TARGETS]
         self._right_group_act_ids = [np.array([act_id(n) for n, _, _ in g]) for g in _RIGHT_GROUP_TARGETS]
+        self._left_group_qpos_adr = [np.array([qpos_adr(n) for n, _, _ in g]) for g in _LEFT_GROUP_TARGETS]
+        self._right_group_qpos_adr = [np.array([qpos_adr(n) for n, _, _ in g]) for g in _RIGHT_GROUP_TARGETS]
 
         self._left_ee_site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, tc.LEFT_EE_SITE)
         self._right_ee_site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, tc.RIGHT_EE_SITE)
@@ -236,17 +238,20 @@ class FixedBaseGraspEnv(gym.Env):
         return self._get_obs(), self._get_info()
 
     def _group_contact_force(self, side: str, group_idx: int) -> float:
-        """Peak resultant contact force between ONE finger group's bodies
+        """Net resultant contact force between ONE finger group's bodies
         and the object, read directly from the CURRENT data.contact (safe
         to call mid-substep, unlike grasp_expert.py's _contact() which
         also does full palm/wrist/self bookkeeping this doesn't need).
-        group_idx: 0=thumb, 1=index, 2=middle. Matches _group_force_raw's
-        "max within group" convention in grasp_expert.py -- same physical
-        quantity, just computed at substep granularity here."""
+        A single mesh pair commonly contributes 3-4 MuJoCo contact
+        points.  Taking only the largest point under-reports the actual
+        force on the object by 2-3x, so sum the world-frame forces first
+        and return the magnitude of that physical resultant.
+        group_idx: 0=thumb, 1=index, 2=middle."""
         model, data = self.model, self.data
         obj_body = self._object_body_id
         group_name = ("thumb", "index", "middle")[group_idx]
         prefix = f"{side}_hand_{group_name}"
+        force_sum = np.zeros(3, dtype=np.float64)
         peak = 0.0
         for i in range(data.ncon):
             c = data.contact[i]
@@ -259,9 +264,11 @@ class FixedBaseGraspEnv(gym.Env):
                 continue
             force6 = np.zeros(6)
             mujoco.mj_contactForce(model, data, i, force6)
-            resultant = float(np.hypot(force6[0], np.hypot(force6[1], force6[2])))
-            peak = max(peak, resultant)
-        return peak
+            peak = max(peak, float(np.linalg.norm(force6[:3])))
+            contact_R = np.asarray(c.frame, dtype=np.float64).reshape(3, 3)
+            force_on_geom2 = contact_R.T @ force6[:3]
+            force_sum += -force_on_geom2 if b1 == obj_body else force_on_geom2
+        return float(np.linalg.norm(force_sum)) if self.config.use_net_group_force else peak
 
     def _hand_hand_contact_force(self) -> float:
         """Peak resultant contact force between ANY left_hand body and ANY
@@ -299,6 +306,7 @@ class FixedBaseGraspEnv(gym.Env):
             self._arm_ctrl_low,
             self._arm_ctrl_high,
         )
+        prev_group_synergy = self._hand_group_synergy.copy()
         group_delta = np.concatenate([action[_LEFT_HAND_GROUP_SLICE], action[_RIGHT_HAND_GROUP_SLICE]])
         self._hand_group_synergy = np.clip(
             self._hand_group_synergy + self.config.hand_synergy_action_scale * group_delta, 0.0, 1.0
@@ -362,27 +370,45 @@ class FixedBaseGraspEnv(gym.Env):
         self.last_safety_events = []
         for _substep_idx in range(self.config.frame_skip):
             mujoco.mj_step(self.model, self.data)
-            for side_idx, (side, group_ids) in enumerate((("left", self._left_group_act_ids), ("right", self._right_group_act_ids))):
+            for side_idx, (side, group_ids, group_qpos) in enumerate((
+                ("left", self._left_group_act_ids, self._left_group_qpos_adr),
+                ("right", self._right_group_act_ids, self._right_group_qpos_adr),
+            )):
                 for g in range(3):
                     force = self._group_contact_force(side, g)
                     ids = group_ids[g]
+                    unload_target = np.clip(
+                        self.data.qpos[group_qpos[g]],
+                        self.model.actuator_ctrlrange[ids, 0],
+                        self.model.actuator_ctrlrange[ids, 1],
+                    )
+                    safe_target = unload_target if self.config.unload_finger_on_force_limit else prev_group_ctrl[side_idx][g]
                     if force > limit:
-                        self.data.ctrl[ids] = prev_group_ctrl[side_idx][g]
+                        frac = self.config.force_unload_fraction if self.config.unload_finger_on_force_limit else 1.0
+                        self.data.ctrl[ids] = (1.0 - frac) * self.data.ctrl[ids] + frac * safe_target
+                        if self.config.persist_safety_synergy_rollback:
+                            syn_idx = g if side == "left" else 3 + g
+                            self._hand_group_synergy[syn_idx] = prev_group_synergy[syn_idx]
                         self.last_safety_events.append((side, g, force))
                     elif force > warn:
-                        self.data.ctrl[ids] = 0.5 * (self.data.ctrl[ids] + prev_group_ctrl[side_idx][g])
+                        frac = 0.5 * (self.config.force_unload_fraction if self.config.unload_finger_on_force_limit else 1.0)
+                        self.data.ctrl[ids] = (1.0 - frac) * self.data.ctrl[ids] + frac * safe_target
             # Hand-hand collision (thumb-vs-thumb, direct trace found 40N+
             # with nothing reacting) -- same substep-level treatment, but
             # freezing BOTH thumb groups (whichever side is at fault is
             # not distinguishable from a single aggregate force reading).
             hh_force = self._hand_hand_contact_force()
+            left_thumb_unload = self.data.qpos[self._left_group_qpos_adr[0]]
+            right_thumb_unload = self.data.qpos[self._right_group_qpos_adr[0]]
+            left_thumb_safe = left_thumb_unload if self.config.unload_finger_on_force_limit else prev_group_ctrl[0][0]
+            right_thumb_safe = right_thumb_unload if self.config.unload_finger_on_force_limit else prev_group_ctrl[1][0]
             if hh_force > limit:
-                self.data.ctrl[self._left_group_act_ids[0]] = prev_group_ctrl[0][0]
-                self.data.ctrl[self._right_group_act_ids[0]] = prev_group_ctrl[1][0]
+                self.data.ctrl[self._left_group_act_ids[0]] = left_thumb_safe
+                self.data.ctrl[self._right_group_act_ids[0]] = right_thumb_safe
                 self.last_safety_events.append(("hand_hand", 0, hh_force))
             elif hh_force > warn:
-                self.data.ctrl[self._left_group_act_ids[0]] = 0.5 * (self.data.ctrl[self._left_group_act_ids[0]] + prev_group_ctrl[0][0])
-                self.data.ctrl[self._right_group_act_ids[0]] = 0.5 * (self.data.ctrl[self._right_group_act_ids[0]] + prev_group_ctrl[1][0])
+                self.data.ctrl[self._left_group_act_ids[0]] = 0.5 * (self.data.ctrl[self._left_group_act_ids[0]] + left_thumb_safe)
+                self.data.ctrl[self._right_group_act_ids[0]] = 0.5 * (self.data.ctrl[self._right_group_act_ids[0]] + right_thumb_safe)
 
             if self.substep_hook is not None:
                 self.substep_hook(self, _substep_idx, prev_group_ctrl)

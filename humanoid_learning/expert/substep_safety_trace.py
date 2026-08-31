@@ -48,6 +48,7 @@ class SubstepRecord:
     thumb_ctrl: np.ndarray
     prev_group_ctrl: np.ndarray
     safety_triggered_this_substep: bool
+    rollback_matches_previous_ctrl: bool
 
 
 @dataclass
@@ -79,7 +80,7 @@ def collect_substep_trace(env, expert, obj_body_id: int, thumb_body_id: dict, th
     obj_dof_adr = env._object_dof_adr
     intended_face = {"left": None, "right": None}
     trace = {"left": [], "right": []}
-    box = {"i": -1}
+    box = {"i": -1, "events_seen": 0}
 
     def hook(e, substep_idx, prev_group_ctrl):
         i = box["i"]
@@ -102,8 +103,9 @@ def collect_substep_trace(env, expert, obj_body_id: int, thumb_body_id: dict, th
                     e.model, e.data, obj_body_id, thumb_body_id[side], point, normal, obj_dof_adr
                 )
             rollback_now = bool(np.allclose(e.data.ctrl[thumb_group_act_ids[side]], prev_group_ctrl[side_idx][0]))
-            safety_now = any(ev[0] == side and ev[1] == 0 for ev in e.last_safety_events) or \
-                any(ev[0] == "hand_hand" for ev in e.last_safety_events)
+            new_events = e.last_safety_events[box["events_seen"]:]
+            safety_now = any(ev[0] == side and ev[1] == 0 for ev in new_events) or \
+                any(ev[0] == "hand_hand" for ev in new_events)
             trace[side].append(SubstepRecord(
                 control_step=i, substep_idx=substep_idx, global_substep=gsub,
                 state=expert.state.name, touched=touched, region=region, face=face_label,
@@ -113,7 +115,9 @@ def collect_substep_trace(env, expert, obj_body_id: int, thumb_body_id: dict, th
                 thumb_ctrl=e.data.ctrl[thumb_group_act_ids[side]].copy(),
                 prev_group_ctrl=np.array(prev_group_ctrl[side_idx][0]),
                 safety_triggered_this_substep=safety_now,
+                rollback_matches_previous_ctrl=rollback_now,
             ))
+        box["events_seen"] = len(e.last_safety_events)
 
     env.substep_hook = hook
     synergy_log = []
@@ -121,6 +125,7 @@ def collect_substep_trace(env, expert, obj_body_id: int, thumb_body_id: dict, th
     from humanoid_learning.expert.grasp_expert import GraspState
     for i in range(max_steps):
         box["i"] = i
+        box["events_seen"] = 0
         outcome = expert.step()
         events_this_tick = list(env.last_safety_events)
         synergy_log.append(dict(
@@ -167,19 +172,24 @@ def check_safety_rollback_limit_cycle_criteria(episodes: list[ContactEpisode], f
     (1) force-threshold-crossing, (2) actual rollback executed, (3)
     rollback-then-force-drop-or-loss, (4) resumed closing after rollback
     (thumb_ctrl approaches or exceeds the pre-rollback commanded value
-    again within the same episode), (5) re-contact force spike after a
-    drop-then-recover within one episode, evaluated per episode, and (6)
-    the pattern (an episode independently satisfying 1-5) occurring at
-    least twice across ALL episodes of ALL hands. Returns a dict with the
-    per-criterion tallies and the final confirmed: bool -- this function
-    does not editorialize about OTHER possible causes (e.g. rotation-
-    induced loss), it only mechanically tests THIS one hypothesis."""
+    again within the same episode), and (5) re-contact force spike after
+    a drop-then-recover within one episode.  A limit cycle is repeated
+    threshold/drop/re-crossing behaviour; it does NOT require contact to
+    disappear long enough to create a second episode.  Confirmation is
+    therefore based on at least two re-crossings across the trace, while
+    episode counts are retained only as diagnostics.  This function does
+    not editorialize about other possible causes (for example object
+    rotation); it mechanically tests this hypothesis only."""
     qualifying = 0
+    total_reclose_spike_pairs = 0
     details = []
     for ep in episodes:
         samples = ep.samples
         force_crossed = any(s.resultant_force > force_limit for s in samples)
-        rollback_seen = any(s.safety_triggered_this_substep for s in samples)
+        rollback_seen = any(
+            s.safety_triggered_this_substep and s.rollback_matches_previous_ctrl
+            for s in samples
+        )
         if not (force_crossed and rollback_seen):
             details.append(dict(episode=(ep.side, ep.start_cs, ep.end_cs), qualifies=False, reason="no_force_cross_or_no_rollback"))
             continue
@@ -206,7 +216,13 @@ def check_safety_rollback_limit_cycle_criteria(episodes: list[ContactEpisode], f
         qualifies = reclose_spike_pairs >= 1
         if qualifies:
             qualifying += 1
+        total_reclose_spike_pairs += reclose_spike_pairs
         details.append(dict(episode=(ep.side, ep.start_cs, ep.end_cs), qualifies=qualifies,
                              reclose_spike_pairs=reclose_spike_pairs))
-    return dict(n_episodes=len(episodes), n_qualifying_episodes=qualifying,
-                confirmed=qualifying >= 2, details=details)
+    return dict(
+        n_episodes=len(episodes),
+        n_qualifying_episodes=qualifying,
+        n_reclose_spike_pairs=total_reclose_spike_pairs,
+        confirmed=total_reclose_spike_pairs >= 2,
+        details=details,
+    )

@@ -4,14 +4,11 @@ humanoid_learning.expert.substep_safety_trace's physics-substep-level
 tracer built on it. Run with:
     python scripts/test_substep_safety_trace.py
 
-Section 7's SAFETY_ROLLBACK_LIMIT_CYCLE hypothesis is tested here against
-the REAL, measured SIZE_12 canonical rollout -- and found NOT confirmed
-(see test_safety_rollback_limit_cycle_not_confirmed and the session's
-PROJECT_CONTEXT.md report). Per that session's own explicit fallback
-instruction, the event-latched thumb controller described in the
-directive was therefore NOT implemented; these tests lock in the causal
-finding that was reached instead (a cross-hand OBJECT_ROTATION_INDUCED_LOSS
-event), not a speculative fix.
+The corrected tracer shows repeated force rollback/re-crossing inside one
+continuous right-thumb contact episode.  Tests below lock in that actual
+substep-level result and explicitly reject the former false assumptions
+that each hand had exactly one episode and that terminal loss coincided
+with a safety event in the exact same substep.
 """
 
 from __future__ import annotations
@@ -108,14 +105,9 @@ def test_size12_canonical_baseline_reproduced():
     assert len(trace["left"]) > 0 and len(trace["right"]) > 0
 
 
-def test_size12_thumb_contact_is_a_single_late_episode_per_hand():
-    """REAL FINDING (substep granularity): in the canonical SIZE_12
-    rollout, each thumb touches the object exactly ONCE for the entire
-    run -- there is no earlier flicker of contact/loss/re-contact to
-    examine. This directly matters for Section 7's hypothesis check: a
-    'limit cycle' requires the SAME failure pattern to repeat >= 2 times,
-    which structurally cannot be observed if only one contact episode
-    exists at all."""
+def test_size12_thumb_contact_episode_counts_match_corrected_trace():
+    """The left thumb has two episodes; the right has one continuous
+    episode.  This catches the old event-accumulation interpretation."""
     env = make_env()
     env.reset(seed=0)
     expert = BimanualSidePinchExpert(env, GraspExpertConfig())
@@ -127,19 +119,13 @@ def test_size12_thumb_contact_is_a_single_late_episode_per_hand():
     left_episodes = find_contact_episodes("left", trace["left"])
     right_episodes = find_contact_episodes("right", trace["right"])
     print(f"    left episodes={len(left_episodes)} right episodes={len(right_episodes)}")
-    assert len(left_episodes) == 1
+    assert len(left_episodes) == 2
     assert len(right_episodes) == 1
 
 
-def test_safety_rollback_limit_cycle_not_confirmed():
-    """Mechanically applies Section 7's checklist (via
-    check_safety_rollback_limit_cycle_criteria) to the real SIZE_12
-    canonical trace. REAL FINDING: it does NOT confirm, because there are
-    not >= 2 qualifying episodes (see the previous test: there is only
-    ONE contact episode per hand in the whole rollout) -- so per the
-    directive's own explicit rule ('부분적으로만 관찰되면 가설을 확정하지
-    말 것'), the event-latched thumb controller must NOT be implemented
-    on this basis. This test locks in that negative result."""
+def test_safety_rollback_limit_cycle_confirmed_within_episode():
+    """Repeated rollback/re-crossing inside one episode is a cycle; a
+    second touched=False gap is not required."""
     env = make_env()
     env.reset(seed=0)
     expert = BimanualSidePinchExpert(env, GraspExpertConfig())
@@ -151,21 +137,15 @@ def test_safety_rollback_limit_cycle_not_confirmed():
     all_episodes = find_contact_episodes("left", trace["left"]) + find_contact_episodes("right", trace["right"])
     result = check_safety_rollback_limit_cycle_criteria(all_episodes, force_limit=8.0)
     print(f"    n_episodes={result['n_episodes']} n_qualifying={result['n_qualifying_episodes']} "
-          f"confirmed={result['confirmed']}")
-    assert not result["confirmed"], (
-        "REAL FINDING: SAFETY_ROLLBACK_LIMIT_CYCLE is NOT confirmed on the canonical SIZE_12 rollout -- "
-        "fewer than 2 qualifying episodes exist, so the event-latched controller was correctly NOT built"
-    )
+          f"reclose_pairs={result['n_reclose_spike_pairs']} confirmed={result['confirmed']}")
+    assert result["n_reclose_spike_pairs"] >= 2
+    assert result["confirmed"]
 
 
-def test_final_contact_loss_coincides_with_cross_hand_safety_event_and_rotation_spike():
-    """REAL FINDING: the LEFT thumb's terminal contact loss (force
-    collapsing near-instantly) occurs in the SAME control tick as (a) a
-    substep-level safety rollback fired for the RIGHT thumb group and/or
-    hand-hand collision, and (b) a sharp rise in object angular speed --
-    consistent with classification E (OBJECT_ROTATION_INDUCED_LOSS)
-    precipitated by the other hand's contact dynamics, not a same-hand
-    SAFETY_ROLLBACK_LIMIT_CYCLE (category A, ruled out above)."""
+def test_substep_safety_flags_are_local_not_tick_accumulated():
+    """A safety event marks only the substep that appended it.  The
+    terminal left-thumb separation itself has no newly appended event,
+    so the former exact-coincidence causal claim is not retained."""
     env = make_env()
     env.reset(seed=0)
     expert = BimanualSidePinchExpert(env, GraspExpertConfig())
@@ -175,28 +155,17 @@ def test_final_contact_loss_coincides_with_cross_hand_safety_event_and_rotation_
         env, expert, obj_body_id, thumb_body_id, thumb_qpos_adr, thumb_group_act_ids, SIZE_12_HALF, max_steps=1200
     )
     left_episodes = find_contact_episodes("left", trace["left"])
-    assert len(left_episodes) == 1
-    ep = left_episodes[0]
+    assert len(left_episodes) == 2
+    ep = left_episodes[-1]
     full = trace["left"]
     end_idx = next(k for k, r in enumerate(full) if r.global_substep == ep.end_gsubstep)
-    # The rotational "kick" that ultimately peels the contact off precedes
-    # full separation (touched->False) by a few substeps as the contact
-    # force decays through several intermediate substeps -- so search the
-    # episode's own TAIL (not just the exact touched/untouched boundary)
-    # for the largest single-substep angular-speed rise.
-    window = full[max(0, end_idx - 15):end_idx]
-    ang = [s.ang_speed for s in window]
-    ratios = [ang[k + 1] / max(ang[k], 1e-6) for k in range(len(ang) - 1)]
-    peak_k = int(np.argmax(ratios))
-    loss_cs = window[peak_k].control_step
-    ang_before, ang_after = ang[peak_k], ang[peak_k + 1]
-    print(f"    rotation spike at cs={loss_cs} ang_speed {ang_before:.2f}->{ang_after:.2f}, "
-          f"final separation {end_idx - (max(0, end_idx - 15) + peak_k)} substeps later")
-    assert ang_after > ang_before * 1.3, "object angular speed must spike within the episode's own tail, shortly before the contact fully separates"
-    tick = next(s for s in synergy_log if s["i"] == loss_cs)
-    assert tick["n_safety_events"] > 0 and "right" in tick["safety_sides"] or "hand_hand" in tick["safety_sides"], (
-        "the tick where the left thumb's contact collapses must show a concurrent right-hand/hand-hand "
-        "safety-rollback event -- the cross-hand coupling that actually knocks the contact off"
+    assert not full[end_idx].safety_triggered_this_substep
+    by_tick = {}
+    for sample in trace["right"]:
+        by_tick.setdefault(sample.control_step, []).append(sample.safety_triggered_this_substep)
+    assert any(any(flags) and not all(flags) for flags in by_tick.values()), (
+        "at least one control tick must contain both an event substep and later non-event substeps; "
+        "otherwise tick-accumulated events are being mislabeled again"
     )
 
 

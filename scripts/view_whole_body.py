@@ -16,6 +16,11 @@ Modes:
                its known failure mode (the object gets knocked away during
                approach), because PROJECT_CONTEXT.md Phase 4 reports this
                honestly rather than hiding it.
+    --grasp-safety-latch  the same SIZE_12 attempt with the 28th-session
+               safety-event thumb latch A/B condition enabled.  This is
+               a known negative experiment (tripod 14 -> 4), exposed only
+               so its lower rotation but earlier contact loss can be
+               inspected visually; it is not the canonical controller.
     --diagonal-feasibility  SIZE_12 diagonal four-face grasp: shows the
                current BEST STATIC candidate from humanoid_learning.expert.
                diagonal_feasibility's Stage U search as a frozen pose (not
@@ -28,6 +33,7 @@ Run locally (needs a real display):
     python scripts/view_whole_body.py --posture
     python scripts/view_whole_body.py --planar
     python scripts/view_whole_body.py --grasp
+    python scripts/view_whole_body.py --grasp-safety-latch
     python scripts/view_whole_body.py --diagonal-feasibility
 """
 
@@ -435,7 +441,11 @@ def mode_whole_body_diagonal():
                 time.sleep(target_dt - elapsed)
 
 
-def mode_grasp(object_pos_x: float = 0.27, object_half_size: float | None = None):
+def mode_grasp(
+    object_pos_x: float = 0.27,
+    object_half_size: float | None = None,
+    safety_latch: bool = False,
+):
     """Bimanual side-pinch attempt with the redesigned 9-state controller
     (STABLE_START..HOLD, rate-limited targets, grip_center/grip_half_width
     force regulation) on the 2x-scaled object -- real controller, shown
@@ -452,7 +462,8 @@ def mode_grasp(object_pos_x: float = 0.27, object_half_size: float | None = None
     from humanoid_learning.envs.grasp_env import FixedBaseGraspEnv
     from humanoid_learning.expert.grasp_expert import BimanualSidePinchExpert, GraspExpertConfig, GraspState
 
-    print("Bimanual side-pinch grasp attempt (Phase 4, redesigned 9-state controller).")
+    condition = "SAFETY-EVENT LATCH (experimental negative result)" if safety_latch else "CANONICAL"
+    print(f"Bimanual side-pinch grasp attempt — {condition}.")
     print(f"object_pos_x={object_pos_x}  object_half_size={object_half_size}")
     print("Close the viewer window to exit; a new attempt restarts automatically.")
 
@@ -460,7 +471,11 @@ def mode_grasp(object_pos_x: float = 0.27, object_half_size: float | None = None
     # whole lifetime -- reset the SAME env for each new attempt rather than
     # constructing a new one (which would build a different model/data the
     # already-open viewer could not switch to).
-    config_kwargs = dict(object_pos=(object_pos_x, 0.0, 0.0), arm_kp=120.0)
+    config_kwargs = dict(
+        object_pos=(object_pos_x, 0.0, 0.0),
+        arm_kp=120.0,
+        persist_safety_synergy_rollback=safety_latch,
+    )
     if object_half_size is not None:
         config_kwargs["object_half_size"] = object_half_size
     env = FixedBaseGraspEnv(GraspEnvConfig(**config_kwargs))
@@ -468,7 +483,10 @@ def mode_grasp(object_pos_x: float = 0.27, object_half_size: float | None = None
 
     def new_attempt():
         env.reset(seed=0)
-        state["expert"] = BimanualSidePinchExpert(env, GraspExpertConfig())
+        state["expert"] = BimanualSidePinchExpert(
+            env,
+            GraspExpertConfig(latch_thumb_after_first_contact=safety_latch),
+        )
         state["last_state"] = None
         state["frame"] = 0
 
@@ -488,6 +506,13 @@ def mode_grasp(object_pos_x: float = 0.27, object_half_size: float | None = None
         if outcome.state in (GraspState.SUCCESS, GraspState.FAILURE):
             print(
                 f"  attempt finished: {outcome.state.name}  "
+                f"reason={outcome.failure_reason}  "
+                f"tripod={outcome.max_bilateral_tripod_streak}/30  "
+                f"multifinger={outcome.max_bilateral_multifinger_streak}  "
+                f"obj_xy={outcome.object_xy_displacement:.4f}m  "
+                f"hand_hand={outcome.max_hand_hand_force_raw:.1f}N/"
+                f"{outcome.max_hand_hand_contact_streak}step  "
+                f"safety={outcome.substep_safety_event_count}  "
                 f"pre_lift_pop={outcome.pre_lift_pop_height:.4f}m  "
                 f"controlled_lift_gain={outcome.controlled_lift_gain:.4f}m  "
                 f"final_height_above_initial={outcome.final_height_above_initial:.4f}m\n  restarting...\n"
@@ -512,15 +537,16 @@ def main():
     parser.add_argument("--posture", action="store_true")
     parser.add_argument("--planar", action="store_true")
     parser.add_argument("--grasp", action="store_true")
+    parser.add_argument("--grasp-safety-latch", action="store_true", help="show the 28th-session failed safety-event latch A/B condition (not canonical)")
     parser.add_argument("--diagonal-feasibility", action="store_true", help="show the current best SIZE_12 diagonal four-face STATIC candidate (frozen pose, not a live grasp attempt)")
     parser.add_argument("--whole-body-diagonal", action="store_true", help="run the SIZE_12 full-body (pelvis/legs/waist/arms) Stage W diagonal-reach static feasibility search and report the result")
     parser.add_argument("--object-pos-x", type=float, default=0.27, help="object x position, meters from robot origin (--grasp only)")
     parser.add_argument("--object-half-size", type=float, default=None, help="object half-size, meters (--grasp only; default: GraspEnvConfig's own default, 0.06)")
     args = parser.parse_args()
 
-    modes = [args.stand, args.posture, args.planar, args.grasp, args.diagonal_feasibility, args.whole_body_diagonal]
+    modes = [args.stand, args.posture, args.planar, args.grasp, args.grasp_safety_latch, args.diagonal_feasibility, args.whole_body_diagonal]
     if sum(bool(m) for m in modes) != 1:
-        parser.error("pass exactly one of --stand / --posture / --planar / --grasp / --diagonal-feasibility / --whole-body-diagonal")
+        parser.error("pass exactly one of --stand / --posture / --planar / --grasp / --grasp-safety-latch / --diagonal-feasibility / --whole-body-diagonal")
 
     if args.stand:
         mode_stand()
@@ -530,6 +556,12 @@ def main():
         mode_planar()
     elif args.grasp:
         mode_grasp(object_pos_x=args.object_pos_x, object_half_size=args.object_half_size)
+    elif args.grasp_safety_latch:
+        mode_grasp(
+            object_pos_x=args.object_pos_x,
+            object_half_size=args.object_half_size,
+            safety_latch=True,
+        )
     elif args.diagonal_feasibility:
         mode_diagonal_feasibility()
     elif args.whole_body_diagonal:
