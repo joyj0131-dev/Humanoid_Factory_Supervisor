@@ -100,6 +100,18 @@ class GraspEnvConfig:
     # Track: a larger object gives real finger contact more surface to
     # engage instead of relying on a bimanual palm squeeze.
     object_half_size: float = tc.OBJECT_HALF_SIZE * 2  # 0.06
+
+    @property
+    def effective_object_half_extents(self) -> tuple[float, float, float]:
+        """Return canonical cubic half-extents for model builders.
+
+        Sharpa model construction has consumed this shape-aware interface
+        since its integration commit.  The official Phase 4.5 branch still
+        uses a cube, so keep the compatibility API independent from the
+        uncommitted rectangular-object viewer experiment.
+        """
+        return (self.object_half_size,) * 3
+
     # Mass is DELIBERATELY NOT density-scaled by default (condition A --
     # "controller validation": isolates whether the controller/contact
     # geometry works at all, holding mass fixed at the Foundation value).

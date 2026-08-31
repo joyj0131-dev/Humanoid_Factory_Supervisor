@@ -147,6 +147,15 @@ def test_arm_holds_stand_pose_under_sharpa_hand_weight_for_3_seconds():
     assert drift < 0.02, f"wrist drifted {drift*1000:.1f}mm under the Sharpa hand's weight -- possible arm-sag problem"
 
 
+def test_canonical_grasp_config_exposes_cubic_half_extents():
+    config = GraspEnvConfig(object_half_size=SIZE_12_HALF)
+    assert config.effective_object_half_extents == (
+        SIZE_12_HALF,
+        SIZE_12_HALF,
+        SIZE_12_HALF,
+    )
+
+
 if __name__ == "__main__":
     tests = [obj for name, obj in list(globals().items()) if name.startswith("test_")]
     passed, failed = 0, 0
