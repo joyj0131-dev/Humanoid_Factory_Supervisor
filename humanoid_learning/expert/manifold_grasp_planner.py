@@ -192,42 +192,137 @@ W_WRIST_EXTREME = 0.4
 W_REAL_COLLISION = 40.0  # real mesh penetration depth is meters-scale and must dominate the cost when active
 
 
-def _real_collision_penalty_rows(ctx: PlannerContext) -> list[float]:
-    """Reads the ACTUAL MuJoCo contacts just computed by mj_forward
-    (real mesh geometry, not the face/margin proxy above) and turns
-    total penetration depth per UNDESIRED category into a FIXED-length
-    (3) set of residual rows: thumb-vs-thumb, palm/wrist-vs-object,
-    any hand body vs table -- summed rather than one row per contact so
-    the residual vector's length stays constant as contacts appear/
-    disappear between finite-difference evaluations (a Gauss-Newton
-    Jacobian requires a fixed-shape residual). This is what actually
-    pulls the solver out of poses the tip-position-only proxy above
-    cannot see (whole-link overlap)."""
-    model = ctx.env.model
-    obj_body = ctx.env._object_body_id
+_ALLOWED_TIP_BODY_NAMES = (
+    "left_hand_thumb_2_link", "left_hand_index_1_link", "left_hand_middle_1_link",
+    "right_hand_thumb_2_link", "right_hand_index_1_link", "right_hand_middle_1_link",
+)
+
+
+def _allowed_contact_body_ids(model: mujoco.MjModel, obj_body: int) -> set[tuple[int, int]]:
+    """[32nd-session] The ONLY contacts this planner treats as intended:
+    one of the 6 designated true-fingertip link bodies touching the
+    object. Every other real contact -- including any OTHER hand link
+    (proximal segments) touching the object, hand-vs-hand, hand-vs-table,
+    or any G1 self-collision -- is forbidden. This replaces the 31st
+    session's narrower, name-substring-based category list (thumb-thumb/
+    palm-wrist-object/table only), which completely missed proximal
+    index/middle/thumb links plowing through the object by up to 3.3cm
+    and G1 self-collision (torso vs shoulder, 7.6mm) -- both found in
+    this session's own audit of the 31st session's best candidate
+    (measured_primary/palm_back)."""
+    ids = {mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n) for n in _ALLOWED_TIP_BODY_NAMES}
+    return {(min(b, obj_body), max(b, obj_body)) for b in ids}
+
+
+_ARM_PREFIXES = ("hand", "wrist", "shoulder", "elbow")
+
+
+def _arm_side(name: str) -> str | None:
+    """[32nd-session fix] The ORIGINAL classifier only recognized
+    'left_hand'/'right_hand'-prefixed bodies as "the hand", which
+    completely missed wrist links (named 'left_wrist_yaw_link' etc, NOT
+    'left_hand_wrist_...') and shoulder/elbow links -- so real
+    object<->wrist contacts and torso<->shoulder self-collision were
+    silently falling into the catch-all "other" bucket and never
+    counted as forbidden. Discovered via this session's own Section 5
+    audit (exact geom/body pair enumeration) of the 31st session's best
+    candidate. Now recognizes the whole arm+hand chain (shoulder, elbow,
+    wrist, and every hand/finger link) for each side."""
+    for side in ("left", "right"):
+        if any(name.startswith(f"{side}_{p}") for p in _ARM_PREFIXES):
+            return side
+    return None
+
+
+def _classify_contact(model: mujoco.MjModel, obj_body: int, table_body: int, c) -> tuple[str, str]:
+    """Returns (bucket, detail) for one real MuJoCo contact. bucket is
+    one of: allowed_tip_contact, thumb_thumb, hand_hand, proximal_object,
+    wrist_palm_object, self_collision, table_hand, table_object, other."""
+    b1 = model.geom_bodyid[c.geom1]
+    b2 = model.geom_bodyid[c.geom2]
+    n1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b1) or ""
+    n2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b2) or ""
+    is_obj = obj_body in (b1, b2)
+    is_table = table_body in (b1, b2)
+    side1, side2 = _arm_side(n1), _arm_side(n2)
+    is_left_arm = "left" in (side1, side2)
+    is_right_arm = "right" in (side1, side2)
+
+    if is_obj and (min(b1, b2), max(b1, b2)) in _allowed_contact_body_ids(model, obj_body):
+        return "allowed_tip_contact", f"{n1}<->{n2}"
+    if not is_obj and not is_table and is_left_arm and is_right_arm:
+        return "thumb_thumb" if ("thumb" in n1 and "thumb" in n2) else "hand_hand", f"{n1}<->{n2}"
+    if is_obj and (is_left_arm or is_right_arm):
+        if "wrist" in n1 or "wrist" in n2 or "palm" in n1 or "palm" in n2:
+            return "wrist_palm_object", f"{n1}<->{n2}"
+        return "proximal_object", f"{n1}<->{n2}"
+    if is_table and (is_left_arm or is_right_arm):
+        return "table_hand", f"{n1}<->{n2}"
+    if is_table and is_obj:
+        return "table_object", f"{n1}<->{n2}"
+    if not is_obj and not is_table and (is_left_arm or is_right_arm):
+        return "self_collision", f"{n1}<->{n2}"
+    return "other", f"{n1}<->{n2}"
+
+
+def enumerate_contact_pairs(env, scratch: mujoco.MjData) -> list[dict]:
+    """Section 5's exact requirement: every real penetrating contact,
+    with geom names, body names, contact point, penetration depth, and
+    its classification bucket -- not just aggregate counts."""
+    model = env.model
+    obj_body = env._object_body_id
     table_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "table")
-    scratch = ctx.scratch
-    thumb_thumb_pen = 0.0
-    palm_wrist_object_pen = 0.0
-    table_pen = 0.0
+    rows = []
     for i in range(scratch.ncon):
         c = scratch.contact[i]
         if c.dist >= 0:
             continue
-        pen = float(-c.dist)
-        b1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom1]) or ""
-        b2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom2]) or ""
-        is_obj = any(model.geom_bodyid[g] == obj_body for g in (c.geom1, c.geom2))
-        if ("left_hand_thumb" in b1 and "right_hand_thumb" in b2) or ("right_hand_thumb" in b1 and "left_hand_thumb" in b2):
-            thumb_thumb_pen += pen
-        elif is_obj and ("palm" in b1 or "palm" in b2 or "wrist" in b1 or "wrist" in b2):
-            palm_wrist_object_pen += pen
-        elif "table" in b1 or "table" in b2:
-            table_pen += pen
-    return [W_REAL_COLLISION * thumb_thumb_pen, W_REAL_COLLISION * palm_wrist_object_pen, W_REAL_COLLISION * table_pen]
+        bucket, detail = _classify_contact(model, obj_body, table_body, c)
+        rows.append(dict(
+            bucket=bucket, bodies=detail,
+            geom1=mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, c.geom1) or f"geom{c.geom1}",
+            geom2=mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, c.geom2) or f"geom{c.geom2}",
+            pos=[float(v) for v in c.pos], penetration=float(-c.dist),
+        ))
+    return rows
 
 
-def residuals(x: np.ndarray, ctx: PlannerContext, topology: Topology, use_real_collision: bool = True) -> np.ndarray:
+ALL_FORBIDDEN_BUCKETS = ("thumb_thumb", "hand_hand", "proximal_object", "wrist_palm_object",
+                         "self_collision", "table_hand")
+# The 31st-session's own (narrower) forbidden set, kept ONLY for the
+# causal A/B comparison this session runs (Section 7): "wrist_palm_object"
+# stands in for that session's combined palm/wrist-vs-object check, and
+# "table_hand" for its table check. It never saw proximal_object,
+# hand_hand, or self_collision at all.
+LEGACY_FORBIDDEN_BUCKETS = ("thumb_thumb", "wrist_palm_object", "table_hand")
+
+
+def _real_collision_penalty_rows(ctx: PlannerContext, buckets: tuple[str, ...] = ALL_FORBIDDEN_BUCKETS) -> list[float]:
+    """Reads the ACTUAL MuJoCo contacts just computed by mj_forward
+    (real mesh geometry, not the face/margin proxy above) and turns
+    total penetration depth per FORBIDDEN category (``buckets``) into a
+    FIXED-length set of residual rows -- summed within each category
+    rather than one row per contact so the residual vector's length
+    stays constant as contacts appear/disappear between finite-
+    difference evaluations (a Gauss-Newton Jacobian requires a
+    fixed-shape residual)."""
+    model = ctx.env.model
+    obj_body = ctx.env._object_body_id
+    table_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "table")
+    scratch = ctx.scratch
+    pen_by_bucket = {b: 0.0 for b in buckets}
+    for i in range(scratch.ncon):
+        c = scratch.contact[i]
+        if c.dist >= 0:
+            continue
+        bucket, _ = _classify_contact(model, obj_body, table_body, c)
+        if bucket in pen_by_bucket:
+            pen_by_bucket[bucket] += float(-c.dist)
+    return [W_REAL_COLLISION * v for v in pen_by_bucket.values()]
+
+
+def residuals(x: np.ndarray, ctx: PlannerContext, topology: Topology, use_real_collision: bool = True,
+              forbidden_buckets: tuple[str, ...] = ALL_FORBIDDEN_BUCKETS) -> np.ndarray:
     _write_x(ctx, x)
     rows = []
 
@@ -282,13 +377,14 @@ def residuals(x: np.ndarray, ctx: PlannerContext, topology: Topology, use_real_c
             rows.append(W_WRIST_EXTREME * x[base + k])
 
     if use_real_collision:
-        rows.extend(_real_collision_penalty_rows(ctx))
+        rows.extend(_real_collision_penalty_rows(ctx, buckets=forbidden_buckets))
 
     return np.array(rows)
 
 
 def solve_manifold(ctx: PlannerContext, x_init: np.ndarray, topology: Topology,
-                    max_iters: int = 150, damping: float = 0.05, gain: float = 0.7, fd_eps: float = 1e-4) -> dict:
+                    max_iters: int = 150, damping: float = 0.05, gain: float = 0.7, fd_eps: float = 1e-4,
+                    forbidden_buckets: tuple[str, ...] = ALL_FORBIDDEN_BUCKETS) -> dict:
     """Gauss-Newton / Levenberg-Marquardt style solve with a NUMERICAL
     (central-difference) Jacobian of the full residual stack -- chosen
     over hand-derived analytic Jacobians because the residual stack mixes
@@ -299,7 +395,7 @@ def solve_manifold(ctx: PlannerContext, x_init: np.ndarray, topology: Topology,
     kinematics, no contact dynamics)."""
     x = x_init.copy()
     x = np.clip(x, ctx.jnt_lo, ctx.jnt_hi)
-    r = residuals(x, ctx, topology)
+    r = residuals(x, ctx, topology, forbidden_buckets=forbidden_buckets)
     cost = float(np.dot(r, r))
     history = [cost]
 
@@ -309,15 +405,15 @@ def solve_manifold(ctx: PlannerContext, x_init: np.ndarray, topology: Topology,
         for j in range(N_TOTAL):
             dx = np.zeros(N_TOTAL)
             dx[j] = fd_eps
-            r_plus = residuals(np.clip(x + dx, ctx.jnt_lo, ctx.jnt_hi), ctx, topology)
-            r_minus = residuals(np.clip(x - dx, ctx.jnt_lo, ctx.jnt_hi), ctx, topology)
+            r_plus = residuals(np.clip(x + dx, ctx.jnt_lo, ctx.jnt_hi), ctx, topology, forbidden_buckets=forbidden_buckets)
+            r_minus = residuals(np.clip(x - dx, ctx.jnt_lo, ctx.jnt_hi), ctx, topology, forbidden_buckets=forbidden_buckets)
             J[:len(r_plus), j] = (r_plus - r_minus) / (2 * fd_eps)
 
         JTJ = J.T @ J + damping * np.eye(N_TOTAL)
         step = np.linalg.solve(JTJ, -J.T @ r) * gain
         step = np.clip(step, -0.15, 0.15)
         x_new = np.clip(x + step, ctx.jnt_lo, ctx.jnt_hi)
-        r_new = residuals(x_new, ctx, topology)
+        r_new = residuals(x_new, ctx, topology, forbidden_buckets=forbidden_buckets)
         cost_new = float(np.dot(r_new, r_new))
         if cost_new < cost:
             x, r, cost = x_new, r_new, cost_new
@@ -338,36 +434,41 @@ def solve_manifold(ctx: PlannerContext, x_init: np.ndarray, topology: Topology,
 # geometry diagnostics reported in their NATIVE units.
 # ---------------------------------------------------------------------
 
+_ALL_BUCKETS = ALL_FORBIDDEN_BUCKETS
+
+
 def check_pose_collisions(env, scratch: mujoco.MjData) -> dict:
-    """Scans the ACTUAL MuJoCo contacts at the current scratch pose (real
-    mesh geometry, not a proxy) and classifies each by body-name prefix,
-    the same convention grasp_expert.HandContact already uses. Returns
-    counts/lists so callers can distinguish an INTENDED fingertip-object
-    contact from an unwanted one (thumb-thumb, palm-object, wrist-object,
-    non-target finger link, table)."""
+    """[32nd-session rewrite] Scans the ACTUAL MuJoCo contacts at the
+    current scratch pose using the SAME general classifier
+    (_classify_contact) the collision-penalty residual uses -- the
+    31st-session version only recognized 3 forbidden name-substring
+    categories and completely missed proximal index/middle/thumb links
+    plowing through the object and G1 self-collision (see
+    _allowed_contact_body_ids' docstring for the exact numbers found).
+    Returns per-bucket contact counts, total penetration per bucket, and
+    the overall max penetration."""
     model = env.model
     obj_body = env._object_body_id
-    result = dict(thumb_thumb=0, palm_object=0, wrist_object=0, other_finger_object=0,
-                   table_finger=0, max_penetration=0.0, n_contacts=int(scratch.ncon))
+    table_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "table")
+    result = {b: 0 for b in _ALL_BUCKETS}
+    result.update({f"{b}_penetration": 0.0 for b in _ALL_BUCKETS})
+    result["allowed_tip_contacts"] = 0
+    result["max_penetration"] = 0.0
+    result["n_contacts"] = int(scratch.ncon)
+    result["n_forbidden_contacts"] = 0
     for i in range(scratch.ncon):
         c = scratch.contact[i]
-        b1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom1]) or ""
-        b2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom2]) or ""
-        pen = float(-c.dist) if c.dist < 0 else 0.0
+        if c.dist >= 0:
+            continue
+        pen = float(-c.dist)
         result["max_penetration"] = max(result["max_penetration"], pen)
-        names = {b1, b2}
-        is_obj = any(model.geom_bodyid[g] == obj_body for g in (c.geom1, c.geom2))
-        if ("left_hand_thumb" in b1 and "right_hand_thumb" in b2) or ("right_hand_thumb" in b1 and "left_hand_thumb" in b2):
-            result["thumb_thumb"] += 1
-        elif is_obj and ("palm" in b1 or "palm" in b2 or "wrist_yaw_link" in b1 or "wrist_yaw_link" in b2):
-            result["palm_object"] += 1
-        elif is_obj and any("wrist" in n for n in names):
-            result["wrist_object"] += 1
-        elif is_obj and not any(("thumb" in n or "index" in n or "middle" in n) for n in names):
-            pass  # object-vs-non-hand (e.g. table) handled by table_finger branch below
-        if "table" in b1 or "table" in b2:
-            if any(("thumb" in n or "index" in n or "middle" in n) for n in (b1, b2)):
-                result["table_finger"] += 1
+        bucket, _ = _classify_contact(model, obj_body, table_body, c)
+        if bucket == "allowed_tip_contact":
+            result["allowed_tip_contacts"] += 1
+        elif bucket in _ALL_BUCKETS:
+            result[bucket] += 1
+            result[f"{bucket}_penetration"] += pen
+            result["n_forbidden_contacts"] += 1
     return result
 
 
@@ -463,9 +564,11 @@ class MultiStartResult:
     thumb_thumb_distance: float
     joint_margins_rad: dict
     joint_travel_from_canonical: float
+    contact_pairs: list = field(default_factory=list)
 
 
-def run_multistart(env, expert, topologies: list[Topology] | None = None) -> tuple[list[MultiStartResult], PlannerContext]:
+def run_multistart(env, expert, topologies: list[Topology] | None = None,
+                    forbidden_buckets: tuple[str, ...] = ALL_FORBIDDEN_BUCKETS) -> tuple[list[MultiStartResult], PlannerContext]:
     ctx = build_context(env, expert)
     if topologies is None:
         primary = derive_primary_topology(ctx)
@@ -475,8 +578,9 @@ def run_multistart(env, expert, topologies: list[Topology] | None = None) -> tup
     results = []
     for topo in topologies:
         for name, x_init in families.items():
-            sol = solve_manifold(ctx, x_init, topo, max_iters=250)
+            sol = solve_manifold(ctx, x_init, topo, max_iters=250, forbidden_buckets=forbidden_buckets)
             coll = check_pose_collisions(env, ctx.scratch)
+            pairs = enumerate_contact_pairs(env, ctx.scratch)
             face_res = {}
             for side in ("left", "right"):
                 for finger in FINGERS:
@@ -502,18 +606,21 @@ def run_multistart(env, expert, topologies: list[Topology] | None = None) -> tup
                 name=name, topology_name=topo.name, x=sol["x"], cost=sol["cost"], n_iters=sol["n_iters"],
                 converged=sol["converged"], collisions=coll, per_finger_face_residual=face_res,
                 thumb_thumb_distance=tt_dist, joint_margins_rad=margins, joint_travel_from_canonical=travel,
+                contact_pairs=pairs,
             ))
     return results, ctx
 
 
 def is_statically_feasible(r: MultiStartResult, face_tol: float = 0.005, min_joint_margin: float = 0.02) -> bool:
-    """Section 8's strict static-success bar, checked mechanically (no
+    """Section 8/9's strict static-success bar, checked mechanically (no
     post-hoc threshold relaxation): every fingertip within face_tol of
-    its assigned face plane, zero real undesired collisions/penetration,
-    every joint at least min_joint_margin (rad) from its hard limit."""
+    its assigned face plane, ZERO real forbidden contacts of ANY
+    category (thumb_thumb, hand_hand, proximal_object, wrist_palm_object,
+    self_collision, table_hand), every joint at least min_joint_margin
+    (rad) from its hard limit."""
     if max(abs(v) for v in r.per_finger_face_residual.values()) > face_tol:
         return False
-    if r.collisions["thumb_thumb"] > 0 or r.collisions["palm_object"] > 0 or r.collisions["wrist_object"] > 0 or r.collisions["table_finger"] > 0:
+    if r.collisions["n_forbidden_contacts"] > 0:
         return False
     if r.collisions["max_penetration"] > 1e-4:
         return False

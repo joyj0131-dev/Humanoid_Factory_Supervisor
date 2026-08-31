@@ -11,7 +11,7 @@ manifold formulation (contact points as decision variables, not fixed
 targets) that supersedes 30th-session's APPROACH to the question, not
 its measured facts.
 
-REAL FINDING (this session): across 3 topology candidates (measured
+REAL FINDING (31st session): across 3 topology candidates (measured
 primary X-face split, its mirror, and an alternative thumb-on-+Z-face
 split) x 7 deterministic posture-family starts (21 total optimizations),
 every run reaches good face-plane alignment (several under 1cm) but NONE
@@ -23,6 +23,18 @@ Dex3 morphology limit -- the current residual set has no explicit
 thumb-proximal-segment separation term, which is a disclosed gap in this
 session's own objective function, not evidence of physical
 impossibility.
+
+REAL FINDING (32nd session): auditing the 31st session's own best
+candidate's REAL MuJoCo contacts (not just the 3 name-substring
+categories it checked) found index/middle PROXIMAL links (not just
+tips) penetrating the object by up to 3.3cm, and G1 self-collision
+(torso vs shoulder, 7.6mm) -- neither was visible to the 31st session's
+narrower classifier. check_pose_collisions/_classify_contact were
+rewritten to classify EVERY real contact into one of 6 forbidden
+buckets (thumb_thumb, hand_hand, proximal_object, wrist_palm_object,
+self_collision, table_hand) or "allowed_tip_contact" (one of the 6
+designated true-fingertip links touching the object), and the collision
+penalty residual now covers all 6 buckets instead of 3.
 """
 
 from __future__ import annotations
@@ -41,6 +53,7 @@ from humanoid_learning.expert.grasp_expert import BimanualSidePinchExpert, Grasp
 from humanoid_learning.expert.manifold_grasp_planner import (
     build_context, derive_primary_topology, mirrored_topology, run_multistart, solve_manifold,
     is_statically_feasible, check_pose_collisions, wrench_diagnostics, _write_x, _tip_world, FINGERS,
+    enumerate_contact_pairs, ALL_FORBIDDEN_BUCKETS, LEGACY_FORBIDDEN_BUCKETS,
 )
 
 
@@ -180,7 +193,71 @@ def test_collision_check_distinguishes_categories():
     env, expert = _reach_thumb_oppose()
     ctx = build_context(env, expert)
     coll = check_pose_collisions(env, ctx.scratch)
-    assert set(coll.keys()) >= {"thumb_thumb", "palm_object", "wrist_object", "table_finger", "max_penetration", "n_contacts"}
+    assert set(coll.keys()) >= {"thumb_thumb", "hand_hand", "proximal_object", "wrist_palm_object",
+                                 "self_collision", "table_hand", "max_penetration", "n_contacts", "n_forbidden_contacts"}
+
+
+def test_contact_pair_enumeration_reports_real_geom_and_body_names():
+    """Section 5's exact requirement: every real penetrating contact
+    with actual geom/body names and a penetration depth, not aggregate
+    counts only."""
+    env, expert = _reach_thumb_oppose()
+    results, ctx = run_multistart(env, expert)
+    best = min(results, key=lambda r: r.cost)
+    assert len(best.contact_pairs) > 0
+    for p in best.contact_pairs:
+        assert p["bucket"] in ("allowed_tip_contact",) + ALL_FORBIDDEN_BUCKETS + ("table_object", "other")
+        assert p["penetration"] >= 0.0
+        assert isinstance(p["geom1"], str) and isinstance(p["geom2"], str)
+    print(f"    {len(best.contact_pairs)} real contact pairs at best candidate ({best.topology_name}/{best.name})")
+
+
+def test_classifier_finds_proximal_object_and_self_collision_categories():
+    """REAL FINDING (32nd session): the 31st session's own best
+    candidate (measured_primary/palm_back) has index/middle PROXIMAL
+    links (not the tip) penetrating the object, and torso-vs-shoulder
+    self-collision -- neither category existed in the 31st session's
+    3-bucket classifier. This test locks in that BOTH new categories are
+    now detected on that exact candidate."""
+    env, expert = _reach_thumb_oppose()
+    results, ctx = run_multistart(env, expert)
+    palm_back = next(r for r in results if r.name == "palm_back" and r.topology_name == "measured_primary")
+    buckets_seen = {p["bucket"] for p in palm_back.contact_pairs}
+    print(f"    buckets seen at palm_back: {buckets_seen}")
+    assert "proximal_object" in buckets_seen, "index/middle proximal links penetrating the object must be detected"
+    assert "self_collision" in buckets_seen, "G1 self-collision (torso vs shoulder) must be detected"
+
+
+def test_collision_aware_finds_strictly_more_forbidden_contacts_than_legacy():
+    """Causal A/B (Section 7): on the SAME candidate pose, classifying
+    with ALL_FORBIDDEN_BUCKETS must find >= as many forbidden contacts
+    as LEGACY_FORBIDDEN_BUCKETS (legacy is a strict subset of buckets),
+    and strictly more on at least one real candidate (the 31st session's
+    best), since proximal_object/self_collision contacts exist there."""
+    env, expert = _reach_thumb_oppose()
+    results_legacy, ctx = run_multistart(env, expert, forbidden_buckets=LEGACY_FORBIDDEN_BUCKETS)
+    legacy_best = next(r for r in results_legacy if r.name == "palm_back" and r.topology_name == "measured_primary")
+    n_legacy_forbidden = sum(
+        1 for p in legacy_best.contact_pairs if p["bucket"] in LEGACY_FORBIDDEN_BUCKETS
+    )
+    n_full_forbidden = sum(
+        1 for p in legacy_best.contact_pairs if p["bucket"] in ALL_FORBIDDEN_BUCKETS
+    )
+    print(f"    at the SAME pose: legacy-bucket contacts={n_legacy_forbidden}, full-bucket contacts={n_full_forbidden}")
+    assert n_full_forbidden > n_legacy_forbidden, "the fuller classifier must see strictly more forbidden contacts at a pose known to have proximal/self collisions"
+
+
+def test_solving_with_full_collision_buckets_still_runs_and_is_deterministic():
+    """The collision-aware residual (with the full bucket set) must
+    still produce a deterministic multi-start result -- same causal
+    machinery (numerical Jacobian + LM), just a larger forbidden set."""
+    env1, expert1 = _reach_thumb_oppose()
+    results1, _ = run_multistart(env1, expert1, forbidden_buckets=ALL_FORBIDDEN_BUCKETS)
+    env2, expert2 = _reach_thumb_oppose()
+    results2, _ = run_multistart(env2, expert2, forbidden_buckets=ALL_FORBIDDEN_BUCKETS)
+    costs1 = [round(r.cost, 6) for r in results1]
+    costs2 = [round(r.cost, 6) for r in results2]
+    assert costs1 == costs2
 
 
 def test_canonical_grasp_behavior_unchanged():
