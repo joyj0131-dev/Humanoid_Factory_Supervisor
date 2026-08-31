@@ -69,6 +69,8 @@ from humanoid_learning.expert.manifold_grasp_planner import (
     is_statically_feasible, check_pose_collisions, wrench_diagnostics, _write_x, _tip_world, FINGERS,
     enumerate_contact_pairs, ALL_FORBIDDEN_BUCKETS, LEGACY_FORBIDDEN_BUCKETS,
     mesh_signed_distance, measure_fingertip_support_offset, ALLOWED_PENETRATION_TOL, ALLOWED_SEPARATION_TOL,
+    classify_nearest_face, contacts_from_face_metrics, collision_penalty_gradient_check,
+    baseline_contact_signatures, full_collision_census, NORMAL_ANGLE_TOL_DEG,
 )
 import mujoco
 
@@ -171,28 +173,53 @@ def test_no_multistart_candidate_is_fully_statically_feasible():
 
 
 def test_wrench_diagnostics_rank_and_condition_are_computed():
-    """Force-closure is a STATIC diagnostic only (never a Gate A
-    substitute) -- verifies the friction-pyramid wrench matrix has full
-    rank (6) for a real six-contact candidate and returns a finite
-    condition number."""
+    """[34th-session correction] The 33rd-session version of this test
+    built its 6-contact wrench matrix from ANALYTIC topology normals
+    (topo.face_axis/face_sign) regardless of whether the real geometry
+    actually touched that face -- exactly the "wrench closure via
+    analytic-normal artifact" this session's directive warns against
+    (Section 7/8). This test now verifies ONLY the underlying LINEAR
+    ALGEBRA (build_wrench_matrix/wrench_diagnostics) on a SYNTHETIC,
+    idealized 6-contact box grasp with correct outward normals -- pure
+    math correctness, decoupled from any specific solved candidate's
+    real face validity (that exclusion is tested separately by
+    test_wrench_excludes_face_invalid_contacts below)."""
+    half = 0.06
+    obj_com = np.zeros(3)
+    contacts = [
+        {"pos": [-half, 0.03, 0.0], "normal": [-1.0, 0.0, 0.0]},
+        {"pos": [-half, -0.03, 0.0], "normal": [-1.0, 0.0, 0.0]},
+        {"pos": [half, 0.03, 0.0], "normal": [1.0, 0.0, 0.0]},
+        {"pos": [half, -0.03, 0.0], "normal": [1.0, 0.0, 0.0]},
+        {"pos": [0.0, 0.0, half], "normal": [0.0, 0.0, 1.0]},
+        {"pos": [0.0, 0.0, -half], "normal": [0.0, 0.0, -1.0]},
+    ]
+    diag = wrench_diagnostics(contacts, obj_com, mass=0.1)
+    print(f"    wrench diagnostics (synthetic idealized contacts): {diag}")
+    assert diag["rank"] == 6, "six well-separated opposing contacts should span the full 6D wrench space"
+    assert np.isfinite(diag["condition"])
+
+
+def test_wrench_excludes_face_invalid_contacts():
+    """[34th session, Section 8] contacts_from_face_metrics must EXCLUDE
+    any fingertip whose real near-contact point is on the wrong face, on
+    an edge/corner, or whose normal-alignment angle exceeds
+    NORMAL_ANGLE_TOL_DEG -- wrench must never be computed by idealizing
+    away a face/normal violation."""
+    from humanoid_learning.expert.manifold_grasp_planner import contacts_from_face_metrics, NORMAL_ANGLE_TOL_DEG
     env, expert = _reach_thumb_oppose()
     results, ctx = run_multistart(env, expert)
     best = min(results, key=lambda r: r.cost)
-    topo = derive_primary_topology(ctx) if best.topology_name == "measured_primary" else mirrored_topology(derive_primary_topology(ctx))
-    _write_x(ctx, best.x)
-    contacts = []
-    for side in ("left", "right"):
-        for finger in FINGERS:
-            pos = _tip_world(ctx, side, finger)
-            axis = topo.face_axis[finger]
-            sign = topo.face_sign[finger]
-            normal_local = np.zeros(3)
-            normal_local[axis] = sign
-            contacts.append({"pos": pos, "normal": ctx.obj_R @ normal_local})
-    diag = wrench_diagnostics(contacts, ctx.obj_pos, mass=env.config.object_mass if hasattr(env.config, "object_mass") else 0.1)
-    print(f"    wrench diagnostics: {diag}")
-    assert diag["rank"] == 6, "six well-separated opposing contacts should span the full 6D wrench space"
-    assert np.isfinite(diag["condition"])
+    valid = contacts_from_face_metrics(best)
+    n_manually_valid = sum(
+        1 for fm in best.face_metrics.values()
+        if not fm["wrong_face"] and not fm["is_edge_or_corner"] and fm["normal_angle_deg"] <= NORMAL_ANGLE_TOL_DEG
+    )
+    print(f"    {len(valid)}/6 fingertip contacts pass face-aware validity at best candidate ({best.topology_name}/{best.name})")
+    assert len(valid) == n_manually_valid
+    assert len(valid) <= 6
+    for c in valid:
+        assert len(c["pos"]) == 3 and len(c["normal"]) == 3
 
 
 def test_deterministic_multistart_reproducible():
@@ -468,6 +495,158 @@ def test_rotated_object_local_to_world_transform_is_correct():
     assert np.allclose(reconstructed_world, world_point, atol=1e-9)
     assert not np.allclose(wrong_world, world_point, atol=1e-6), \
         "at a genuinely rotated object, the buggy obj_pos+local form must NOT reconstruct the original world point"
+
+
+def test_assigned_face_validation_on_a_controlled_point():
+    """[34th session] A point placed exactly at the center of a face's
+    plane must classify as on that face, not an edge/corner, with the
+    correct outward normal."""
+    half = 0.06
+    local = np.array([half, 0.0, 0.0])  # dead center of the +X face
+    nearest = classify_nearest_face(local, half)
+    assert nearest["face"] == "FACE_POS_X"
+    assert nearest["axis"] == 0 and nearest["sign"] == 1.0
+    assert nearest["on_plane"]
+    assert not nearest["is_edge_or_corner"]
+    assert np.allclose(nearest["normal_local"], [1.0, 0.0, 0.0])
+
+
+def test_wrong_face_rejection():
+    """[34th session, Section 6/11] A point that is actually on the +X
+    face must be classified as "wrong face" against a Topology that
+    assigns the SAME finger to -X -- this is the exact bug this session
+    fixed (mesh_signed_distance's whole-box nearest point has no
+    dependency on which face was assigned)."""
+    half = 0.06
+    local = np.array([half, 0.0, 0.0])  # +X face, dead center, safely interior
+    nearest = classify_nearest_face(local, half)
+    assigned_axis, assigned_sign = 0, -1.0  # topology assigns -X, but the point is on +X
+    wrong_face = (nearest["axis"] != assigned_axis) or (nearest["sign"] != assigned_sign)
+    assert wrong_face, "a point on +X must be flagged wrong-face against a -X assignment"
+
+
+def test_face_interior_margin_and_edge_corner_rejection():
+    """[34th session, Section 6] A point safely inside a face's tangential
+    extent must NOT be flagged edge/corner; a point near a shared edge
+    between two faces MUST be."""
+    half = 0.06
+    interior = np.array([half, 0.01, -0.01])   # well inside the +X face, far from any edge
+    corner = np.array([half, half - 0.001, half - 0.001])  # right at a corner of +X/+Y/+TOP
+    assert not classify_nearest_face(interior, half)["is_edge_or_corner"]
+    assert classify_nearest_face(corner, half)["is_edge_or_corner"]
+
+
+def test_actual_normal_direction_and_flip_handling():
+    """[34th session, Section 7] classify_nearest_face's normal must
+    correctly flip sign between opposite faces -- not a fixed assumption,
+    derived from which side of the box the point numerically falls on."""
+    half = 0.06
+    pos_x = classify_nearest_face(np.array([half, 0.0, 0.0]), half)
+    neg_x = classify_nearest_face(np.array([-half, 0.0, 0.0]), half)
+    assert np.allclose(pos_x["normal_local"], [1.0, 0.0, 0.0])
+    assert np.allclose(neg_x["normal_local"], [-1.0, 0.0, 0.0])
+    assert np.dot(pos_x["normal_local"], neg_x["normal_local"]) < 0, "opposite faces must have opposite normals"
+
+
+def test_rotated_object_face_classification_is_correct():
+    """[34th session] Face classification must be computed in
+    OBJECT-LOCAL coordinates, so it is invariant to the object's world
+    rotation -- a world point on the object's true +X face (after
+    rotation) must still classify as FACE_POS_X once transformed into
+    local coordinates via obj_R.T, matching the rotated-transform
+    regression already established for the margin/thumb-thumb terms."""
+    half = 0.06
+    yaw = 0.3
+    obj_R = np.array([[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
+    obj_pos = np.array([0.27, 0.0, 0.75])
+    local_point = np.array([half, 0.02, -0.01])  # a point on the LOCAL +X face
+    world_point = obj_pos + obj_R @ local_point
+    recovered_local = obj_R.T @ (world_point - obj_pos)
+    nearest = classify_nearest_face(recovered_local, half)
+    assert nearest["face"] == "FACE_POS_X"
+    assert np.allclose(recovered_local, local_point, atol=1e-9)
+
+
+def test_topology_assignment_actually_changes_the_solve():
+    """[34th session, Section 11] REAL FINDING: the 33rd session's
+    mesh_signed_distance-only face residual made measured_primary and
+    mirrored topologies produce BYTE-IDENTICAL results (face_sign had no
+    effect on the objective). After reinstating an explicit face-plane
+    residual on the assigned axis/sign, the two topologies must now
+    differ (mirrored assigns each finger to the OPPOSITE, physically
+    wrong-approach face, which this session's own data shows is far more
+    costly, not merely relabeled)."""
+    env, expert = _reach_thumb_oppose()
+    results, ctx = run_multistart(env, expert)
+    mp = sorted([r for r in results if r.topology_name == "measured_primary"], key=lambda r: r.name)
+    mr = sorted([r for r in results if r.topology_name == "mirrored"], key=lambda r: r.name)
+    assert len(mp) == len(mr) > 0
+    costs_equal = all(abs(a.cost - b.cost) < 1e-6 for a, b in zip(mp, mr))
+    print(f"    measured_primary vs mirrored byte-identical: {costs_equal} "
+          f"(mp best={min(r.cost for r in mp):.4f}, mirrored best={min(r.cost for r in mr):.4f})")
+    assert not costs_equal, "topology's face_sign must have a real effect on the solve now"
+    for a in mp:
+        for finger in FINGERS:
+            assert a.face_metrics[f"left_{finger}"]["assigned_sign"] != 0.0
+
+
+def test_collision_census_finds_exact_offending_pair():
+    """[34th session, Section 4] REAL FINDING: this session's root-cause
+    audit of the largest forbidden penetration (~0.9-1.2mm) at the top
+    multi-start candidates found it is consistently left/right
+    hand_thumb_1_link (the PROXIMAL/middle-knuckle link, NOT the true
+    fingertip thumb_2_link) grazing the object -- not the fingertip mesh
+    itself. This test locks in that the census reports geom/body names,
+    signed distance, and contype for that exact category, and that every
+    reported pair is a genuine contype=1 collision geom (MuJoCo's
+    broadphase cannot generate a contact for a contype=0 visual geom at
+    all, so this is a verification, not a new fix)."""
+    env, expert = _reach_thumb_oppose()
+    results, ctx = run_multistart(env, expert)
+    best = min(results, key=lambda r: r.cost)
+    census = full_collision_census(env, ctx.scratch, meta=dict(topology=best.topology_name, family=best.name))
+    proximal_rows = [p for p in census if p["bucket"] == "proximal_object" and "thumb_1_link" in p["bodies"]]
+    print(f"    {len(census)} total real contact pairs; {len(proximal_rows)} thumb_1_link<->object proximal pairs")
+    for p in census:
+        assert p["contype1"] == 1 and p["contype2"] == 1, "every reported real contact must be between two contype=1 (collision) geoms"
+        assert p["signed_distance"] < 0
+        assert isinstance(p["body1"], str) and isinstance(p["body2"], str)
+    if proximal_rows:
+        assert all(p["object_local_point"] is not None and p["nearest_face"] is not None for p in proximal_rows)
+
+
+def test_baseline_relative_collision_distinguishes_pre_existing_contacts():
+    """[34th session, Section 5] A contact signature that is present at
+    the reset baseline pose must be flagged pre_existing_at_reset when
+    checked against a census AT THAT SAME reset pose -- self-consistency
+    check that baseline tagging actually works, before trusting it to
+    separate pre-existing model self-contact from planner-induced
+    collisions at a solved candidate."""
+    env = make_env()
+    env.reset(seed=0)
+    baselines = baseline_contact_signatures(make_env)
+    census_at_reset = full_collision_census(env, env.data, meta=dict(topology="reset_baseline", family="n/a"),
+                                             baselines=baselines)
+    if census_at_reset:
+        assert all(p["pre_existing_at_reset"] for p in census_at_reset), \
+            "every real contact AT the reset pose must be tagged pre-existing-at-reset against its own baseline"
+    assert isinstance(baselines["reset"], set)
+    assert isinstance(baselines["contact_acquire_end_thumb_oppose_entry"], set)
+
+
+def test_collision_penalty_gradient_is_not_flat():
+    """[34th session, Section 9] Before trusting that a solver failure to
+    clear a forbidden pair is a genuine local optimum (not an invisible
+    flat penalty landscape), a finite-difference nudge of a real decision
+    variable near an active proximal-clearance constraint must produce a
+    non-zero, non-degenerate cost change."""
+    env, expert = _reach_thumb_oppose()
+    ctx = build_context(env, expert)
+    topo = derive_primary_topology(ctx)
+    joint_index = 0 * 14 + 7 + 1  # left thumb_1 joint
+    result = collision_penalty_gradient_check(ctx, topo, ctx.x0.copy(), joint_index, delta=1e-3)
+    print(f"    gradient check (left thumb_1 joint): {result}")
+    assert result["gradient_nonzero"], "the collision-aware residual must respond to a real decision-variable nudge, not be flat"
 
 
 def test_canonical_grasp_behavior_unchanged():
