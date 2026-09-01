@@ -13,7 +13,7 @@
 | Phase 4 (Dex3) | `b46fe3b` | `bce1dec` | `phase4/dex3-grasp` | 실패로 종료·대체 | Dex3-1(3-finger) fixed-base bimanual grasp 연구 최종 스냅샷 |
 | Phase 4.5 (Sharpa Wave) | `d038c5b` | `69276b3`(최신 controller checkpoint) | `phase4.5/sharpa-wave` | 활성, 미완료 | Sharpa Wave(5-finger) 전환 및 grasp 연구 |
 | Phase 4.5 single-hand prototype | — | `a0d286d` | `experiment/phase4.5-sharpa-single-hand` | 진단용 보존 | 공식 목표 아님, self-collision-avoidance geometry 참고용 |
-| Phase 4.5 dirty viewer/rectangular 실험 | `69276b3` 기반 | (uncommitted) | `wip/phase4.5-viewer-rectangular` | 로컬 미커밋 | 10×15×10cm 직육면체/뷰어 실험 격리 보존 |
+| Phase 4.5 구 rectangular 실험 | `69276b3` 기반 | (폐기) | 없음 | patch만 보관 | 공식 Sharpa 구현으로 대체된 로컬 WIP |
 
 **중요한 구분**: `69276b3`은 Phase 4.5의 시작점이 아니라 최신
 **controller checkpoint**다. Phase 4.5의 실제 시작점은 `d038c5b`
@@ -52,32 +52,29 @@ git log --oneline bce1dec..69276b3
 아니다. 위 5개는 Phase 4.5 전환부터 최신 controller checkpoint까지의
 역사적 범위를 고정한 것이다.
 
-## Worktree 레이아웃
+## 현재 작업공간 레이아웃
 
-- **원본 workspace**: `/home/youngjin/Mujoco_humanoid` — 브랜치
-  `wip/phase4.5-viewer-rectangular`. 10×15×10cm 직육면체/`--no-restart`/
-  force 진단 + Sharpa viewer 실험이 **커밋되지 않은 상태로** 여기에만
-  존재한다. `PROJECT_CONTEXT.md`/`CLAUDE.md`/`.claude`/`docs/history`
-  같은 ignored/local-only 파일의 실제 원본이 위치하는 곳이기도 하다.
-- **Clean Phase 4.5 worktree**: `/home/youngjin/Mujoco_humanoid_worktrees/phase4_5_sharpa`
-  — 브랜치 `phase4.5/sharpa-wave`. 위 ignored/
-  local-only 경로들은 원본 workspace로부터 심볼릭 링크했다(tracked
-  파일/디렉터리는 절대 덮어쓰지 않음 — 링크 전 `git ls-files`로 확인).
-  Sharpa 대용량 mesh(`assets/robots/sharpa_wave/{left,right}_sharpa_wave/`)와
-  `assets/robots/g1/`도 동일하게 링크했다(둘 다 `.gitignore` 대상이라
-  clean checkout에는 애초에 존재하지 않음).
+- **유일한 활성 workspace**: `/home/youngjin/Mujoco_humanoid`
+- **활성 브랜치**: `phase4.5/sharpa-wave`
+- 과거 보조 worktree `/home/youngjin/Mujoco_humanoid_worktrees/
+  phase4_5_sharpa`와 `wip/phase4.5-viewer-rectangular` 브랜치는 로컬 구조를
+  단순화하기 위해 제거했다.
+- 제거 전 dirty 5개 파일의 binary-safe diff가 아래 patch와 정확히 같은
+  SHA256임을 확인했다.
+  `/home/youngjin/Mujoco_humanoid_local_backups/
+  phase4_5_viewer_rectangular_69276b3.patch`
+- Dex3 연구 이력은 `phase4/dex3-grasp` 브랜치와 annotated tag에 남아
+  있으므로 별도 checkout 디렉터리가 필요 없다.
 
 ## 일반 작업 절차
 
-1. **공식 Sharpa 개발은 clean `phase4.5/sharpa-wave` worktree에서
-   수행한다.** 이 브랜치의 커밋만 신뢰할 수 있는 재현 가능한 상태다.
-2. rectangular/no-restart/viewer 혼합 실험처럼 여러 목적이 한 파일에
-   섞인 로컬 실험은 `wip/phase4.5-viewer-rectangular`(원본 workspace)
-   에서만 보존한다.
-3. WIP 브랜치의 변경을 clean 브랜치로 **통째로 복사(cherry-pick,
-   diff 적용 등)하지 않는다.** 필요한 기능은 clean 브랜치에서 독립적으로
-   재구현하고, 그 브랜치 자체의 테스트로 검증한 뒤 커밋한다 — 이렇게
-   해야 두 브랜치가 서로 다른 실험을 안전하게 뒤섞지 않는다.
+1. 공식 Sharpa 개발은 `/home/youngjin/Mujoco_humanoid`의 clean
+   `phase4.5/sharpa-wave` 브랜치에서 수행한다.
+2. 새 실험은 별도 폴더/worktree를 자동으로 만들지 말고, 필요성이 명확할
+   때만 사용자에게 먼저 이유와 수명주기를 설명한다.
+3. Dex3 과거 상태 확인이 필요하면 `phase4/dex3-grasp`의 파일을 `git show`
+   등 읽기 전용으로 조회한다. 동시에 checkout해야 하는 명확한 이유가
+   없다면 새 worktree를 만들지 않는다.
 4. Gate 실패 상태를 성공으로 태그하거나 문서화하지 않는다("Stage/Phase
    완료"는 해당 acceptance criteria를 전부 만족했을 때만 사용).
 5. **Phase 5(whole-body 이동, IL/BC/PPO 등)는 Phase 4.5의 Gate
