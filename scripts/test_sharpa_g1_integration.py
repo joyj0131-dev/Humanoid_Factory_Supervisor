@@ -196,6 +196,50 @@ def test_sharpa_visual_style_g1_is_physics_invariant():
     print("    physics identical (mass/inertia/collision/joints/actuators), rgba differs as expected")
 
 
+def test_g1_visual_style_uses_real_g1_materials_not_approximate_rgba():
+    """[Session 41] Stage 2 Visual Acceptance Gate: the "g1" visual style
+    must ASSIGN Sharpa visual geoms to G1's own compiled "black"/"metal"
+    materials (verifiable by geom_matid), not merely set an
+    approximately-similar rgba (the 40th session's version did this and
+    was measured, by the user, to still look like the vendored lavender
+    shell under the viewer's lighting). Zero upstream lavender/green rgba
+    may remain; palm/wrist housing must use "black", finger structural
+    links must use "metal"."""
+    cfg = GraspEnvConfig(object_pos=(0.27, 0.0, 0.0), arm_kp=120.0, object_half_size=SIZE_12_HALF, sharpa_visual_style="g1")
+    model = build_grasp_model_sharpa(cfg)
+    black_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MATERIAL, "black")
+    metal_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MATERIAL, "metal")
+    assert black_id >= 0 and metal_id >= 0, "G1's own 'black'/'metal' materials must exist in the compiled spec"
+
+    lavender_rgba = np.array([0.79216, 0.81961, 0.93333, 1.0])
+    green_rgba = np.array([0.2, 1.0, 0.2, 1.0])
+    n_black = n_metal = n_other = 0
+    housing_matids, elastomer_matids, finger_matids = [], [], []
+    for g in range(model.ngeom):
+        bname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[g]) or ""
+        if not (bname.startswith("left_left_") or bname.startswith("right_right_")):
+            continue
+        if model.geom_contype[g] != 0 or model.geom_conaffinity[g] != 0:
+            continue  # collision geom, not part of this visual check
+        assert not np.allclose(model.geom_rgba[g], lavender_rgba, atol=0.01), f"geom {g} still shows upstream lavender rgba"
+        assert not np.allclose(model.geom_rgba[g], green_rgba, atol=0.01), f"geom {g} still shows upstream green elastomer rgba"
+        matid = model.geom_matid[g]
+        if matid == black_id:
+            n_black += 1
+        elif matid == metal_id:
+            n_metal += 1
+        else:
+            n_other += 1
+        gname = (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or "").lower()
+        if "wrist" in bname.lower() or "c_mc" in gname:
+            housing_matids.append(matid)
+        if "elastomer" in gname:
+            elastomer_matids.append(matid)
+    assert n_other == 0, f"{n_other} Sharpa visual geoms use neither G1 material (found other matids)"
+    assert n_black > 0 and n_metal > 0, "expected a mix of black (housing/elastomer) and metal (finger structure) geoms"
+    print(f"    g1 style: {n_black} geoms on G1 'black', {n_metal} geoms on G1 'metal', 0 upstream lavender/green remaining")
+
+
 if __name__ == "__main__":
     tests = [obj for name, obj in list(globals().items()) if name.startswith("test_")]
     passed, failed = 0, 0

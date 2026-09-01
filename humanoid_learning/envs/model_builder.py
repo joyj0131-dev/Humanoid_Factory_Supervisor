@@ -467,12 +467,34 @@ _G1_BLACK_RGBA = [0.2, 0.2, 0.2, 1.0]
 
 
 def _apply_sharpa_visual_style(spec: "mujoco.MjSpec", side: str, style: str) -> None:
-    """VISUAL geoms only (contype==0==conaffinity, the vendored XML's own
-    "no collision participation" convention for its *_visual duplicates --
-    see attach_sharpa_hands's docstring). Never touches a geom that
-    participates in collision (contype/conaffinity, friction, solref) or
-    mass/inertia -- recoloring is purely cosmetic, verified by a physics-
-    invariance regression test (test_sharpa_wave_model.py)."""
+    """[Session 41 rewrite] VISUAL geoms only (contype==0==conaffinity, the
+    vendored XML's own "no collision participation" convention for its
+    *_visual duplicates -- see attach_sharpa_hands's docstring). Never
+    touches a geom that participates in collision (contype/conaffinity,
+    friction, solref) or mass/inertia -- recoloring is purely cosmetic,
+    verified by a physics-invariance regression test.
+
+    Session 40's version only set geom.rgba to a value CLOSE to G1's own
+    metal (0.7,0.7,0.7) -- visually almost indistinguishable from the
+    vendored lavender (0.79,0.82,0.93) under the viewer's lighting (user-
+    confirmed: "still looks the same"). This version instead ASSIGNS the
+    geom to G1's own actual named material ("black"/"metal", already
+    defined in this spec since it started from g1_with_hands.xml) --
+    verifiable post-compile via geom_matid, not just an approximately-
+    matching rgba -- and, per the user's explicit palette split, uses
+    "black" (not "metal") for the LARGE housing/base surfaces (the
+    dominant visible area) so the change is unmistakable, not just the
+    small elastomer pads:
+      - "wrist"/"C_MC" mesh (wrist adapter + palm/hand-base housing,
+        Sharpa's own naming -- see assets/robots/sharpa_wave's vendored
+        mesh list) -> G1 "black"
+      - "elastomer" mesh (fingertip contact pads) -> G1 "black"
+      - everything else (VL/PP/MP/DP finger structural links) -> G1
+        "metal"
+    Also sets geom.rgba to the SAME material's own rgba explicitly (not
+    left at the vendored per-geom rgba, which would otherwise win over an
+    assigned material at render time) so the visible result does not
+    depend on MuJoCo's material-vs-rgba precedence rule."""
     if style != "g1":
         return
     prefix = f"{side}_{side}_"
@@ -482,8 +504,16 @@ def _apply_sharpa_visual_style(spec: "mujoco.MjSpec", side: str, style: str) -> 
         for g in body.geoms:
             if g.contype != 0 or g.conaffinity != 0:
                 continue  # collision-participating geom -- never recolored
-            is_elastomer = "elastomer" in (g.meshname or "").lower() or "elastomer" in (g.name or "").lower()
-            g.rgba = _G1_BLACK_RGBA if is_elastomer else _G1_METAL_RGBA
+            mesh = (g.meshname or "").lower()
+            name = (g.name or "").lower()
+            is_housing = "wrist" in mesh or "c_mc" in mesh or "wrist" in name or "c_mc" in name
+            is_elastomer = "elastomer" in mesh or "elastomer" in name
+            if is_housing or is_elastomer:
+                g.material = "black"
+                g.rgba = _G1_BLACK_RGBA
+            else:
+                g.material = "metal"
+                g.rgba = _G1_METAL_RGBA
 
 
 def attach_sharpa_hands(spec: "mujoco.MjSpec", mount: str = "wrist", visual_style: str = "upstream") -> None:
