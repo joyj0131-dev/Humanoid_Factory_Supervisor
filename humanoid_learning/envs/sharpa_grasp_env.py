@@ -39,7 +39,6 @@ import numpy as np
 from gymnasium import spaces
 
 from humanoid_learning.envs import grasp_config as gc
-from humanoid_learning.envs import hand_synergy
 from humanoid_learning.envs import model_builder
 from humanoid_learning.envs import sharpa_config as sc
 from humanoid_learning.envs import task_config as tc

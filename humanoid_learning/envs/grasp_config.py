@@ -161,6 +161,8 @@ class GraspEnvConfig:
 
     success: GraspSuccessThresholds = field(default_factory=GraspSuccessThresholds)
 
+    # Active Sharpa grasp starts from the bare G1; model_builder attaches the
+    # hand once, without inherited end-effector mass.
     g1_xml_path: str = str(tc.G1_XML_PATH)
 
     # Net-Torque Root Cause Isolation session: False (default) reproduces

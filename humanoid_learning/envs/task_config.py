@@ -1,11 +1,4 @@
-"""Robot facts and the configurable environment definition for Phase 1.
-
-The joint/site names below were confirmed by directly opening
-``assets/robots/g1/g1_with_hands.xml`` (Unitree G1 with hands, from
-mujoco_menagerie) -- they are not guessed. See PROJECT_CONTEXT.md Phase 1
-report for the inspection notes. If the vendored model file is ever updated,
-re-check these names before trusting them again.
-"""
+"""G1 + Sharpa common robot facts and Phase-1 environment config."""
 
 from __future__ import annotations
 
@@ -15,11 +8,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Robot facts (confirmed from g1_with_hands.xml)
+# Robot facts (confirmed from the vendored bare G1 model)
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-G1_XML_PATH = PROJECT_ROOT / "assets" / "robots" / "g1" / "g1_with_hands.xml"
+# Canonical robot base.  Sharpa Wave is attached programmatically by
+# model_builder; using a pre-hand-equipped model here would double-count hand
+# mass/inertia.
+G1_XML_PATH = PROJECT_ROOT / "assets" / "robots" / "g1" / "g1.xml"
 
 FLOATING_BASE_JOINT = "floating_base_joint"
 STAND_KEYFRAME = "stand"
@@ -44,7 +40,7 @@ RIGHT_ARM_JOINTS = [
     "right_wrist_yaw_joint",
 ]
 
-# Actuator names are identical to joint names in g1_with_hands.xml
+# Actuator names are identical to joint names in g1.xml
 # (each <position name="X" joint="X"/>), so the same lists index actuators.
 LEFT_ARM_ACTUATORS = LEFT_ARM_JOINTS
 RIGHT_ARM_ACTUATORS = RIGHT_ARM_JOINTS

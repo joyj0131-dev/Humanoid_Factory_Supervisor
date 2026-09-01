@@ -6,15 +6,15 @@ contract is left completely unchanged -- see PROJECT_CONTEXT.md, Foundation
 Preservation). This env is the whole-body successor used for standing,
 posture, and grasp validation; it is not yet wired into Expert/BC/PPO.
 
-Action (31-dim, Box(-1, 1)), each slice a delta on its own internally
+Action (37-dim, Box(-1, 1)), each slice a delta on its own internally
 tracked target -- NOT one uniform physical unit, documented explicitly
 (PROJECT_CONTEXT.md Phase 4, Section H):
     [0:12)  legs         -- Joint Position Delta, radians, leg_action_scale
     [12:15) waist        -- Joint Position Delta, radians, waist_action_scale
     [15:29) arms         -- Joint Position Delta, radians, arm_action_scale
                              (order: left 7, right 7, same as task_config)
-    [29:31) hand synergy -- delta on a unitless open(0)<->close(1) scalar,
-                             hand_synergy_action_scale (order: left, right)
+    [29:37) Sharpa groups -- unitless open(0)<->close(1) deltas for
+                             thumb/index/middle/wrap, left then right
 
 legs are exposed as a directly-commandable slice here because Phase 4's own
 standing/posture experiments need to drive them directly (see Section C/D);
@@ -39,8 +39,8 @@ import numpy as np
 from gymnasium import spaces
 
 from humanoid_learning.envs import frames
-from humanoid_learning.envs import hand_synergy
 from humanoid_learning.envs import model_builder
+from humanoid_learning.envs import sharpa_config as sc
 from humanoid_learning.envs import task_config as tc
 from humanoid_learning.envs import whole_body_config as wbc
 
@@ -48,8 +48,8 @@ _ARM_JOINTS = tc.LEFT_ARM_JOINTS + tc.RIGHT_ARM_JOINTS  # 14, left then right
 N_LEGS = len(wbc.LEG_JOINTS)  # 12
 N_WAIST = len(wbc.WAIST_JOINTS)  # 3
 N_ARMS = len(_ARM_JOINTS)  # 14
-N_HAND_SYNERGY = 2
-ACTION_DIM = N_LEGS + N_WAIST + N_ARMS + N_HAND_SYNERGY  # 31
+N_HAND_SYNERGY = 2 * len(sc.GROUPS)  # 8
+ACTION_DIM = N_LEGS + N_WAIST + N_ARMS + N_HAND_SYNERGY  # 37
 
 _LEG_SLICE = slice(0, N_LEGS)
 _WAIST_SLICE = slice(N_LEGS, N_LEGS + N_WAIST)
@@ -74,7 +74,7 @@ class WholeBodyEnv(gym.Env):
         self._leg_target = np.zeros(N_LEGS, dtype=np.float64)
         self._waist_target = np.zeros(N_WAIST, dtype=np.float64)
         self._arm_target = np.zeros(N_ARMS, dtype=np.float64)
-        self._hand_synergy = np.zeros(2, dtype=np.float64)
+        self._hand_synergy = np.zeros(N_HAND_SYNERGY, dtype=np.float64)
         self._step_count = 0
         self._renderer: mujoco.Renderer | None = None
 
@@ -118,8 +118,23 @@ class WholeBodyEnv(gym.Env):
         self._arm_ctrl_low = model.actuator_ctrlrange[self._arm_act_ids, 0].copy()
         self._arm_ctrl_high = model.actuator_ctrlrange[self._arm_act_ids, 1].copy()
 
-        self._left_hand_act_ids = np.array([act_id(n) for n, _, _ in wbc.LEFT_HAND_SYNERGY_TARGETS])
-        self._right_hand_act_ids = np.array([act_id(n) for n, _, _ in wbc.RIGHT_HAND_SYNERGY_TARGETS])
+        self._hand_group_act_ids: dict[str, list[np.ndarray]] = {"left": [], "right": []}
+        self._hand_group_open: dict[str, list[np.ndarray]] = {"left": [], "right": []}
+        self._hand_group_close: dict[str, list[np.ndarray]] = {"left": [], "right": []}
+        for side in sc.SIDES:
+            for group in sc.GROUPS:
+                aids, opens, closes = [], [], []
+                for finger in sc.GROUP_FINGERS[group]:
+                    for suffix in sc.curl_suffixes(finger):
+                        jname = sc.sharpa_joint(side, finger, suffix)
+                        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+                        lo, hi = model.jnt_range[jid]
+                        aids.append(act_id(sc.sharpa_actuator(side, finger, suffix)))
+                        opens.append(lo)
+                        closes.append(lo + sc.CLOSE_FRACTION * (hi - lo))
+                self._hand_group_act_ids[side].append(np.asarray(aids, dtype=int))
+                self._hand_group_open[side].append(np.asarray(opens, dtype=float))
+                self._hand_group_close[side].append(np.asarray(closes, dtype=float))
 
         self._pelvis_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, wbc.PELVIS_BODY)
         self._left_foot_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, wbc.LEFT_FOOT_CONTACT_BODY)
@@ -161,7 +176,10 @@ class WholeBodyEnv(gym.Env):
         self._leg_target = self.data.ctrl[self._leg_act_ids].copy()
         self._waist_target = self.data.ctrl[self._waist_act_ids].copy()
         self._arm_target = self.data.ctrl[self._arm_act_ids].copy()
-        self._hand_synergy = np.zeros(2, dtype=np.float64)
+        self._hand_synergy = np.zeros(N_HAND_SYNERGY, dtype=np.float64)
+        for side in sc.SIDES:
+            for group_idx in range(len(sc.GROUPS)):
+                self.data.ctrl[self._hand_group_act_ids[side][group_idx]] = self._hand_group_open[side][group_idx]
         self._step_count = 0
 
         obs = self._get_obs()
@@ -198,8 +216,12 @@ class WholeBodyEnv(gym.Env):
         ctrl[self._leg_act_ids] = self._leg_target
         ctrl[self._waist_act_ids] = self._waist_target
         ctrl[self._arm_act_ids] = self._arm_target
-        ctrl[self._left_hand_act_ids] = hand_synergy.left_hand_targets(self._hand_synergy[0])
-        ctrl[self._right_hand_act_ids] = hand_synergy.right_hand_targets(self._hand_synergy[1])
+        for side_idx, side in enumerate(sc.SIDES):
+            for group_idx in range(len(sc.GROUPS)):
+                synergy = self._hand_synergy[side_idx * len(sc.GROUPS) + group_idx]
+                open_q = self._hand_group_open[side][group_idx]
+                close_q = self._hand_group_close[side][group_idx]
+                ctrl[self._hand_group_act_ids[side][group_idx]] = open_q + synergy * (close_q - open_q)
         self.data.ctrl[:] = ctrl
 
         for _ in range(self.config.frame_skip):

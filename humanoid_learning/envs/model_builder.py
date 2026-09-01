@@ -36,6 +36,58 @@ from humanoid_learning.envs import task_config as tc
 from humanoid_learning.envs import whole_body_config as wbc
 
 
+def _restore_named_keyframe(
+    model: mujoco.MjModel,
+    source_xml_path: str | Path,
+    key_name: str = tc.STAND_KEYFRAME,
+) -> None:
+    """Rebuild an attached model's keyframe by joint/actuator *name*.
+
+    ``MjSpec.attach`` inserts child joints at the attachment body's position
+    in the kinematic tree.  A pre-existing flat ``key.qpos`` array is only
+    padded, however; it is not reliably remapped to that new order.  With the
+    bare G1 this silently assigned right-arm stand values to the newly
+    inserted left Sharpa thumb and left the object freejoint at the origin.
+
+    Joints absent from the source (Sharpa and the task object) retain their
+    compiled ``qpos0``.  Actuators absent from the source retain zero control.
+    """
+    source = mujoco.MjModel.from_xml_path(str(source_xml_path))
+    source_key = mujoco.mj_name2id(source, mujoco.mjtObj.mjOBJ_KEY, key_name)
+    target_key = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, key_name)
+    if source_key < 0 or target_key < 0:
+        raise ValueError(f"missing keyframe {key_name!r} while rebuilding attached model")
+
+    rebuilt_qpos = model.qpos0.copy()
+    for target_jid in range(model.njnt):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, target_jid)
+        source_jid = mujoco.mj_name2id(source, mujoco.mjtObj.mjOBJ_JOINT, name)
+        if source_jid < 0:
+            continue
+        target_type = model.jnt_type[target_jid]
+        source_type = source.jnt_type[source_jid]
+        if target_type != source_type:
+            continue
+        width = {
+            mujoco.mjtJoint.mjJNT_FREE: 7,
+            mujoco.mjtJoint.mjJNT_BALL: 4,
+            mujoco.mjtJoint.mjJNT_SLIDE: 1,
+            mujoco.mjtJoint.mjJNT_HINGE: 1,
+        }[mujoco.mjtJoint(target_type)]
+        target_adr = model.jnt_qposadr[target_jid]
+        source_adr = source.jnt_qposadr[source_jid]
+        rebuilt_qpos[target_adr : target_adr + width] = source.key_qpos[source_key, source_adr : source_adr + width]
+    model.key_qpos[target_key] = rebuilt_qpos
+
+    rebuilt_ctrl = np.zeros(model.nu, dtype=float)
+    for target_aid in range(model.nu):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, target_aid)
+        source_aid = mujoco.mj_name2id(source, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+        if source_aid >= 0:
+            rebuilt_ctrl[target_aid] = source.key_ctrl[source_key, source_aid]
+    model.key_ctrl[target_key] = rebuilt_ctrl
+
+
 def build_model(config) -> mujoco.MjModel:
     spec = mujoco.MjSpec.from_file(str(config.g1_xml_path))
 
@@ -48,6 +100,8 @@ def build_model(config) -> mujoco.MjModel:
     # entries so it matches the new 43-dof fixed-base model.
     stand_key = spec.key(tc.STAND_KEYFRAME)
     stand_key.qpos = np.asarray(stand_key.qpos)[7:].tolist()
+
+    attach_sharpa_hands(spec, visual_style="g1")
 
     # --- end-effector sites --------------------------------------------------
     spec.body("left_wrist_yaw_link").add_site(
@@ -90,7 +144,9 @@ def build_model(config) -> mujoco.MjModel:
         mass=0.1,
     )
 
-    return spec.compile()
+    model = spec.compile()
+    _restore_named_keyframe(model, config.g1_xml_path)
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -218,12 +274,15 @@ def build_whole_body_model(config, include_object: bool = False) -> mujoco.MjMod
     robot. The stand keyframe qpos is used as-authored (no 7-entry strip --
     it already has the right length for a 50-dof floating-base model)."""
     spec = mujoco.MjSpec.from_file(str(config.g1_xml_path))
+    attach_sharpa_hands(spec, visual_style="g1")
     _add_ee_sites(spec)
-    _add_grasp_sites(spec)
+    _add_sharpa_grasp_sites(spec)
     _add_floor(spec)
     if include_object:
         _add_table_and_object(spec, config)
-    return spec.compile()
+    model = spec.compile()
+    _restore_named_keyframe(model, config.g1_xml_path)
+    return model
 
 
 def build_grasp_model(config, hard_fixed_waist: bool = False) -> mujoco.MjModel:
@@ -363,6 +422,7 @@ def build_planar_debug_model(config) -> mujoco.MjModel:
     pelvis.add_joint(name="planar_y", type=mujoco.mjtJoint.mjJNT_SLIDE, axis=[0, 1, 0])
     pelvis.add_joint(name="planar_yaw", type=mujoco.mjtJoint.mjJNT_HINGE, axis=[0, 0, 1])
 
+    attach_sharpa_hands(spec, visual_style="g1")
     _add_ee_sites(spec)
     _add_floor(spec)
 
@@ -388,7 +448,9 @@ def build_planar_debug_model(config) -> mujoco.MjModel:
             ctrlrange=ctrlrange,
         )
 
-    return spec.compile()
+    model = spec.compile()
+    _restore_named_keyframe(model, config.g1_xml_path)
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -532,10 +594,16 @@ def attach_sharpa_hands(spec: "mujoco.MjSpec", mount: str = "wrist", visual_styl
     not a bug (verified: does not collide with any other name)."""
     for side in ("left", "right"):
         wrist = spec.body(f"{side}_wrist_yaw_link")
+        # Compatibility cleanup for an old g1_with_hands.xml caller.  The
+        # active path starts from bare g1.xml, so these bodies normally do
+        # not exist.  Keeping this conditional during migration makes the
+        # helper safe without retaining a Dex3 requirement.
         for finger_root in (f"{side}_hand_thumb_0_link", f"{side}_hand_middle_0_link", f"{side}_hand_index_0_link"):
-            spec.delete(spec.body(finger_root))
+            body = spec.body(finger_root)
+            if body is not None:
+                spec.delete(body)
         for g in list(wrist.geoms):
-            if g.meshname == f"{side}_hand_palm_link":
+            if g.meshname in {f"{side}_hand_palm_link", f"{side}_rubber_hand"}:
                 spec.delete(g)
         mount_site = wrist.add_site(
             name=f"{side}_sharpa_mount", pos=list(_SHARPA_MOUNT_POS), quat=_sharpa_mount_quat(side)
@@ -610,5 +678,6 @@ def build_grasp_model_sharpa(config) -> mujoco.MjModel:
     )
 
     model = spec.compile()
+    _restore_named_keyframe(model, config.g1_xml_path)
     _apply_compliant_kp(model, tc.LEFT_ARM_JOINTS + tc.RIGHT_ARM_JOINTS, config.arm_kp)
     return model

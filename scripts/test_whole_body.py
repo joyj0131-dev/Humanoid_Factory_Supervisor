@@ -17,15 +17,14 @@ import mujoco
 import numpy as np
 
 from humanoid_learning.envs import frames
-from humanoid_learning.envs import hand_synergy
 from humanoid_learning.envs import model_builder
+from humanoid_learning.envs import sharpa_config as sc
 from humanoid_learning.envs import task_config as tc
 from humanoid_learning.envs import whole_body_config as wbc
 from humanoid_learning.envs.humanoid_reach_env import BimanualReachEnv
 from humanoid_learning.envs.planar_debug_env import PlanarDebugEnv
 from humanoid_learning.envs.whole_body_env import ACTION_DIM, N_ARMS, N_LEGS, N_WAIST, WholeBodyEnv
 from humanoid_learning.expert.scripted_expert import ExpertConfig, ScriptedExpert
-from humanoid_learning.expert import ik_solver
 
 ZERO_ACTION = np.zeros(ACTION_DIM, dtype=np.float32)
 
@@ -48,18 +47,18 @@ def test_whole_body_model_loads_and_keeps_floating_base():
 
 def test_whole_body_nq_nv_nu():
     env = make_wb_env()
-    # 43 robot hinge joints + 1 freejoint (7 qpos / 6 dof) = nq 50, nv 49, nu 43 (unchanged)
-    assert env.model.nq == 50
-    assert env.model.nv == 49
-    assert env.model.nu == 43
+    # 29 G1 + 44 Sharpa hinges and one floating base.
+    assert env.model.nq == 80
+    assert env.model.nv == 79
+    assert env.model.nu == 73
 
 
 def test_fixed_base_and_whole_body_builders_are_independent():
     fixed_config = tc.EnvConfig.from_yaml(PROJECT_ROOT / "configs" / "environment.yaml")
     fixed_model = model_builder.build_model(fixed_config)
     wb_model = model_builder.build_whole_body_model(wbc.WholeBodyConfig())
-    assert fixed_model.nq == 50  # 43 fixed-base dof + 7 object freejoint
-    assert wb_model.nq == 50  # 43 robot hinge + 7 floating-base freejoint, no object
+    assert fixed_model.nq == 80  # 29 G1 + 44 Sharpa + 7 object freejoint
+    assert wb_model.nq == 80  # 29 G1 + 44 Sharpa + 7 floating-base qpos
     jid_fixed = mujoco.mj_name2id(fixed_model, mujoco.mjtObj.mjOBJ_JOINT, wbc.FLOATING_BASE_JOINT)
     assert jid_fixed < 0, "fixed-base model must not have floating_base_joint"
     jid_wb = mujoco.mj_name2id(wb_model, mujoco.mjtObj.mjOBJ_JOINT, wbc.FLOATING_BASE_JOINT)
@@ -71,11 +70,14 @@ def test_leg_waist_arm_hand_actuator_mapping():
     for name in wbc.LEG_JOINTS + wbc.WAIST_JOINTS + tc.LEFT_ARM_JOINTS + tc.RIGHT_ARM_JOINTS:
         aid = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
         assert aid >= 0, f"actuator missing: {name}"
-    for name, _, _ in wbc.LEFT_HAND_SYNERGY_TARGETS + wbc.RIGHT_HAND_SYNERGY_TARGETS:
-        aid = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
-        assert aid >= 0, f"hand actuator missing: {name}"
+    for side in sc.SIDES:
+        for finger in sc.FINGERS:
+            for suffix in sc.curl_suffixes(finger) + sc.preshape_suffixes(finger):
+                name = sc.sharpa_actuator(side, finger, suffix)
+                aid = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+                assert aid >= 0, f"hand actuator missing: {name}"
     assert N_LEGS == 12 and N_WAIST == 3 and N_ARMS == 14
-    assert ACTION_DIM == 31
+    assert ACTION_DIM == 37
 
 
 # ---------------------------------------------------------------------
@@ -319,27 +321,32 @@ def test_whole_body_obs_ee_relative_to_pelvis_matches_frames():
 def test_hand_synergy_open_close_within_ctrlrange():
     env = make_wb_env()
     for synergy in (0.0, 0.5, 1.0):
-        left = hand_synergy.left_hand_targets(synergy)
-        right = hand_synergy.right_hand_targets(synergy)
-        for act_ids, targets in (
-            (env._left_hand_act_ids, left),
-            (env._right_hand_act_ids, right),
-        ):
-            low = env.model.actuator_ctrlrange[act_ids, 0]
-            high = env.model.actuator_ctrlrange[act_ids, 1]
-            assert np.all(targets >= low - 1e-6) and np.all(targets <= high + 1e-6)
+        for side in sc.SIDES:
+            for group_idx in range(len(sc.GROUPS)):
+                act_ids = env._hand_group_act_ids[side][group_idx]
+                open_q = env._hand_group_open[side][group_idx]
+                close_q = env._hand_group_close[side][group_idx]
+                targets = open_q + synergy * (close_q - open_q)
+                low = env.model.actuator_ctrlrange[act_ids, 0]
+                high = env.model.actuator_ctrlrange[act_ids, 1]
+                assert np.all(targets >= low - 1e-6) and np.all(targets <= high + 1e-6)
 
 
 def test_hand_synergy_actuates_real_finger_joints():
     env = make_wb_env()
     env.reset(seed=0)
-    left_qpos_adr = np.array(
-        [env.model.jnt_qposadr[mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_JOINT, n)] for n, _, _ in wbc.LEFT_HAND_SYNERGY_TARGETS]
-    )
+    left_joint_names = [
+        sc.sharpa_joint("left", finger, suffix)
+        for finger in sc.FINGERS for suffix in sc.curl_suffixes(finger)
+    ]
+    left_qpos_adr = np.array([
+        env.model.jnt_qposadr[mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_JOINT, name)]
+        for name in left_joint_names
+    ])
     open_qpos = env.data.qpos[left_qpos_adr].copy()
 
     a = ZERO_ACTION.copy()
-    a[29] = 1.0  # left hand synergy delta, full close command
+    a[29:33] = 1.0  # all four left Sharpa closing groups
     for _ in range(30):
         obs, r, term, trunc, info = env.step(a)
     closed_qpos = env.data.qpos[left_qpos_adr].copy()
@@ -350,85 +357,26 @@ def test_hand_synergy_actuates_real_finger_joints():
 
 
 # ---------------------------------------------------------------------
-# Grasp / contact / lift (see PROJECT_CONTEXT.md Phase 4 report --
-# physical pick-and-lift was NOT achieved in this session; this test
-# documents the reproducible partial result rather than asserting success
-# that did not happen).
+# Object-enabled whole-body smoke test.  Grasp Gate A belongs to the
+# fixed-base Sharpa grasp suite; this only verifies the common floating-base
+# environment remains stable when the task object and real hand actuators
+# coexist.
 # ---------------------------------------------------------------------
 
 
-def test_grasp_attempt_runs_without_crash_and_reports_outcome():
-    env = BimanualReachEnv(tc.EnvConfig.from_yaml(PROJECT_ROOT / "configs" / "environment.yaml"))
-    obs, info = env.reset(seed=0)
-    obj0 = info["object_position"].copy()
-    expert = ScriptedExpert(env, ExpertConfig(damping=0.05, gain=0.5))
-
-    for _ in range(200):
-        obs, r, term, trunc, info = env.step(expert.act())
-        if term:
-            break
-    assert info["success"], "pre-grasp reach itself (Phase 2 behavior) should still succeed"
-
-    obj_now = env.data.qpos[env._object_qpos_adr : env._object_qpos_adr + 3].copy()
-
-    left_hand_act_ids = np.array(
-        [mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_ACTUATOR, n) for n, _, _ in wbc.LEFT_HAND_SYNERGY_TARGETS]
-    )
-    right_hand_act_ids = np.array(
-        [mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_ACTUATOR, n) for n, _, _ in wbc.RIGHT_HAND_SYNERGY_TARGETS]
-    )
-    obj_body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, "object")
-
-    def act_toward_both(left_t, right_t, gain):
-        left_jac, right_jac = env.arm_jacobians()
-        ldq = ik_solver.dls_step(left_jac, left_t - env.left_ee_pos, damping=0.05) * gain
-        rdq = ik_solver.dls_step(right_jac, right_t - env.right_ee_pos, damping=0.05) * gain
-        a = np.zeros(14, dtype=np.float32)
-        a[:7] = np.clip(ldq / env.config.action_scale, -1, 1)
-        a[7:] = np.clip(rdq / env.config.action_scale, -1, 1)
-        return a
-
-    left_pinch = obj_now + np.array([0.0, 0.032, 0.0])
-    right_pinch = obj_now + np.array([0.0, -0.032, 0.0])
-    for _ in range(100):
-        a = act_toward_both(left_pinch, right_pinch, gain=0.3)
-        obs, r, term, trunc, info = env.step(a)
-        assert np.isfinite(obs).all()
-
-    obj_after_descent = env.data.qpos[env._object_qpos_adr : env._object_qpos_adr + 3].copy()
-
-    synergy = 0.0
+def test_object_enabled_sharpa_whole_body_runs_without_crash():
+    env = make_wb_env(include_object=True)
+    obs, _ = env.reset(seed=0)
+    action = ZERO_ACTION.copy()
+    action[29:37] = 0.3
     for _ in range(30):
-        synergy = min(1.0, synergy + 0.05)
-        a = act_toward_both(left_pinch, right_pinch, gain=0.3)
-        obs, r, term, trunc, info = env.step(a)
-        ctrl = env.data.ctrl.copy()
-        ctrl[left_hand_act_ids] = hand_synergy.left_hand_targets(synergy)
-        ctrl[right_hand_act_ids] = hand_synergy.right_hand_targets(synergy)
-        env.data.ctrl[:] = ctrl
-        mujoco.mj_step(env.model, env.data)
+        obs, _, terminated, truncated, info = env.step(action)
+        assert np.isfinite(obs).all()
         assert np.isfinite(env.data.qpos).all() and np.isfinite(env.data.qvel).all()
-
-    obj_after_close = env.data.qpos[env._object_qpos_adr : env._object_qpos_adr + 3].copy()
-
-    hand_object_contact = False
-    for i in range(env.data.ncon):
-        c = env.data.contact[i]
-        bodies = {env.model.geom_bodyid[c.geom1], env.model.geom_bodyid[c.geom2]}
-        if obj_body_id in bodies:
-            other = (bodies - {obj_body_id}).pop() if len(bodies) == 2 else obj_body_id
-            other_name = mujoco.mj_id2name(env.model, mujoco.mjtObj.mjOBJ_BODY, other) or ""
-            if "hand" in other_name:
-                hand_object_contact = True
-
-    lifted = obj_after_close[2] > obj_now[2] + 0.02
-    disturbed = float(np.linalg.norm(obj_after_descent[:2] - obj_now[:2])) > 0.1
-
-    print(
-        f"    grasp attempt: hand_object_contact={hand_object_contact} lifted={lifted} "
-        f"disturbed_during_descent={disturbed} obj_xy_moved={np.linalg.norm(obj_after_close[:2]-obj_now[:2]):.4f}"
-    )
-    print("    NOTE: physical pick-and-lift was not achieved this session (see PROJECT_CONTEXT.md Phase 4 report)")
+        assert not terminated
+        if truncated:
+            break
+    assert not info["fallen"]
 
 
 # ---------------------------------------------------------------------

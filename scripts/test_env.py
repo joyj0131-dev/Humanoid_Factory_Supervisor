@@ -35,8 +35,9 @@ def make_env() -> BimanualReachEnv:
 def test_model_loads():
     config = EnvConfig.from_yaml(CONFIG_PATH)
     model = model_builder.build_model(config)
-    assert model.nq == 50  # 43 fixed-base robot dof + 7 object freejoint
-    assert model.nu == 43
+    # 29 G1 hinges + 44 Sharpa hinges + 7 object freejoint.
+    assert model.nq == 80
+    assert model.nu == 73
 
 
 def test_simulation_forward_runs():
