@@ -431,9 +431,19 @@ _SHARPA_MOUNT_POS = (0.0, 0.0, 0.0)  # at the wrist_yaw_link's own origin -- the
 # _with_wrist Sharpa variant already models the physical wrist-adapter
 # standoff as part of its own geometry (see assets/robots/sharpa_wave/README.md)
 
-def _sharpa_xml_path(side: str) -> Path:
+def _sharpa_xml_path(side: str, mount: str = "wrist") -> Path:
+    """``mount``: "wrist" (default, existing behavior) or "flange" -- see
+    Session 40's mount A/B audit (docs/history/PHASE4_GRASP_SESSION_40.md).
+    Measured directly from the vendored XML: both variants add a RIGID
+    (zero extra DoF) hand-base standoff of nearly identical thickness
+    (with_wrist: +29.0mm; with_flange: +29.5mm, i.e. with_flange is 0.5mm
+    MORE, via an additional thin flange plate mesh, not less) -- neither
+    is a "no adapter" bare-mount option, and the difference between them
+    is not the wrist-duplication most of the visual asymmetry was
+    hypothesized to come from."""
     project_root = Path(__file__).resolve().parents[2]
-    return project_root / "assets" / "robots" / "sharpa_wave" / f"{side}_sharpa_wave" / f"{side}_sharpa_wave_with_wrist.xml"
+    suffix = "with_flange" if mount == "flange" else "with_wrist"
+    return project_root / "assets" / "robots" / "sharpa_wave" / f"{side}_sharpa_wave" / f"{side}_sharpa_wave_{suffix}.xml"
 
 
 def _sharpa_mount_quat(side: str) -> list[float]:
@@ -447,7 +457,36 @@ def _sharpa_mount_quat(side: str) -> list[float]:
     return q.tolist()
 
 
-def attach_sharpa_hands(spec: "mujoco.MjSpec") -> None:
+# [Session 40, Stage 8] Reused VERBATIM from g1_with_hands.xml's own
+# <material> definitions (rgba only -- see that file's "metal"/"black"
+# entries) rather than inventing new colors, so the Sharpa hands visually
+# match the rest of G1 instead of the vendored light-lavender
+# (0.79216 0.81961 0.93333) shell and bright-green (0.2 1 0.2) elastomer.
+_G1_METAL_RGBA = [0.7, 0.7, 0.7, 1.0]
+_G1_BLACK_RGBA = [0.2, 0.2, 0.2, 1.0]
+
+
+def _apply_sharpa_visual_style(spec: "mujoco.MjSpec", side: str, style: str) -> None:
+    """VISUAL geoms only (contype==0==conaffinity, the vendored XML's own
+    "no collision participation" convention for its *_visual duplicates --
+    see attach_sharpa_hands's docstring). Never touches a geom that
+    participates in collision (contype/conaffinity, friction, solref) or
+    mass/inertia -- recoloring is purely cosmetic, verified by a physics-
+    invariance regression test (test_sharpa_wave_model.py)."""
+    if style != "g1":
+        return
+    prefix = f"{side}_{side}_"
+    for body in spec.bodies:
+        if not body.name.startswith(prefix):
+            continue
+        for g in body.geoms:
+            if g.contype != 0 or g.conaffinity != 0:
+                continue  # collision-participating geom -- never recolored
+            is_elastomer = "elastomer" in (g.meshname or "").lower() or "elastomer" in (g.name or "").lower()
+            g.rgba = _G1_BLACK_RGBA if is_elastomer else _G1_METAL_RGBA
+
+
+def attach_sharpa_hands(spec: "mujoco.MjSpec", mount: str = "wrist", visual_style: str = "upstream") -> None:
     """[35th session, Stage 2] Removes the Dex3 hand (finger-root bodies +
     palm-plate geom) from each {side}_wrist_yaw_link and attaches the
     vendored Sharpa Wave hand in its place, via a mount SITE (MjSpec.attach
@@ -471,8 +510,9 @@ def attach_sharpa_hands(spec: "mujoco.MjSpec") -> None:
         mount_site = wrist.add_site(
             name=f"{side}_sharpa_mount", pos=list(_SHARPA_MOUNT_POS), quat=_sharpa_mount_quat(side)
         )
-        sharpa_spec = mujoco.MjSpec.from_file(str(_sharpa_xml_path(side)))
+        sharpa_spec = mujoco.MjSpec.from_file(str(_sharpa_xml_path(side, mount)))
         spec.attach(sharpa_spec, prefix=f"{side}_", site=mount_site)
+        _apply_sharpa_visual_style(spec, side, visual_style)
 
 
 def _add_sharpa_grasp_sites(spec: "mujoco.MjSpec") -> None:
@@ -511,7 +551,7 @@ def build_grasp_model_sharpa(config) -> mujoco.MjModel:
     stand_key = spec.key(tc.STAND_KEYFRAME)
     stand_key.qpos = np.asarray(stand_key.qpos)[7:].tolist()
 
-    attach_sharpa_hands(spec)
+    attach_sharpa_hands(spec, mount=config.sharpa_mount, visual_style=config.sharpa_visual_style)
     _add_ee_sites(spec)
     _add_sharpa_grasp_sites(spec)
     _add_floor(spec)

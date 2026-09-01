@@ -156,6 +156,46 @@ def test_canonical_grasp_config_exposes_cubic_half_extents():
     )
 
 
+def test_wrist_and_flange_mount_palm_frame_agree():
+    """[Session 40] Mount A/B: with_wrist (default) vs with_flange must
+    produce the SAME palm-frame site pose (the site lives on
+    wrist_yaw_link, independent of which Sharpa variant is attached) --
+    the two variants differ only by the vendored hand's own ~0.5mm
+    hand-base offset (see model_builder._sharpa_xml_path's docstring),
+    never a meaningfully different mount geometry."""
+    cfg_wrist = GraspEnvConfig(object_pos=(0.27, 0.0, 0.0), arm_kp=120.0, object_half_size=SIZE_12_HALF, sharpa_mount="wrist")
+    cfg_flange = GraspEnvConfig(object_pos=(0.27, 0.0, 0.0), arm_kp=120.0, object_half_size=SIZE_12_HALF, sharpa_mount="flange")
+    m_wrist, m_flange = build_grasp_model_sharpa(cfg_wrist), build_grasp_model_sharpa(cfg_flange)
+    for m in (m_wrist, m_flange):
+        assert m.nq == m_wrist.nq and m.nv == m_wrist.nv
+    d_wrist, d_flange = _stand_data(m_wrist), _stand_data(m_flange)
+    for site in ("left_palm_frame", "right_palm_frame"):
+        sid_w = mujoco.mj_name2id(m_wrist, mujoco.mjtObj.mjOBJ_SITE, site)
+        sid_f = mujoco.mj_name2id(m_flange, mujoco.mjtObj.mjOBJ_SITE, site)
+        diff = float(np.linalg.norm(d_wrist.site_xpos[sid_w] - d_flange.site_xpos[sid_f]))
+        assert diff < 1e-6, f"{site} palm frame differs between mount variants by {diff*1000:.4f}mm"
+    print("    with_wrist/with_flange palm frames match exactly (mount variant does not affect targeting)")
+
+
+def test_sharpa_visual_style_g1_is_physics_invariant():
+    """[Session 40, Stage 8] Recoloring visual-only Sharpa geoms to match
+    G1's own material palette must NEVER change mass, inertia, collision
+    geometry, joint ranges, or actuator gains -- only geom_rgba differs."""
+    cfg_up = GraspEnvConfig(object_pos=(0.27, 0.0, 0.0), arm_kp=120.0, object_half_size=SIZE_12_HALF, sharpa_visual_style="upstream")
+    cfg_g1 = GraspEnvConfig(object_pos=(0.27, 0.0, 0.0), arm_kp=120.0, object_half_size=SIZE_12_HALF, sharpa_visual_style="g1")
+    m_up, m_g1 = build_grasp_model_sharpa(cfg_up), build_grasp_model_sharpa(cfg_g1)
+    assert np.allclose(m_up.body_mass, m_g1.body_mass)
+    assert np.allclose(m_up.body_inertia, m_g1.body_inertia)
+    assert np.allclose(m_up.geom_size, m_g1.geom_size)
+    assert np.array_equal(m_up.geom_contype, m_g1.geom_contype)
+    assert np.array_equal(m_up.geom_conaffinity, m_g1.geom_conaffinity)
+    assert np.allclose(m_up.geom_friction, m_g1.geom_friction)
+    assert np.allclose(m_up.jnt_range, m_g1.jnt_range)
+    assert np.allclose(m_up.actuator_gainprm, m_g1.actuator_gainprm)
+    assert not np.allclose(m_up.geom_rgba, m_g1.geom_rgba), "g1 visual style should actually change some geom_rgba"
+    print("    physics identical (mass/inertia/collision/joints/actuators), rgba differs as expected")
+
+
 if __name__ == "__main__":
     tests = [obj for name, obj in list(globals().items()) if name.startswith("test_")]
     passed, failed = 0, 0

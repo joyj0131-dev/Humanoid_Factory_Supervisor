@@ -111,6 +111,19 @@ class GraspEnvConfig:
     # env enables it (sharpa_grasp_env.py's step()).
     arm_gravity_compensation: bool = False
 
+    # [Session 40, Sharpa track only -- read by build_grasp_model_sharpa,
+    # never by Dex3's build_grasp_model] "wrist" (default, existing
+    # behavior) or "flange" -- see model_builder._sharpa_xml_path's
+    # docstring and docs/history/PHASE4_GRASP_SESSION_40.md's mount A/B
+    # audit for why the two variants measured almost identically (0.5mm
+    # hand-base offset difference, not a meaningful structural change).
+    sharpa_mount: str = "wrist"
+    # [Session 40] "upstream" (default, existing appearance unchanged) or
+    # "g1" (recolor VISUAL-only Sharpa geoms to reuse g1_with_hands.xml's
+    # own metal/black material rgba -- see model_builder._apply_sharpa_
+    # visual_style docstring; never touches collision/mass/inertia).
+    sharpa_visual_style: str = "upstream"
+
     object_pos: tuple[float, float, float] = (0.27, 0.0, 0.0)  # z resolved at reset (on table surface)
     # 2x every linear dimension of the Foundation object (0.03 -> 0.06,
     # i.e. 6cm cube -> 12cm cube) -- see PROJECT_CONTEXT.md Phase 4 Grasp
