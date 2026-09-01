@@ -660,6 +660,66 @@ def mode_grasp_sharpa(
                 time.sleep(state["env"].model.opt.timestep * 5 - elapsed)
 
 
+def mode_sharpa_hand_demo(no_restart: bool = False, sharpa_visual_style: str = "g1"):
+    """[Session 41, Stage 3] DIAGNOSTIC ONLY -- free-space Sharpa Wave
+    bimanual open/close motion, independent of the official grasp state
+    machine (no object contact, never affects any Gate metric). See
+    humanoid_learning/expert/sharpa_hand_demo.py's module docstring."""
+    from humanoid_learning.envs.grasp_config import GraspEnvConfig
+    from humanoid_learning.envs.sharpa_grasp_env import SharpaGraspEnv
+    from humanoid_learning.expert.sharpa_hand_demo import HandDemoState, SharpaHandDemo
+
+    print("=" * 60)
+    print("DIAGNOSTIC ONLY -- free-space Sharpa hand open/close demo.")
+    print("No object contact. Does NOT affect any official Gate.")
+    print("=" * 60)
+
+    config = GraspEnvConfig(arm_kp=120.0, arm_gravity_compensation=True, sharpa_visual_style=sharpa_visual_style)
+    env = SharpaGraspEnv(config)
+    state = {"env": env, "demo": None, "last_state": None, "frame": 0, "done": False}
+
+    def new_attempt():
+        env.reset(seed=0)
+        state["demo"] = SharpaHandDemo(env)
+        state["last_state"] = None
+        state["frame"] = 0
+
+    new_attempt()
+
+    def step(_i):
+        env, demo = state["env"], state["demo"]
+        action = demo.step()
+        env.step(action)
+        if demo.state != state["last_state"]:
+            st = demo.status()
+            print(f"  [{state['frame']:4d}] -> {demo.state.name}  "
+                  f"pos_err(L,R)=({st.left_palm_pos_error_m*100:.2f},{st.right_palm_pos_error_m*100:.2f})cm  "
+                  f"forbidden_collision={st.forbidden_collision}  "
+                  f"synergy_L={ {g: round(v, 2) for g, v in st.group_synergy['left'].items()} }  "
+                  f"synergy_R={ {g: round(v, 2) for g, v in st.group_synergy['right'].items()} }")
+            state["last_state"] = demo.state
+        state["frame"] += 1
+        if demo.state == HandDemoState.DONE and demo._state_step >= 10:
+            if no_restart:
+                if not state["done"]:
+                    print("  --no-restart: holding final open pose, closing the viewer window exits.")
+                state["done"] = True
+            else:
+                demo.loop_if_done()
+
+    with mujoco.viewer.launch_passive(state["env"].model, state["env"].data) as viewer:
+        i = 0
+        while viewer.is_running():
+            step_start = time.time()
+            if not state["done"]:
+                step(i)
+            viewer.sync()
+            i += 1
+            elapsed = time.time() - step_start
+            if elapsed < state["env"].model.opt.timestep * 5:
+                time.sleep(state["env"].model.opt.timestep * 5 - elapsed)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--stand", action="store_true")
@@ -669,6 +729,7 @@ def main():
     parser.add_argument("--grasp-safety-latch", action="store_true", help="show the 28th-session failed safety-event latch A/B condition (not canonical)")
     parser.add_argument("--diagonal-feasibility", action="store_true", help="show the current best SIZE_12 diagonal four-face STATIC candidate (frozen pose, not a live grasp attempt)")
     parser.add_argument("--whole-body-diagonal", action="store_true", help="run the SIZE_12 full-body (pelvis/legs/waist/arms) Stage W diagonal-reach static feasibility search and report the result")
+    parser.add_argument("--sharpa-hand-demo", action="store_true", help="DIAGNOSTIC ONLY: free-space Sharpa Wave bimanual open/close motion, no object contact, does not affect any Gate")
     parser.add_argument("--object-pos-x", type=float, default=0.27, help="object x position, meters from robot origin (--grasp only)")
     parser.add_argument("--object-half-size", type=float, default=None, help="object half-size, meters (--grasp only; default: GraspEnvConfig's own default, 0.06)")
     parser.add_argument("--hand-model", choices=["dex3", "sharpa"], default="dex3",
@@ -685,9 +746,9 @@ def main():
                               "geoms to match G1's own materials; upstream keeps the vendored look")
     args = parser.parse_args()
 
-    modes = [args.stand, args.posture, args.planar, args.grasp, args.grasp_safety_latch, args.diagonal_feasibility, args.whole_body_diagonal]
+    modes = [args.stand, args.posture, args.planar, args.grasp, args.grasp_safety_latch, args.diagonal_feasibility, args.whole_body_diagonal, args.sharpa_hand_demo]
     if sum(bool(m) for m in modes) != 1:
-        parser.error("pass exactly one of --stand / --posture / --planar / --grasp / --grasp-safety-latch / --diagonal-feasibility / --whole-body-diagonal")
+        parser.error("pass exactly one of --stand / --posture / --planar / --grasp / --grasp-safety-latch / --diagonal-feasibility / --whole-body-diagonal / --sharpa-hand-demo")
 
     if args.stand:
         mode_stand()
@@ -714,6 +775,8 @@ def main():
         mode_diagonal_feasibility()
     elif args.whole_body_diagonal:
         mode_whole_body_diagonal()
+    elif args.sharpa_hand_demo:
+        mode_sharpa_hand_demo(no_restart=args.no_restart, sharpa_visual_style=args.sharpa_visual_style)
 
 
 if __name__ == "__main__":

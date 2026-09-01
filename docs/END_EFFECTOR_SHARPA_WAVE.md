@@ -186,6 +186,9 @@ python3 scripts/audit_sharpa_mount.py
 
 # 실제 MuJoCo viewer (39차부터 공식 브랜치에 존재, 37차의 "미커밋" 기록은 낡음)
 DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --hand-model sharpa --no-restart
+
+# Free-space 손 open/close diagnostic (41차 세션, Gate와 무관)
+DISPLAY=:0 python3 scripts/view_whole_body.py --sharpa-hand-demo --no-restart
 ```
 
 > **[37차 세션 — Git 정리, 낡은 기록]** 이 문단이 최초 작성된 시점에는
@@ -215,3 +218,18 @@ DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --hand-model sharpa --no-r
 > Sharpa 외형은 G1 자체 material(metal/black)로 통일했다(물리 불변
 > 검증됨, 기본값 `sharpa_visual_style="upstream"`이나 viewer는
 > `g1`을 기본 사용). 상세: `docs/history/PHASE4_GRASP_SESSION_40.md`.
+
+> **[41차 세션 — 육안으로 확인 가능한 색상/자세 완성]** 40차의 색상
+> 수정이 사용자에게 "안 바뀐 것처럼" 보였다(rgba 근사값이 라벤더와
+> 너무 비슷). `_apply_sharpa_visual_style()`을 실제 G1 material
+> ("black"/"metal") **참조**로 재작성 — 손등/손바닥이 뚜렷한 검은색으로
+> 바뀜(material ID로 검증, rgba 근사 아님). `NATURAL_ARM_LIFT`(Cartesian
+> IK, redundant arm이 팔꿈치 위/뒤 분기를 임의로 선택 — "나루토" 자세의
+> 실제 원인)를 제거하고, 직접 joint target 기반 `ARM_LATERAL_CLEARANCE`
+> (3후보 중 실측 선정, self-collision 0건, elbow 항상 어깨 아래) →
+> `FOREARM_FORWARD_REACH`(6-waypoint, ori_task_weight=0으로 waist/wrist
+> hard-limit 문제 해소) → `FOREARM_DESCEND`로 교체. **Natural Posture
+> Gate 통과**. 공식 기본 경로(Precontact Tracking Gate)는 39차와 동일
+> 지점에서 무회귀·무개선(이번 세션 범위 밖). Free-space 손 open/close
+> diagnostic(`--sharpa-hand-demo`) 신규. 상세:
+> `docs/history/PHASE4_GRASP_SESSION_41.md`.
