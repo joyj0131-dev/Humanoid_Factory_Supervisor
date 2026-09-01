@@ -281,6 +281,31 @@ class SharpaGraspEnv(gym.Env):
             force_sum += -force_on_geom2 if b1 == obj_body else force_on_geom2
         return peak, float(np.linalg.norm(force_sum))
 
+    def _torso_arm_collision_force(self) -> float:
+        """[Session 40] G1's own torso/upper-body vs either arm/wrist/hand
+        -- a category the existing hand-hand and proximal-object checks
+        never covered. Added after the object-facing wrist orientation
+        change was found (causally, A/B) to drive the right wrist into
+        torso_link at up to 109N (docs/history/PHASE4_GRASP_SESSION_40.md)."""
+        model, data = self.model, self.data
+        peak = 0.0
+        for i in range(data.ncon):
+            c = data.contact[i]
+            b1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom1]) or ""
+            b2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom2]) or ""
+            arm_prefixes = ("left_left_", "right_right_", "left_wrist", "right_wrist",
+                             "left_elbow", "right_elbow", "left_shoulder", "right_shoulder")
+            is_torso_arm = (
+                ("torso" in b1 and any(b2.startswith(p) or p in b2 for p in arm_prefixes)) or
+                ("torso" in b2 and any(b1.startswith(p) or p in b1 for p in arm_prefixes))
+            )
+            if not is_torso_arm:
+                continue
+            force6 = np.zeros(6)
+            mujoco.mj_contactForce(model, data, i, force6)
+            peak = max(peak, float(np.linalg.norm(force6[:3])))
+        return peak
+
     def _hand_hand_contact_force(self) -> float:
         model, data = self.model, self.data
         peak = 0.0

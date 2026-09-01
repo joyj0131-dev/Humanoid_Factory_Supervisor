@@ -12,8 +12,8 @@
 > 있다. 역사적 시작점은 계속 `d038c5b`다. 상세 경계/브랜치/태그 표는
 > [`GIT_WORKFLOW.md`](GIT_WORKFLOW.md) 참고. 세션별 상세 기록은
 > `docs/history/PHASE4_GRASP_SESSION_35.md`/`_36.md`/
-> `_37_GIT_CLEANUP.md`/`_38_WORKTREE_HYGIENE.md`/`_39.md`(전부 로컬
-> 전용, `.gitignore`).
+> `_37_GIT_CLEANUP.md`/`_38_WORKTREE_HYGIENE.md`/`_39.md`/`_40.md`
+> (전부 로컬 전용, `.gitignore`).
 
 ## 선택 이유
 
@@ -180,16 +180,38 @@ python3 scripts/test_sharpa_bimanual_grasp.py
 
 # FINGERTIP_PRECONTACT IK-vs-physics gap 계층 분해 진단 (39차 세션)
 python3 scripts/diagnose_precontact_gap.py
+
+# Sharpa mount(_with_wrist vs _with_flange) 감사·A/B (40차 세션)
+python3 scripts/audit_sharpa_mount.py
+
+# 실제 MuJoCo viewer (39차부터 공식 브랜치에 존재, 37차의 "미커밋" 기록은 낡음)
+DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --hand-model sharpa --no-restart
 ```
 
-> **[37차 세션 — Git 정리]** `--hand-model sharpa --grasp-mode
-> {bimanual,single}` viewer 플래그와 `mode_grasp_sharpa()`는
-> **`phase4.5/sharpa-wave`(공식 브랜치)에는 아직 커밋되어 있지 않다.**
-> 이 변경은 원본 workspace(`/home/youngjin/Mujoco_humanoid`)의 로컬
-> `wip/phase4.5-viewer-rectangular` 브랜치에만 존재하며, 사용자의
-> 10×15×10cm 직육면체 실험(`--object-size`/`--no-restart`/force 진단,
-> Dex3 `mode_grasp` 대상)과 같은 파일(`scripts/view_whole_body.py`)에
-> 라인 단위로 얽혀 있어 이번 세션에서 안전하게 분리해 커밋할 수
-> 없었다(보고만 함, 커밋하지 않음). 공식 브랜치에서 이 viewer 기능이
-> 필요하면 clean branch에서 독립적으로 재구현·검증한다 — WIP 변경을
-> 통째로 복사하지 않는다.
+> **[37차 세션 — Git 정리, 낡은 기록]** 이 문단이 최초 작성된 시점에는
+> `--hand-model sharpa`/`mode_grasp_sharpa()`가 WIP 브랜치에만
+> 있었다. **39차 세션(커밋 `5afdab2`)에 공식 브랜치로 독립
+> 재구현·커밋됐고, 40차 세션이 `--sharpa-mount`/`--sharpa-visual-style`을
+> 추가했다** — 더 이상 미커밋 상태가 아니다. WIP의 10×15×10cm
+> 직육면체 실험은 여전히 WIP 브랜치 전용으로 남아 있다(가져오지 않음).
+
+> **[40차 세션 — mount 감사, object-facing orientation(opt-in),
+> self-collision 안전장치, 외형 통일]** `_with_wrist` vs `_with_flange`
+> mount는 실측상 사실상 동일함을 확정했다(palm 위치 차이 0.000mm,
+> fingertip reach 차이 0.48mm — 기본값 `sharpa_mount="wrist"` 유지).
+> "부자연스러운 자세"의 실제 원인은 mount가 아니라 WRIST_ALIGN이
+> orientation "안정성"만 확인하고 "정확성"(물체를 향하는지)은 확인하지
+> 않았던 것이었다(index/middle fingertip이 물체에서 12~21cm 벗어남을
+> 실측). 명시적 object-facing target(`_object_facing_R`)을 구현했으나,
+> **causal A/B로 이 target이 `torso_link<->right_wrist_pitch_link`
+> self-collision(최대 113N)을 유발함을 확정**했다 — 39차가 확정한
+> 것과 같은 범주(steady-state actuator physical tracking error)가
+> orientation에도 적용됨을 보여준다. 이 문제를 이번 세션에서 완전히
+> 해결하지 못해, `BimanualGraspConfig.object_facing_orientation`
+> 플래그(기본값 **False**)로 게이팅해 공식 기본 동작(39차 검증 결과)은
+> 전혀 변경하지 않았다 — opt-in으로만 존재한다. 새로운
+> `SharpaGraspEnv._torso_arm_collision_force()` 안전장치는 플래그와
+> 무관하게 항상 계산되며, 39차 기본 경로에서는 0N임을 확인했다(무회귀).
+> Sharpa 외형은 G1 자체 material(metal/black)로 통일했다(물리 불변
+> 검증됨, 기본값 `sharpa_visual_style="upstream"`이나 viewer는
+> `g1`을 기본 사용). 상세: `docs/history/PHASE4_GRASP_SESSION_40.md`.

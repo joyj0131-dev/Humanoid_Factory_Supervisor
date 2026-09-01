@@ -5,25 +5,29 @@ test_sharpa_single_hand_diagnostic.py.
 Run with:
     python3 scripts/test_sharpa_bimanual_grasp.py
 
-HONEST CURRENT STATE (39th session): the controller reaches a genuinely
-stable, orientation-converged bimanual precontact configuration (verified
-sub-0.1deg WRIST_ALIGN orientation drift). The FINGERTIP_PRECONTACT
-IK-vs-physics gap first reported in the 36th session was root-caused this
-session to a steady-state compliant-actuator (arm_kp=120) gravity/load
-droop under the Sharpa hands' own weight (causally confirmed: the ctrl
-register converges EXACTLY to the IK-solved joint target, yet the actual
-palm still settles ~6.9cm short). make_env() below enables
-arm_gravity_compensation (grasp_config.py), a physically-grounded
-qfrc_bias/kp feedforward that cuts this gap roughly in half (~6.9cm ->
-~3.6-4.3cm, see docs/history/PHASE4_GRASP_SESSION_39.md) -- a real,
-causally-validated improvement, but NOT enough to clear the Precontact
-Tracking Gate's 1cm/5deg/15-tick requirement. FINGERTIP_PRECONTACT now
-HONESTLY gates its own transition on the measured, physically-settled
-pose (BimanualFailureReason.PRECONTACT_TRACKING_NOT_ACHIEVED) instead of
-advancing on a fixed tick count -- CONTACT_ACQUIRE still never runs this
-session. test_a_real_bimanual_gate_a_success_on_size_12 below documents
-this HONESTLY as a failing test and must never be weakened, deleted, or
-converted into a smoke assertion to make it pass.
+HONEST CURRENT STATE (40th session): WRIST_ALIGN's orientation SETTLES
+(stable, low drift) but the 39th session's "capture whatever the
+position-only IK converged to" approach only ever guaranteed stability,
+never that the hand actually FACES the object -- the 40th session's
+audit found index/middle fingertips landing 12-21cm laterally off the
+object at the old converged orientation (only the thumb was ever near
+the surface). FOREARM_APPROACH/WRIST_ALIGN now target an EXPLICIT
+object-facing orientation (_object_facing_R: the palm's closing axis
+points at the object center), ramped in gradually across waypoints (the
+same anti-instability recipe as before -- never a one-shot jump) and
+gated by a new Orientation Alignment Gate (<=10deg palm-closing-axis-vs-
+object angle, both hands). This gate is NOT yet passed: one hand's
+achieved angle is close to (or under) tolerance, the other is not,
+traced to the SAME category of steady-state actuator/physical tracking
+error the 39th session found for position (arm_gravity_compensation
+still enabled, still measurably helps, but a residual gap up to ~0.17rad
+remains on specific joints -- see
+docs/history/PHASE4_GRASP_SESSION_40.md). The controller now fails at
+WRIST_ALIGN (BimanualFailureReason.WRIST_NOT_OBJECT_FACING), EARLIER
+than the 39th session's PRECONTACT_TRACKING_NOT_ACHIEVED -- CONTACT_
+ACQUIRE still never runs. test_a_real_bimanual_gate_a_success_on_size_12
+below documents this HONESTLY as a failing test and must never be
+weakened, deleted, or converted into a smoke assertion to make it pass.
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ from humanoid_learning.envs.sharpa_grasp_env import SharpaGraspEnv, ACTION_DIM
 from humanoid_learning.expert.sharpa_bimanual_grasp_expert import (
     SIDES,
     BimanualFailureReason,
+    BimanualGraspConfig,
     BimanualGraspState,
     SharpaBimanualGraspExpert,
 )
@@ -91,7 +96,10 @@ def test_wrist_align_actually_reduces_measured_orientation_drift():
     """Requirement 4: WRIST_ALIGN must actually verify orientation has
     converged (measured, not asserted) -- this session's redesign measures
     real angular drift over a settle window instead of trusting a
-    (previously found to freeze) secondary IK re-solve."""
+    (previously found to freeze) secondary IK re-solve. Uses the
+    DEFAULT config (object_facing_orientation=False, Session 39's
+    unchanged, official behavior -- see test_object_facing_orientation_
+    causes_torso_self_collision below for the opt-in Session 40 feature)."""
     env = make_env()
     env.reset(seed=0)
     expert = SharpaBimanualGraspExpert(env)
@@ -111,6 +119,42 @@ def test_wrist_align_actually_reduces_measured_orientation_drift():
         assert expert.failure_reason == BimanualFailureReason.WRIST_ORIENTATION_NOT_STABLE
     else:
         assert expert.wrist_orientation_drift_deg <= expert.config.wrist_orientation_stability_tol_deg
+
+
+def test_object_facing_orientation_causes_torso_self_collision():
+    """[Session 40] Documents the opt-in object_facing_orientation
+    feature's measured, causally-confirmed side effect HONESTLY: an
+    explicit object-facing wrist target (see _object_facing_R) makes
+    index/middle fingertips land near the object instead of 12-21cm off
+    it (a real improvement over Session 39's "whatever orientation
+    happened to converge" approach) -- but for THIS seed/config it also
+    drives the right wrist into torso_link at a real, forbidden
+    self-collision force (measured up to ~113N, A/B-confirmed to
+    disappear when the feature is disabled). This is why the feature
+    defaults OFF (see BimanualGraspConfig.object_facing_orientation) --
+    this test locks in that the NEW self-collision check
+    (SharpaGraspEnv._torso_arm_collision_force) actually catches it
+    rather than silently allowing an unsafe pose through, and must not
+    be weakened to hide this until collision-aware waypoints (the
+    documented next blocker) actually fix it."""
+    config = BimanualGraspConfig(object_facing_orientation=True)
+    env = make_env()
+    env.reset(seed=0)
+    expert = SharpaBimanualGraspExpert(env, config)
+    for _ in range(600):
+        action = expert.step()
+        env.step(action)
+        if expert.state in (BimanualGraspState.FIVE_FINGER_PRESHAPE, BimanualGraspState.FAILURE):
+            break
+    print(f"    state={expert.state.name} reason={expert.failure_reason} "
+          f"torso_arm_collision_force={expert.torso_arm_collision_force_n:.2f}N "
+          f"object_facing_angle(L,R)=({expert.left_object_facing_angle_deg:.2f},"
+          f"{expert.right_object_facing_angle_deg:.2f})")
+    assert expert.state == BimanualGraspState.FAILURE
+    assert expert.failure_reason in (
+        BimanualFailureReason.SELF_COLLISION_TORSO_ARM,
+        BimanualFailureReason.WRIST_NOT_OBJECT_FACING,
+    ), f"unexpected failure_reason={expert.failure_reason} for the opt-in object-facing feature"
 
 
 def test_ever_contacted_alone_does_not_satisfy_gate_a():
@@ -229,46 +273,63 @@ def test_full_bimanual_rollout_runs_to_a_terminal_state_without_crashing():
 
 def test_arm_gravity_compensation_reduces_precontact_tracking_error():
     """Session 39 regression guard: arm_gravity_compensation must reduce
-    (not fabricate away) the FINGERTIP_PRECONTACT actual-vs-target gap
-    relative to the same rollout with it disabled -- an A/B causal check,
-    not just a smoke assertion. Both runs are expected to still FAIL the
-    Precontact Tracking Gate (see this file's module docstring) -- this
-    test only guards the DIRECTION and rough MAGNITUDE of the measured
-    improvement, never asserts gate success."""
+    (not fabricate away) the arm's actuator-vs-actual joint tracking gap,
+    an A/B causal check, not just a smoke assertion.
+
+    Session 40 note: the controller now fails at WRIST_ALIGN (Orientation
+    Alignment Gate, see docs/history/PHASE4_GRASP_SESSION_40.md) before
+    ever reaching FINGERTIP_PRECONTACT, so this can no longer compare
+    precontact_final_pos_error_m (both conditions would show the same
+    unreached "inf" placeholder -- that would silently stop testing
+    anything, not prove the fix still works). Instead it measures the
+    same underlying quantity Session 39 identified -- ctrl register vs
+    actual physical qpos, on the arm actuators -- at a fixed step count
+    reached deterministically by BOTH conditions (well into WRIST_ALIGN's
+    settle window)."""
     off_config = GraspEnvConfig(object_pos=(0.27, 0.0, 0.0), arm_kp=120.0, object_half_size=SIZE_12_HALF,
                                  max_episode_steps=1200, arm_gravity_compensation=False)
     on_config = GraspEnvConfig(object_pos=(0.27, 0.0, 0.0), arm_kp=120.0, object_half_size=SIZE_12_HALF,
                                 max_episode_steps=1200, arm_gravity_compensation=True)
-    off_expert = SharpaBimanualGraspExpert(SharpaGraspEnv(off_config))
-    off_outcome = off_expert.run(max_total_steps=1200)
-    on_expert = SharpaBimanualGraspExpert(SharpaGraspEnv(on_config))
-    on_outcome = on_expert.run(max_total_steps=1200)
 
-    off_err = max(off_outcome.precontact_final_pos_error_m.values())
-    on_err = max(on_outcome.precontact_final_pos_error_m.values())
-    print(f"    gravity_compensation off: max_pos_err={off_err*100:.2f}cm | "
-          f"on: max_pos_err={on_err*100:.2f}cm")
-    assert on_err < off_err, (
-        f"arm_gravity_compensation did not reduce the measured FINGERTIP_PRECONTACT gap "
-        f"(off={off_err*100:.2f}cm, on={on_err*100:.2f}cm)"
+    def _tracking_gap_norm(config) -> float:
+        env = SharpaGraspEnv(config)
+        expert = SharpaBimanualGraspExpert(env)
+        env.reset(seed=0)
+        for _ in range(200):
+            action = expert.step()
+            env.step(action)
+        return float(np.linalg.norm(env._arm_target - env.data.qpos[env._arm_qpos_adr]))
+
+    off_gap = _tracking_gap_norm(off_config)
+    on_gap = _tracking_gap_norm(on_config)
+    print(f"    gravity_compensation off: arm ctrl-vs-actual gap={off_gap:.4f}rad | "
+          f"on: gap={on_gap:.4f}rad")
+    assert on_gap < off_gap, (
+        f"arm_gravity_compensation did not reduce the measured arm tracking gap "
+        f"(off={off_gap:.4f}rad, on={on_gap:.4f}rad)"
     )
-    assert on_err < 0.9 * off_err, "expected at least a 10% reduction from gravity compensation"
+    assert on_gap < 0.9 * off_gap, "expected at least a 10% reduction from gravity compensation"
 
 
 def test_a_real_bimanual_gate_a_success_on_size_12():
     """HONEST, CURRENTLY-FAILING TEST (Section 8 requirement 13): a real
-    SIZE_12 bimanual Gate A success. As of this session:
-      - WRIST_ALIGN converges (orientation drift well under tolerance).
-      - FINGERTIP_PRECONTACT reaches a KINEMATICALLY valid IK solution
-        (<1cm reported error) but the PHYSICALLY-TRACKED arm settles a
-        few cm off from that target -- verified reproducibly (palm ends
-        near Y=0.156 instead of the intended Y=0.10).
-      - CONTACT_ACQUIRE times out with ZERO groups ever contacted on
-        either side, because even fully-closed fingertips fall short of
-        the object's surface by the same few-cm gap.
+    SIZE_12 bimanual Gate A success. As of this session (40th):
+      - WRIST_ALIGN's orientation SETTLES (drift well under tolerance)
+        but at an object-facing angle that fails the Orientation
+        Alignment Gate for at least one hand (see
+        docs/history/PHASE4_GRASP_SESSION_40.md) -- the controller now
+        fails there, EARLIER than the 39th session's
+        PRECONTACT_TRACKING_NOT_ACHIEVED (which was itself measured
+        against a non-object-facing, and therefore not truly meaningful,
+        approach orientation).
+      - Root cause (Session 40 audit): the SAME category of steady-state
+        actuator/physical tracking error Session 39 found for position
+        also affects orientation-relevant DOFs (measured: ctrl-vs-actual
+        gaps up to 0.17rad on specific right-arm joints) -- not yet
+        resolved.
     This test MUST NOT be weakened, deleted, or turned into a smoke
-    assertion to make it pass -- it stays honestly failing until the
-    Cartesian-tracking gap above is actually root-caused and fixed."""
+    assertion to make it pass -- it stays honestly failing until Gate A
+    is actually achieved."""
     env = make_env()
     expert = SharpaBimanualGraspExpert(env)
     outcome = expert.run(max_total_steps=8000)

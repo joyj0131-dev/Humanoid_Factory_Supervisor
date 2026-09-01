@@ -68,8 +68,58 @@ import numpy as np
 from humanoid_learning.envs import sharpa_config as sc
 from humanoid_learning.envs import task_config as tc
 from humanoid_learning.envs import whole_body_config as wbc
+from humanoid_learning.expert import pose_ik
 from humanoid_learning.expert.coupled_ik import CoupledBilateralIK
 from humanoid_learning.expert.grasp_expert import sim_time_to_steps
+
+
+def _object_facing_R(side: str, palm_pos: np.ndarray, obj_pos: np.ndarray) -> np.ndarray:
+    """[Session 40] Explicit object-facing wrist target, replacing the
+    prior "capture whatever the position-only IK converged to" approach
+    (which only guaranteed orientation STABILITY, never CORRECTNESS --
+    Session 40's audit found index/middle fingertips landing 12-21cm
+    laterally off the object at the old converged orientation, only the
+    thumb near the surface). Uses the EXISTING, already-validated palm-
+    frame axis convention (whole_body_config.py: site local +X=approach,
+    -Y(left)/+Y(right)=closing, Z=lateral) -- the CLOSING axis is set to
+    point from the palm straight at the object center; the one remaining
+    free rotation (about the closing axis) is resolved by keeping the
+    lateral axis close to world-up (a natural, non-twisted approach
+    rather than an arbitrary roll)."""
+    closing_dir = obj_pos - palm_pos
+    n = np.linalg.norm(closing_dir)
+    closing_dir = closing_dir / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
+    y_col = -closing_dir if side == "left" else closing_dir
+    world_up = np.array([0.0, 0.0, 1.0])
+    ref = world_up if abs(np.dot(y_col, world_up)) < 0.95 else np.array([1.0, 0.0, 0.0])
+    z_col = np.cross(y_col, ref)
+    z_col /= np.linalg.norm(z_col)
+    x_col = np.cross(y_col, z_col)
+    x_col /= np.linalg.norm(x_col)
+    return np.column_stack([x_col, y_col, z_col])
+
+
+def _object_facing_angle_deg(side: str, palm_R: np.ndarray, palm_pos: np.ndarray, obj_pos: np.ndarray) -> float:
+    """Angle between the palm's ACTUAL closing axis and the true
+    palm->object direction -- the Orientation Alignment Gate metric
+    (Session 40), independent of and in addition to WRIST_ALIGN's own
+    drift-stability check."""
+    closing_dir = obj_pos - palm_pos
+    n = np.linalg.norm(closing_dir)
+    if n < 1e-9:
+        return 0.0
+    closing_dir = closing_dir / n
+    actual_closing = -palm_R[:, 1] if side == "left" else palm_R[:, 1]
+    cos_ang = np.clip(np.dot(actual_closing, closing_dir), -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos_ang)))
+
+
+def _slerp_R(R_a: np.ndarray, R_b: np.ndarray, frac: float) -> np.ndarray:
+    """Geodesic SO(3) interpolation from R_a (frac=0) to R_b (frac=1),
+    world-frame axis-angle (matches pose_ik.orientation_error's own
+    convention, reused here instead of inventing a new one)."""
+    err = pose_ik.orientation_error(R_a, R_b)
+    return pose_ik.so3_exp(frac * err) @ R_a
 
 SIDES = ("left", "right")
 Y_SIGN = {"left": 1.0, "right": -1.0}
@@ -109,6 +159,8 @@ class BimanualFailureReason(Enum):
     OBJECT_ANGULAR_VELOCITY_EXCEEDED = auto()
     LIFT_FAILED = auto()
     PRECONTACT_TRACKING_NOT_ACHIEVED = auto()
+    WRIST_NOT_OBJECT_FACING = auto()
+    SELF_COLLISION_TORSO_ARM = auto()
 
 
 @dataclass
@@ -159,6 +211,27 @@ class BimanualGraspConfig:
     # measures the actual settled pose and gates the transition on it.
     precontact_ori_tol_deg: float = 5.0  # Precontact Tracking Gate orientation tolerance (Session 39 spec)
     precontact_stable_streak_required: int = 15  # Precontact Tracking Gate: consecutive ticks required
+    # [Session 40] Orientation Alignment Gate: explicit object-facing
+    # wrist target (see _object_facing_R), ramped in gradually across
+    # FOREARM_APPROACH_ORI_WAYPOINTS waypoints (same recipe as
+    # FINGERTIP_PRECONTACT's WAYPOINT_COUNT interpolation -- a single
+    # hard jump to an independently-chosen orientation was found in the
+    # 36th session to destabilize the low-inertia wrist joints).
+    object_facing_angle_tol_deg: float = 10.0  # Orientation Alignment Gate: palm-closing-axis vs palm->object angle
+    # [Session 40] Default False: PRESERVES the 39th session's official
+    # tested behavior exactly (FOREARM_APPROACH soft-anchors to whatever
+    # orientation NATURAL_ARM_LIFT converged to; WRIST_ALIGN only checks
+    # drift stability). True enables the object-facing orientation target
+    # + Orientation Alignment Gate (see _object_facing_R / module
+    # docstring) -- causally confirmed to measurably improve WHERE the
+    # hand ends up (index/middle fingertips no longer 12-21cm off the
+    # object) but ALSO causally confirmed (A/B) to drive the right wrist
+    # into torso_link at up to 113N, a real forbidden self-collision this
+    # session did not have time to resolve (collision-aware waypoints /
+    # shoulder-elbow posture seeding, as originally scoped, are NOT yet
+    # implemented). Kept default OFF and opt-in until that is fixed --
+    # see docs/history/PHASE4_GRASP_SESSION_40.md's "next single blocker".
+    object_facing_orientation: bool = False
 
 
 @dataclass
@@ -203,6 +276,16 @@ class SharpaBimanualGraspExpert:
     APPROACH_STEPS = 200
     WAYPOINT_COUNT = 4
     WAYPOINT_TICKS = 60
+    # [Session 40] FOREARM_APPROACH orientation ramp: APPROACH_STEPS split
+    # into this many equal waypoints, each re-solving the SAME (fixed)
+    # approach position but SLERPing the orientation target a bit further
+    # from the entry orientation toward _object_facing_R, with
+    # ori_task_weight ramped from a small starting value to a moderate
+    # ending value across the same waypoints -- gradual, never a one-shot
+    # jump (see module docstring's wrist-instability finding).
+    APPROACH_ORI_WAYPOINTS = 4
+    APPROACH_ORI_WEIGHT_START = 0.05
+    APPROACH_ORI_WEIGHT_END = 1.0
 
     def __init__(self, env, config: BimanualGraspConfig | None = None):
         self.env = env
@@ -232,6 +315,9 @@ class SharpaBimanualGraspExpert:
         self._max_bilateral_streak = 0
         self._locked_R: dict | None = None  # set at WRIST_ALIGN entry, see module docstring
         self.wrist_orientation_drift_deg: float = float("inf")
+        self.left_object_facing_angle_deg: float = float("inf")
+        self.right_object_facing_angle_deg: float = float("inf")
+        self.torso_arm_collision_force_n: float = 0.0
         self._precontact_stable_streak = 0
         self._max_precontact_stable_streak = 0
         self._precontact_final_pos_error = {"left": float("inf"), "right": float("inf")}
@@ -457,25 +543,57 @@ class SharpaBimanualGraspExpert:
                 self._advance(BimanualGraspState.FOREARM_APPROACH)
 
         elif state == BimanualGraspState.FOREARM_APPROACH:
-            if self._state_step == 0:
-                # [This session's real root-cause fix] targeting a FIXED
-                # np.eye(3) orientation at ori_task_weight=0.0 (nominally
-                # "orientation ignored") let the position-redundant DLS
-                # solve drift wrist_pitch into a configuration where the
-                # closed-loop PD (kp=120, dof_damping=0, armature=0.01 --
-                # see grasp_config.py/model_builder.py, both protected)
-                # is genuinely dynamically unstable: qvel diverges to
-                # >3rad/s within ~50 ticks regardless of ramp speed, joint
-                # margin, or null-space anchor (all independently tried
-                # and all failed this session), and the joint is flung to
-                # its own hard limit every time. Soft-anchoring to the
-                # CURRENT achieved orientation at ori_task_weight=0.1 --
-                # the exact recipe NATURAL_ARM_LIFT already used
-                # successfully one state earlier -- removes the
-                # instability entirely (verified: wrist_pitch converges
-                # cleanly, max excursion 0.5rad, matching NATURAL_ARM_LIFT's
-                # own already-stable configuration instead of drifting
-                # into an unrelated one).
+            # [Session 39 root-cause fix, kept] a FIXED np.eye(3)
+            # orientation at ori_task_weight=0.0 let the position-
+            # redundant DLS solve drift wrist_pitch into a genuinely
+            # dynamically-unstable configuration (armature=0.01,
+            # dof_damping=0). Soft-anchoring toward a target near the
+            # CURRENT orientation avoids this.
+            # [Session 40 addition] "near current" used to mean the exact
+            # current orientation held fixed for all 200 ticks -- this
+            # only guaranteed STABILITY, not that the hand ever ends up
+            # facing the object (Session 40 audit: index/middle
+            # fingertips landed 12-21cm laterally off the object at
+            # FINGERTIP_PRECONTACT with the old fixed-current-orientation
+            # approach). Now the SAME approach position target is re-
+            # solved at APPROACH_ORI_WAYPOINTS waypoints, SLERPing the
+            # orientation target from the entry orientation toward
+            # _object_facing_R and ramping ori_task_weight up gradually
+            # (never a one-shot jump to an independently-chosen
+            # orientation, the exact failure mode that caused the
+            # original instability).
+            if cfg.object_facing_orientation:
+                if self._state_step == 0:
+                    self._approach_start_R = {s: self.env.palm_pose(s)[1].copy() for s in SIDES}
+                    targets = self._mirrored_targets(cfg.approach_standoff_m, cfg.approach_height_m, cfg.approach_y_offset_m)
+                    obj_pos = self._object_pos()
+                    self._approach_target_R = {
+                        s: _object_facing_R(s, targets[s], obj_pos) for s in SIDES
+                    }
+                    self._approach_waypoint = 0
+                ticks_per_wp = self.APPROACH_STEPS // self.APPROACH_ORI_WAYPOINTS
+                if self._state_step % ticks_per_wp == 0 and self._approach_waypoint < self.APPROACH_ORI_WAYPOINTS:
+                    self._approach_waypoint += 1
+                    frac = self._approach_waypoint / self.APPROACH_ORI_WAYPOINTS
+                    ori_w = self.APPROACH_ORI_WEIGHT_START + frac * (self.APPROACH_ORI_WEIGHT_END - self.APPROACH_ORI_WEIGHT_START)
+                    targets = self._mirrored_targets(cfg.approach_standoff_m, cfg.approach_height_m, cfg.approach_y_offset_m)
+                    R = {s: _slerp_R(self._approach_start_R[s], self._approach_target_R[s], frac) for s in SIDES}
+                    # Only the FINAL waypoint requires orientation convergence
+                    # (not just position) -- require_orientation=False lets
+                    # solve() stop the instant POSITION converges, which can
+                    # leave orientation error at an arbitrary path-dependent
+                    # value rather than the best the solver could reach; the
+                    # last waypoint spends its full iteration budget closing
+                    # orientation too (still bounded by max_iterations=200,
+                    # still line-search-protected -- not a raw one-shot jump).
+                    final_wp = self._approach_waypoint >= self.APPROACH_ORI_WAYPOINTS
+                    result = self._solve_both(targets, R, require_orientation=final_wp, ori_task_weight=ori_w)
+                    self._apply_ik_result(result)
+            elif self._state_step == 0:
+                # [Session 39 behavior, preserved as the default -- see
+                # BimanualGraspConfig.object_facing_orientation's
+                # docstring] soft-anchor to whatever orientation is
+                # CURRENTLY held, held fixed for the whole state.
                 targets = self._mirrored_targets(cfg.approach_standoff_m, cfg.approach_height_m, cfg.approach_y_offset_m)
                 lR = self.env.palm_pose("left")[1].copy()
                 rR = self.env.palm_pose("right")[1].copy()
@@ -525,6 +643,41 @@ class SharpaBimanualGraspExpert:
                 self._locked_R = {"left": lR, "right": rR}
                 if self.wrist_orientation_drift_deg > cfg.wrist_orientation_stability_tol_deg:
                     self._fail(BimanualFailureReason.WRIST_ORIENTATION_NOT_STABLE)
+                    return action
+                # [Session 40] torso<->arm self-collision check -- added
+                # after the object-facing orientation change below was
+                # causally found (A/B: disabling it removes the contact
+                # entirely) to drive the right wrist into torso_link at
+                # up to 109N. Neither the existing hand-hand nor
+                # proximal-object checks cover this category. Must be
+                # checked BEFORE declaring the orientation gate passed --
+                # a "stable and object-facing" orientation that only gets
+                # there by wedging the arm into the torso is not a pass.
+                self.torso_arm_collision_force_n = self.env._torso_arm_collision_force()
+                if self.torso_arm_collision_force_n > cfg.hand_hand_force_limit_n:
+                    self._fail(BimanualFailureReason.SELF_COLLISION_TORSO_ARM)
+                    return action
+                # [Session 40] Orientation Alignment Gate -- stability
+                # alone (above) does not mean the palm is actually facing
+                # the object (Session 40 audit finding). Measure the real
+                # palm-closing-axis-vs-object angle for BOTH hands here;
+                # a stable-but-wrong orientation must not silently pass.
+                # Gated behind object_facing_orientation (default False,
+                # see BimanualGraspConfig docstring): the metric itself is
+                # always computed/reported for visibility, but only
+                # ENFORCED as a pass/fail gate when the caller has opted
+                # into the (not yet self-collision-safe) object-facing
+                # target this measures against.
+                obj_pos = self._object_pos()
+                left_pos = self.env.palm_pose("left")[0]
+                right_pos = self.env.palm_pose("right")[0]
+                self.left_object_facing_angle_deg = _object_facing_angle_deg("left", lR, left_pos, obj_pos)
+                self.right_object_facing_angle_deg = _object_facing_angle_deg("right", rR, right_pos, obj_pos)
+                if cfg.object_facing_orientation and (
+                    self.left_object_facing_angle_deg > cfg.object_facing_angle_tol_deg
+                    or self.right_object_facing_angle_deg > cfg.object_facing_angle_tol_deg
+                ):
+                    self._fail(BimanualFailureReason.WRIST_NOT_OBJECT_FACING)
                     return action
                 self._advance(BimanualGraspState.FIVE_FINGER_PRESHAPE)
 
