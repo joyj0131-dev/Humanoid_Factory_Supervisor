@@ -12,8 +12,16 @@
 > 있다. 역사적 시작점은 계속 `d038c5b`다. 상세 경계/브랜치/태그 표는
 > [`GIT_WORKFLOW.md`](GIT_WORKFLOW.md) 참고. 세션별 상세 기록은
 > `docs/history/PHASE4_GRASP_SESSION_35.md`/`_36.md`/
-> `_37_GIT_CLEANUP.md`/`_38_WORKTREE_HYGIENE.md`/`_39.md`/`_40.md`
+> `_37_GIT_CLEANUP.md`/`_38_WORKTREE_HYGIENE.md`/`_39.md`/`_40.md`/
+> `_41.md`/`_42.md`
 > (전부 로컬 전용, `.gitignore`).
+>
+> **현재 요약(42차 기준):** mount 통합과 Natural Posture Gate는 PASS다.
+> `ARM_LATERAL_CLEARANCE`의 엄지-테이블 충돌로 Wrist Transition Gate가
+> `5.12rad/s > 2.0rad/s` 상태이며, Precontact Tracking Gate와 Gate A는
+> 아직 FAIL이다. 다음 단일 blocker는 속도 튜닝이 아니라 이 접촉 경로의
+> 기하학적 제거다. 최신 간결 상태는 `PROJECT_CONTEXT.md` Section 20,
+> 공개 로드맵은 [`PHASE_ROADMAP.md`](PHASE_ROADMAP.md)를 따른다.
 
 ## 선택 이유
 
