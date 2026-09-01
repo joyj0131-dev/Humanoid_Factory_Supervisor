@@ -48,6 +48,8 @@ results/manifold_grasp_collision_aware_ab.json
 results/precontact_gap/
 results/session41_visual_before/
 results/session41_visual_after/
+results/session42_before/
+results/session42_after/
 
 # Local-only detailed session history (docs/ itself stays tracked for
 # future public documentation -- only the internal history archive is

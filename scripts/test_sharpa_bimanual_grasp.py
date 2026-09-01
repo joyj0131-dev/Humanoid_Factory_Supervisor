@@ -89,6 +89,43 @@ def test_bimanual_targets_are_mirrored_never_crossing_midline():
     print(f"    left target y={targets['left'][1]:.3f}, right target y={targets['right'][1]:.3f} -- mirrored, no midline crossing")
 
 
+def test_arm_lateral_clearance_wrist_transition_gate():
+    """[Session 42] Wrist Transition Gate (an explicit engineering safety
+    target for THIS approach trajectory, NOT a Gate A criterion): raw
+    (unfiltered) wrist |qvel| during ARM_LATERAL_CLEARANCE.
+
+    HONEST CURRENT STATE: substep-level tracing
+    (scripts/diagnose_clearance_wrist_spike.py) found the 41st session's
+    abrupt-step joint target caused a real thumb<->table collision
+    impulse (qfrc_constraint jumping to 12-23 N*m in a single tick) that
+    couples into the zero-damping wrist joints. A quintic minimum-jerk
+    trajectory (zero velocity/acceleration at both ends, replacing the
+    abrupt step) causally reduces peak raw wrist qvel from ~8.07rad/s to
+    ~5.1rad/s (see docs/history/PHASE4_GRASP_SESSION_42.md) -- a real,
+    measured improvement -- but does NOT fully reach the 2.0rad/s target,
+    because the underlying thumb<->table graze itself (a geometric path
+    property, confirmed NOT resolved by slowing the trajectory further)
+    is not eliminated, only its coupling into wrist velocity is damped.
+    This test locks in the IMPROVEMENT direction/magnitude, not a false
+    Gate pass -- it must not be weakened into asserting <=2.0rad/s until
+    that is actually achieved."""
+    env = make_env()
+    env.reset(seed=0)
+    expert = SharpaBimanualGraspExpert(env)
+    for _ in range(400):
+        if expert.state not in (BimanualGraspState.STABLE_START, BimanualGraspState.ARM_LATERAL_CLEARANCE):
+            break
+        action = expert.step()
+        env.step(action)
+    max_wrist_qvel = expert._clearance_max_raw_wrist_qvel
+    print(f"    max raw wrist qvel during ARM_LATERAL_CLEARANCE = {max_wrist_qvel:.3f} rad/s "
+          f"(Wrist Transition Gate target <=2.0rad/s: {'PASS' if max_wrist_qvel <= 2.0 else 'NOT YET MET'})")
+    assert max_wrist_qvel < 7.0, (
+        f"regression: max raw wrist qvel {max_wrist_qvel:.3f}rad/s is back near the pre-fix ~8.07rad/s baseline "
+        "-- the quintic minimum-jerk trajectory fix may have been lost"
+    )
+
+
 def test_arm_lateral_clearance_meets_natural_posture_gate():
     """[Session 41] ARM_LATERAL_CLEARANCE must actually exist as an
     official state (not a rename -- the old NATURAL_ARM_LIFT/single-shot
@@ -185,7 +222,7 @@ def test_object_facing_orientation_still_not_fully_safe():
     env = make_env()
     env.reset(seed=0)
     expert = SharpaBimanualGraspExpert(env, config)
-    for _ in range(900):
+    for _ in range(1200):
         action = expert.step()
         env.step(action)
         if expert.state in (BimanualGraspState.FIVE_FINGER_PRESHAPE, BimanualGraspState.FAILURE):

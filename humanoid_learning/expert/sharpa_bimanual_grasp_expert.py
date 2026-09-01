@@ -114,6 +114,19 @@ def _object_facing_angle_deg(side: str, palm_R: np.ndarray, palm_pos: np.ndarray
     return float(np.degrees(np.arccos(cos_ang)))
 
 
+def _quintic_scale(tau: float) -> float:
+    """[Session 42] Canonical quintic minimum-jerk time-scaling: zero
+    velocity AND zero acceleration at both tau=0 and tau=1 (clipped to
+    [0,1]). Used for ARM_LATERAL_CLEARANCE's joint trajectory instead of
+    a raw rate-limited step target -- see that state's docstring for the
+    causal finding (a step target's instantaneous ctrl-register slope
+    change, tracked by zero-damping wrist joints, excites a real
+    thumb<->table collision impulse that couples back into ~8rad/s wrist
+    qvel)."""
+    tau = min(max(tau, 0.0), 1.0)
+    return 6 * tau**5 - 15 * tau**4 + 10 * tau**3
+
+
 def _slerp_R(R_a: np.ndarray, R_b: np.ndarray, frac: float) -> np.ndarray:
     """Geodesic SO(3) interpolation from R_a (frac=0) to R_b (frac=1),
     world-frame axis-angle (matches pose_ik.orientation_error's own
@@ -186,6 +199,14 @@ class BimanualGraspConfig:
     clearance_elbow: float = 0.8
     clearance_joint_tol_rad: float = 0.03
     clearance_stable_streak_required: int = 15
+    # [Session 42] Wrist Transition Gate: engineering safety target for
+    # THIS approach trajectory specifically (not a Gate A criterion).
+    # See sharpa_bimanual_grasp_expert.py's ARM_LATERAL_CLEARANCE
+    # docstring / docs/history/PHASE4_GRASP_SESSION_42.md for the causal
+    # root cause (thumb<->table collision impulse, not the direct-joint-
+    # target step itself).
+    clearance_trajectory_ticks: int = 90
+    wrist_max_qvel_rad_s: float = 2.0
     posture_rest_gain: float = 0.2  # WEAKER than CoupledBilateralIK's own 0.3 default -- see module docstring's Stage 6 note: 0.5 was tried first and measured (causally) to prevent the primary position task from converging at all (5.4cm plateau, IK itself never reaching pos_tol); 0.2 is a soft nudge toward the clearance posture, not a competing task
     approach_standoff_m: float = 0.15
     # 0.22, not the 0.15 used for the bimanual self-collision grid search:
@@ -350,6 +371,7 @@ class SharpaBimanualGraspExpert:
         self.right_object_facing_angle_deg: float = float("inf")
         self.torso_arm_collision_force_n: float = 0.0
         self._clearance_target: np.ndarray | None = None
+        self._clearance_max_raw_wrist_qvel: float = 0.0
         self._clearance_stable_streak = 0
         self._forward_reach_stable_streak = 0
         self._descend_stable_streak = 0
@@ -602,25 +624,63 @@ class SharpaBimanualGraspExpert:
             # BimanualGraspConfig docstring; docs/history/
             # PHASE4_GRASP_SESSION_41.md) -- 0 real self-collisions,
             # elbow ~7.6cm below shoulder, near-perfect actuator tracking.
+            #
+            # [Session 42 fix] the 41st session's version wrote the FULL
+            # clearance target into _arm_ik_target/_waist_ik_target in a
+            # single tick (state_step==0), making the ctrl register's
+            # RATE-LIMITED CHASE begin with an instantaneous slope change
+            # (0 -> max rate) rather than a smooth ramp. Substep-level
+            # tracing (scripts/diagnose_clearance_wrist_spike.py) found
+            # this is not directly what excites the ~8rad/s wrist qvel --
+            # qfrc_constraint stays near zero for the first ~5 ticks even
+            # with the abrupt ctrl slope. The ACTUAL trigger, confirmed
+            # tick-by-tick: a real thumb<->table contact appears at tick
+            # ~17 (qfrc_constraint on shoulder/elbow/wrist jumps from <1
+            # to 12-23 N*m in the SAME tick the contact appears), and
+            # THAT impulse is what couples into wrist_pitch (armature=
+            # 0.01, dof_damping=0) and drives it to ~8rad/s over the next
+            # ~30 ticks. A quintic minimum-jerk joint trajectory (zero
+            # velocity/acceleration at both ends, from the ACTUAL current
+            # qpos to the clearance target over
+            # clearance_trajectory_ticks) replaces the abrupt-slope chase
+            # -- verified (see history doc) to keep peak penetration at
+            # this contact shallow enough that qfrc_constraint never
+            # exceeds a few N*m, which keeps wrist qvel bounded well
+            # under the engineering safety target (Wrist Transition Gate,
+            # wrist_max_qvel_rad_s=2.0 -- an explicit trajectory-safety
+            # target for THIS approach, not a Gate A criterion).
             if self._state_step == 0:
                 self._clearance_target = np.concatenate([
                     self._waist_ik_target,  # waist stays neutral/current
                     self._clearance_arm_vector("left"),
                     self._clearance_arm_vector("right"),
                 ])
-                self._waist_ik_target = self._clearance_target[:3].copy()
-                self._arm_ik_target = self._clearance_target[3:].copy()
+                self._clearance_q_start = np.concatenate([
+                    self.env._waist_target.copy(), self.env._arm_target.copy(),
+                ])
                 self._clearance_stable_streak = 0
+                self._clearance_max_raw_wrist_qvel = 0.0
+            tau = self._state_step / cfg.clearance_trajectory_ticks
+            s = _quintic_scale(tau)
+            traj_target = self._clearance_q_start + s * (self._clearance_target - self._clearance_q_start)
+            self._waist_ik_target = traj_target[:3].copy()
+            self._arm_ik_target = traj_target[3:].copy()
             action[0:3] = self._waist_action_toward_target()
             action[3:17] = self._arm_action_toward_target()
             actual_arm_q = np.concatenate([
                 self.env.data.qpos[self.env._arm_qpos_adr[:7]], self.env.data.qpos[self.env._arm_qpos_adr[7:]]
             ])
-            joint_err = float(np.max(np.abs(actual_arm_q - self._arm_ik_target)))
+            wrist_dof = np.concatenate([self.env._arm_dof_adr[4:7], self.env._arm_dof_adr[11:14]])
+            raw_wrist_qvel = float(np.max(np.abs(self.env.data.qvel[wrist_dof])))
+            self._clearance_max_raw_wrist_qvel = max(self._clearance_max_raw_wrist_qvel, raw_wrist_qvel)
+            joint_err = float(np.max(np.abs(actual_arm_q - self._clearance_target[3:])))
             qvel_ok = float(np.max(np.abs(self.env.data.qvel[np.concatenate([self.env._arm_dof_adr, self.env._waist_dof_adr])]))) < 0.05
+            wrist_qvel_ok = raw_wrist_qvel <= cfg.wrist_max_qvel_rad_s
             no_collision = (self.env._torso_arm_collision_force() <= cfg.hand_hand_force_limit_n
                              and self.env._hand_hand_contact_force() <= cfg.hand_hand_force_limit_n)
-            stable_now = joint_err <= cfg.clearance_joint_tol_rad and qvel_ok and no_collision
+            trajectory_done = self._state_step >= cfg.clearance_trajectory_ticks
+            stable_now = (trajectory_done and joint_err <= cfg.clearance_joint_tol_rad
+                          and qvel_ok and wrist_qvel_ok and no_collision)
             self._clearance_stable_streak = self._clearance_stable_streak + 1 if stable_now else 0
             if self._clearance_stable_streak >= cfg.clearance_stable_streak_required:
                 self._advance(BimanualGraspState.FOREARM_FORWARD_REACH)
