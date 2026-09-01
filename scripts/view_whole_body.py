@@ -552,6 +552,8 @@ def mode_grasp_sharpa(
     object_pos_x: float = 0.27,
     object_half_size: float | None = None,
     no_restart: bool = False,
+    sharpa_mount: str = "wrist",
+    sharpa_visual_style: str = "g1",
 ):
     """OFFICIAL Sharpa Wave bimanual grasp controller
     (SharpaBimanualGraspExpert), real MuJoCo physics, fixed-base -- shown
@@ -560,7 +562,7 @@ def mode_grasp_sharpa(
     branch -- see docs/GIT_WORKFLOW.md) against SharpaGraspEnv/
     SharpaBimanualGraspExpert, mirroring mode_grasp()'s viewer-loop shape
     for the Dex3 controller above. Gate A has NOT been passed this session
-    (docs/history/PHASE4_GRASP_SESSION_39.md) -- this viewer does not hide
+    (docs/history/PHASE4_GRASP_SESSION_40.md) -- this viewer does not hide
     that; --no-restart freezes the final FAILURE pose for inspection
     instead of looping forever."""
     from humanoid_learning.envs.grasp_config import GraspEnvConfig
@@ -571,7 +573,8 @@ def mode_grasp_sharpa(
     )
 
     print("Sharpa Wave bimanual grasp attempt (OFFICIAL controller) -- Gate A not yet passed.")
-    print(f"object_pos_x={object_pos_x}  object_half_size={object_half_size}")
+    print(f"object_pos_x={object_pos_x}  object_half_size={object_half_size}  "
+          f"sharpa_mount={sharpa_mount}  sharpa_visual_style={sharpa_visual_style}")
     print("Close the viewer window to exit."
           + (" --no-restart: freezes on the first terminal state." if no_restart else " a new attempt restarts automatically."))
 
@@ -581,6 +584,11 @@ def mode_grasp_sharpa(
         # Session 39 fix -- see grasp_config.py's arm_gravity_compensation
         # docstring / docs/history/PHASE4_GRASP_SESSION_39.md.
         arm_gravity_compensation=True,
+        # Session 40: mount A/B measured essentially identical (see
+        # docs/history/PHASE4_GRASP_SESSION_40.md) -- exposed for
+        # visual/A-B inspection, not because "flange" was found better.
+        sharpa_mount=sharpa_mount,
+        sharpa_visual_style=sharpa_visual_style,
     )
     if object_half_size is not None:
         config_kwargs["object_half_size"] = object_half_size
@@ -617,6 +625,8 @@ def mode_grasp_sharpa(
             lp, rp = expert._precontact_final_pos_error, expert._precontact_final_ori_error_deg
             print(
                 f"  [{state['frame']:4d}] -> {expert.state.name}  reason={expert.failure_reason}  "
+                f"object_facing(L,R)=({expert.left_object_facing_angle_deg:.2f},"
+                f"{expert.right_object_facing_angle_deg:.2f})deg  "
                 f"precontact_pos_err(L,R)=({lp['left']*100:.2f},{lp['right']*100:.2f})cm  "
                 f"precontact_ori_err(L,R)=({rp['left']:.2f},{rp['right']:.2f})deg  "
                 f"bilateral_streak={expert._max_bilateral_streak}/{expert.config.bilateral_streak_required}"
@@ -667,6 +677,12 @@ def main():
     parser.add_argument("--no-restart", action="store_true",
                          help="--grasp only: freeze on the first terminal state (SUCCESS/FAILURE) instead "
                               "of auto-restarting, so the final pose can be inspected")
+    parser.add_argument("--sharpa-mount", choices=["wrist", "flange"], default="wrist",
+                         help="--grasp --hand-model sharpa only: mount variant (Session 40 audit found these "
+                              "measure essentially identical -- see docs/history/PHASE4_GRASP_SESSION_40.md)")
+    parser.add_argument("--sharpa-visual-style", choices=["upstream", "g1"], default="g1",
+                         help="--grasp --hand-model sharpa only: g1 (default) recolors visual-only Sharpa "
+                              "geoms to match G1's own materials; upstream keeps the vendored look")
     args = parser.parse_args()
 
     modes = [args.stand, args.posture, args.planar, args.grasp, args.grasp_safety_latch, args.diagonal_feasibility, args.whole_body_diagonal]
@@ -682,7 +698,8 @@ def main():
     elif args.grasp:
         if args.hand_model == "sharpa":
             mode_grasp_sharpa(object_pos_x=args.object_pos_x, object_half_size=args.object_half_size,
-                               no_restart=args.no_restart)
+                               no_restart=args.no_restart, sharpa_mount=args.sharpa_mount,
+                               sharpa_visual_style=args.sharpa_visual_style)
         else:
             mode_grasp(object_pos_x=args.object_pos_x, object_half_size=args.object_half_size,
                        no_restart=args.no_restart)
