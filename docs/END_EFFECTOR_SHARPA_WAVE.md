@@ -12,7 +12,8 @@
 > 있다. 역사적 시작점은 계속 `d038c5b`다. 상세 경계/브랜치/태그 표는
 > [`GIT_WORKFLOW.md`](GIT_WORKFLOW.md) 참고. 세션별 상세 기록은
 > `docs/history/PHASE4_GRASP_SESSION_35.md`/`_36.md`/
-> `_37_GIT_CLEANUP.md`(전부 로컬 전용, `.gitignore`).
+> `_37_GIT_CLEANUP.md`/`_38_WORKTREE_HYGIENE.md`/`_39.md`(전부 로컬
+> 전용, `.gitignore`).
 
 ## 선택 이유
 
@@ -115,6 +116,33 @@ MuJoCo 모델에 존재하지 않는다. 존재하는 것은 각 fingertip의
   못한다 — `CONTACT_ACQUIRE`가 양쪽 모두 접촉 0회로 TIMEOUT.
   `max_bilateral_stable_streak = 0/30`. **Gate A: 미통과.**
 
+  > **[39차 세션 — 원인 규명 및 부분 완화, Gate A 여전히 미통과]**
+  > 이 5~6cm 간극을 layer-by-layer로 계측한 결과(`scripts/
+  > diagnose_precontact_gap.py`), ctrl register(`env._arm_target`)는
+  > IK가 푼 joint target에 정확히 수렴하는데(`joint_target_minus_ctrl_norm
+  > == 0`) 실제 물리 qpos만 뒤처지는 **steady-state compliant-actuator
+  > (arm_kp=120) 중력 부하 tracking error**로 확정했다(홀드 시간을
+  > 3000+ tick으로 늘려도 간극이 줄지 않는 진짜 asymptotic floor임을
+  > 확인). Dex3의 검증된 `_coupled_maybe_resolve`(Cartesian-target
+  > inflation resolve) 방식을 그대로 이식해봤으나 이 reach에서는
+  > causal A/B로 **오히려 악화됨을 확인**(6.9cm → 10~25cm, joint
+  > norm > 1rad) — 사용하지 않는다. 대신 `data.qfrc_bias/arm_kp`를
+  > 매 tick ctrl에 더하는 물리 기반 feedforward(`GraspEnvConfig.
+  > arm_gravity_compensation`, 기본값 False, `SharpaBimanualGraspExpert`
+  > 전용 env에서만 활성화)로 간극을 약 6.9cm → 3.6~4.3cm로 절반 가까이
+  > 줄였다(causal A/B 테스트로 검증, `test_arm_gravity_compensation_
+  > reduces_precontact_tracking_error`). Joint frictionloss(0.3, 전
+  > 팔 관절 확인됨) 보정도 시도했으나 기여가 무시할 수준(수 mm)임을
+  > 확인해 반증·폐기했다. FINGERTIP_PRECONTACT는 이제 고정 tick 수가
+  > 아니라 실측 palm pose 기반 Precontact Tracking Gate(위치 ≤1cm,
+  > orientation ≤5°, 15-tick 연속)로만 다음 상태로 전이하며, 실패 시
+  > `BimanualFailureReason.PRECONTACT_TRACKING_NOT_ACHIEVED`로 정직하게
+  > 보고한다. **이 Gate는 아직 통과하지 못했다** — 남은 ~3.6~4.3cm는
+  > 아직 원인 미확정이며(qfrc_constraint 계측에서 어깨 관절에 최대
+  > ~17.5Nm의 큰 constraint force가 관측됨 — 같은 손 내부 self-collision
+  > 후보로 추정되나 확정되지 않음), 다음 세션의 단일 blocker다. 상세:
+  > `docs/history/PHASE4_GRASP_SESSION_39.md`.
+
 Gate A 정의(Dex3의 `_bilateral_tripod_streak` 패턴을 그대로 모델링):
 양측 동시에 thumb 접촉 AND (index 또는 middle) 접촉 AND wrap 접촉
 AND thumb의 힘 방향이 index/middle 합력과 실제로 반대(dot<0) AND
@@ -149,6 +177,9 @@ python3 scripts/install_sharpa_wave_assets.py
 # 단일손 진단 / 공식 양손 controller 테스트
 python3 scripts/test_sharpa_single_hand_diagnostic.py
 python3 scripts/test_sharpa_bimanual_grasp.py
+
+# FINGERTIP_PRECONTACT IK-vs-physics gap 계층 분해 진단 (39차 세션)
+python3 scripts/diagnose_precontact_gap.py
 ```
 
 > **[37차 세션 — Git 정리]** `--hand-model sharpa --grasp-mode

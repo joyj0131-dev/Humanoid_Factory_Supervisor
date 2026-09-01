@@ -108,6 +108,7 @@ class BimanualFailureReason(Enum):
     OBJECT_MOVED_TOO_MUCH = auto()
     OBJECT_ANGULAR_VELOCITY_EXCEEDED = auto()
     LIFT_FAILED = auto()
+    PRECONTACT_TRACKING_NOT_ACHIEVED = auto()
 
 
 @dataclass
@@ -142,6 +143,22 @@ class BimanualGraspConfig:
     ik_pos_tol: float = 0.01
     max_steps_per_state: int = 400
     wrist_orientation_stability_tol_deg: float = 5.0  # max angular drift over the last 30 ticks to call WRIST_ALIGN settled
+    # [Session 39] FINGERTIP_PRECONTACT Precontact Tracking Gate (see
+    # docs/history/PHASE4_GRASP_SESSION_39.md): the ctrl register
+    # converges EXACTLY to the IK-solved joint target --
+    # joint_target_minus_ctrl_norm == 0 -- yet the actual physical palm
+    # settles several cm short, a steady-state compliant-actuator (arm_kp
+    # =120) gravity/load droop under the Sharpa hands' own weight, not a
+    # kinematic or rate-limit error. A Cartesian-target-inflation resolve
+    # (grasp_expert.py's own proven `_coupled_maybe_resolve` recipe for
+    # the Dex3 track) was tried here and causally measured to make the
+    # gap WORSE at this already-extreme precontact reach (see the same
+    # history doc) -- not used. The actual fix is
+    # SharpaGraspEnv's config-gated arm_gravity_compensation (see
+    # grasp_config.py/sharpa_grasp_env.py); this state only HONESTLY
+    # measures the actual settled pose and gates the transition on it.
+    precontact_ori_tol_deg: float = 5.0  # Precontact Tracking Gate orientation tolerance (Session 39 spec)
+    precontact_stable_streak_required: int = 15  # Precontact Tracking Gate: consecutive ticks required
 
 
 @dataclass
@@ -167,6 +184,10 @@ class BimanualGraspOutcome:
     gate_b: bool
     gate_c: bool
     gate_d: bool
+    precontact_final_pos_error_m: dict  # {side: m}, FINGERTIP_PRECONTACT actual-vs-target Cartesian error
+    precontact_final_ori_error_deg: dict  # {side: deg}
+    precontact_max_stable_streak: int
+    precontact_gate: bool  # Session 39 Precontact Tracking Gate (see module docstring)
 
 
 class SharpaBimanualGraspExpert:
@@ -211,6 +232,10 @@ class SharpaBimanualGraspExpert:
         self._max_bilateral_streak = 0
         self._locked_R: dict | None = None  # set at WRIST_ALIGN entry, see module docstring
         self.wrist_orientation_drift_deg: float = float("inf")
+        self._precontact_stable_streak = 0
+        self._max_precontact_stable_streak = 0
+        self._precontact_final_pos_error = {"left": float("inf"), "right": float("inf")}
+        self._precontact_final_ori_error_deg = {"left": float("inf"), "right": float("inf")}
 
         model = env.model
         waist_dof = np.array([model.jnt_dofadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)] for n in wbc.WAIST_JOINTS])
@@ -242,14 +267,15 @@ class SharpaBimanualGraspExpert:
         obj_pos = self._object_pos()
         return {side: obj_pos + np.array([-standoff, Y_SIGN[side] * y_offset, height]) for side in SIDES}
 
-    def _solve_both(self, targets: dict, R: dict, require_orientation: bool, ori_task_weight: float):
+    def _solve_both(self, targets: dict, R: dict, require_orientation: bool, ori_task_weight: float,
+                     rest_q: np.ndarray | None = None):
         data = self.env.data
         scratch = mujoco.MjData(self.env.model)
         scratch.qpos[:] = data.qpos
         mujoco.mj_forward(self.env.model, scratch)
         return self.ik.solve(
             scratch, targets["left"], R["left"], targets["right"], R["right"],
-            rest_q=self._rest_q, pos_tol=self.config.ik_pos_tol,
+            rest_q=rest_q if rest_q is not None else self._rest_q, pos_tol=self.config.ik_pos_tol,
             require_orientation=require_orientation, ori_task_weight=ori_task_weight,
         )
 
@@ -533,7 +559,17 @@ class SharpaBimanualGraspExpert:
                 self._precontact_final = self._mirrored_targets(
                     cfg.precontact_standoff_m, cfg.precontact_height_m, cfg.precontact_y_offset_m
                 )
+                # Target orientation for the gate check is WRIST_ALIGN's
+                # already-locked, measured-stable orientation (module
+                # docstring: "LOCK that exact orientation as the explicit
+                # WRIST_ALIGN/FINGERTIP_PRECONTACT target"), not a freshly
+                # re-measured one -- these should coincide closely since
+                # every waypoint solve below only soft-anchors
+                # (ori_task_weight=0.05) to whatever orientation is
+                # currently held.
+                self._precontact_final_R = {s: self._locked_R[s].copy() for s in SIDES}
                 self._precontact_waypoint = 0
+                self._precontact_stable_streak = 0
             if self._state_step % self.WAYPOINT_TICKS == 0 and self._precontact_waypoint < self.WAYPOINT_COUNT:
                 self._precontact_waypoint += 1
                 frac = self._precontact_waypoint / self.WAYPOINT_COUNT
@@ -547,8 +583,61 @@ class SharpaBimanualGraspExpert:
                 self._apply_ik_result(result)
             action[0:3] = self._waist_action_toward_target()
             action[3:17] = self._arm_action_toward_target()
-            if self._precontact_waypoint >= self.WAYPOINT_COUNT and self._state_step >= self.WAYPOINT_COUNT * self.WAYPOINT_TICKS:
-                self._advance(BimanualGraspState.CONTACT_ACQUIRE)
+
+            if self._precontact_waypoint >= self.WAYPOINT_COUNT:
+                # [Session 39 finding -- see docs/history/
+                # PHASE4_GRASP_SESSION_39.md] the ctrl register/
+                # rate-limited chase has nothing left to converge to at
+                # this point (it reaches the IK-solved joint target
+                # exactly). Two independent Cartesian-target-inflation
+                # resolve variants (Dex3's own _coupled_maybe_resolve
+                # recipe, both with and without a posture-hold rest_q)
+                # were causally tested here and BOTH measured WORSE
+                # (gap grew from ~6.9cm to 10-25cm, joint norm to
+                # >1rad) -- this state's redundant 17-DOF solve, at this
+                # already-extreme precontact reach, does not have the
+                # locally-linear droop-vs-target relationship the Dex3
+                # resolve assumes; extrapolating the Cartesian target
+                # drives the IK into a qualitatively different, LESS
+                # favorable arm configuration instead of compensating.
+                # That IK-side compensation avenue is therefore not
+                # used. What IS applied is a real, physically-grounded
+                # feedforward: SharpaGraspEnv's arm_gravity_compensation
+                # (config-gated, see grasp_config.py/sharpa_grasp_env.py)
+                # cancels the actual measured qfrc_bias/kp steady-state
+                # droop AT THE ACTUATOR, not via a kinematic guess. This
+                # block does NOT re-solve IK -- it only measures the
+                # ACTUAL settled pose and HONESTLY gates the transition
+                # on it (Precontact Tracking Gate), never advancing on a
+                # fixed tick count regardless of convergence (the
+                # pre-Session-39 behavior).
+                left_actual, left_R = self.env.palm_pose("left")
+                right_actual, right_R = self.env.palm_pose("right")
+                left_pos_err = float(np.linalg.norm(self._precontact_final["left"] - left_actual))
+                right_pos_err = float(np.linalg.norm(self._precontact_final["right"] - right_actual))
+
+                def _ang_deg(Ra, Rb):
+                    r_delta = Ra.T @ Rb
+                    cos_ang = np.clip((np.trace(r_delta) - 1.0) / 2.0, -1.0, 1.0)
+                    return float(np.degrees(np.arccos(cos_ang)))
+
+                left_ori_err = _ang_deg(left_R, self._precontact_final_R["left"])
+                right_ori_err = _ang_deg(right_R, self._precontact_final_R["right"])
+                self._precontact_final_pos_error = {"left": left_pos_err, "right": right_pos_err}
+                self._precontact_final_ori_error_deg = {"left": left_ori_err, "right": right_ori_err}
+
+                no_hand_hand = self.env._hand_hand_contact_force() <= cfg.hand_hand_force_limit_n
+                stable_now = (
+                    left_pos_err <= cfg.ik_pos_tol and right_pos_err <= cfg.ik_pos_tol
+                    and left_ori_err <= cfg.precontact_ori_tol_deg and right_ori_err <= cfg.precontact_ori_tol_deg
+                    and no_hand_hand
+                )
+                self._precontact_stable_streak = self._precontact_stable_streak + 1 if stable_now else 0
+                self._max_precontact_stable_streak = max(self._max_precontact_stable_streak, self._precontact_stable_streak)
+                if self._precontact_stable_streak >= cfg.precontact_stable_streak_required:
+                    self._advance(BimanualGraspState.CONTACT_ACQUIRE)
+                elif self._state_step >= cfg.max_steps_per_state:
+                    self._fail(BimanualFailureReason.PRECONTACT_TRACKING_NOT_ACHIEVED)
 
         elif state == BimanualGraspState.CONTACT_ACQUIRE:
             # Both sides close INDEPENDENTLY/asynchronously: a side/group
@@ -702,6 +791,9 @@ class SharpaBimanualGraspExpert:
         gate_b = self._tabletop_hold_steps >= sim_time_to_steps(self.env, self.config.tabletop_hold_seconds)
         gate_c = self._lift_height_achieved >= self.config.lift_height_m
         gate_d = self._air_hold_steps >= sim_time_to_steps(self.env, self.config.air_hold_seconds)
+        precontact_gate = (
+            self._max_precontact_stable_streak >= self.config.precontact_stable_streak_required
+        )
 
         return BimanualGraspOutcome(
             state=self.state, failure_reason=self.failure_reason, step_count=self._total_step,
@@ -714,4 +806,8 @@ class SharpaBimanualGraspExpert:
             object_angular_velocity_peak=angvel_peak, object_angular_velocity_rms=angvel_rms,
             tabletop_hold_steps_achieved=self._tabletop_hold_steps, air_hold_steps_achieved=self._air_hold_steps,
             lift_height_achieved_m=self._lift_height_achieved, gate_a=gate_a, gate_b=gate_b, gate_c=gate_c, gate_d=gate_d,
+            precontact_final_pos_error_m=dict(self._precontact_final_pos_error),
+            precontact_final_ori_error_deg=dict(self._precontact_final_ori_error_deg),
+            precontact_max_stable_streak=self._max_precontact_stable_streak,
+            precontact_gate=precontact_gate,
         )

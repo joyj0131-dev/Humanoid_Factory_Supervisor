@@ -346,6 +346,25 @@ class SharpaGraspEnv(gym.Env):
 
         self.data.ctrl[self._waist_act_ids] = self._waist_target
         self.data.ctrl[self._arm_act_ids] = self._arm_target
+        if self.config.arm_gravity_compensation:
+            # [Session 39] cancel the compliant kp=120 position actuators'
+            # steady-state gravity/load droop with a direct feedforward:
+            # data.qfrc_bias (gravity+Coriolis bias force, already computed
+            # by the PREVIOUS mj_step/mj_forward call) divided by arm_kp is
+            # the actuator-space position offset needed to hold the CURRENT
+            # load at the CURRENT target -- see grasp_config.py's
+            # arm_gravity_compensation docstring. Uses last tick's qfrc_bias
+            # (one-tick feedback delay, standard and stable for a load that
+            # changes slowly relative to the control tick) rather than an
+            # extra mj_forward call.
+            grav_arm = self.data.qfrc_bias[self._arm_dof_adr] / self.config.arm_kp
+            grav_waist = self.data.qfrc_bias[self._waist_dof_adr] / self.config.arm_kp
+            self.data.ctrl[self._arm_act_ids] = np.clip(
+                self._arm_target + grav_arm, self._arm_ctrl_low, self._arm_ctrl_high
+            )
+            self.data.ctrl[self._waist_act_ids] = np.clip(
+                self._waist_target + grav_waist, self._waist_ctrl_low, self._waist_ctrl_high
+            )
         for side_idx, side in enumerate(sc.SIDES):
             for g in range(N_GROUPS_PER_HAND):
                 syn = self._group_synergy[side_idx * N_GROUPS_PER_HAND + g]

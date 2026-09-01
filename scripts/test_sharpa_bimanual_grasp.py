@@ -5,12 +5,22 @@ test_sharpa_single_hand_diagnostic.py.
 Run with:
     python3 scripts/test_sharpa_bimanual_grasp.py
 
-HONEST CURRENT STATE (36th session): the controller reaches a genuinely
+HONEST CURRENT STATE (39th session): the controller reaches a genuinely
 stable, orientation-converged bimanual precontact configuration (verified
-sub-0.1deg WRIST_ALIGN orientation drift) but the physically-tracked arm
-converges to a Cartesian pose several cm off from FINGERTIP_PRECONTACT's
-own IK-solved target, leaving fully-closed fingertips short of the
-object's surface -- CONTACT_ACQUIRE times out with ZERO contact this
+sub-0.1deg WRIST_ALIGN orientation drift). The FINGERTIP_PRECONTACT
+IK-vs-physics gap first reported in the 36th session was root-caused this
+session to a steady-state compliant-actuator (arm_kp=120) gravity/load
+droop under the Sharpa hands' own weight (causally confirmed: the ctrl
+register converges EXACTLY to the IK-solved joint target, yet the actual
+palm still settles ~6.9cm short). make_env() below enables
+arm_gravity_compensation (grasp_config.py), a physically-grounded
+qfrc_bias/kp feedforward that cuts this gap roughly in half (~6.9cm ->
+~3.6-4.3cm, see docs/history/PHASE4_GRASP_SESSION_39.md) -- a real,
+causally-validated improvement, but NOT enough to clear the Precontact
+Tracking Gate's 1cm/5deg/15-tick requirement. FINGERTIP_PRECONTACT now
+HONESTLY gates its own transition on the measured, physically-settled
+pose (BimanualFailureReason.PRECONTACT_TRACKING_NOT_ACHIEVED) instead of
+advancing on a fixed tick count -- CONTACT_ACQUIRE still never runs this
 session. test_a_real_bimanual_gate_a_success_on_size_12 below documents
 this HONESTLY as a failing test and must never be weakened, deleted, or
 converted into a smoke assertion to make it pass.
@@ -37,8 +47,12 @@ from humanoid_learning.expert.sharpa_bimanual_grasp_expert import (
 
 
 def make_env(max_episode_steps: int = 8000) -> SharpaGraspEnv:
+    # arm_gravity_compensation=True: Session 39 fix for the FINGERTIP_
+    # PRECONTACT IK-vs-physics tracking gap -- see grasp_config.py's
+    # arm_gravity_compensation docstring and
+    # docs/history/PHASE4_GRASP_SESSION_39.md.
     config = GraspEnvConfig(object_pos=(0.27, 0.0, 0.0), arm_kp=120.0, object_half_size=SIZE_12_HALF,
-                             max_episode_steps=max_episode_steps)
+                             max_episode_steps=max_episode_steps, arm_gravity_compensation=True)
     return SharpaGraspEnv(config)
 
 
@@ -211,6 +225,34 @@ def test_full_bimanual_rollout_runs_to_a_terminal_state_without_crashing():
     assert outcome.state in (BimanualGraspState.SUCCESS, BimanualGraspState.FAILURE)
     print(f"    rollout reached terminal state {outcome.state.name} "
           f"(failure_reason={outcome.failure_reason}) after {outcome.step_count} steps")
+
+
+def test_arm_gravity_compensation_reduces_precontact_tracking_error():
+    """Session 39 regression guard: arm_gravity_compensation must reduce
+    (not fabricate away) the FINGERTIP_PRECONTACT actual-vs-target gap
+    relative to the same rollout with it disabled -- an A/B causal check,
+    not just a smoke assertion. Both runs are expected to still FAIL the
+    Precontact Tracking Gate (see this file's module docstring) -- this
+    test only guards the DIRECTION and rough MAGNITUDE of the measured
+    improvement, never asserts gate success."""
+    off_config = GraspEnvConfig(object_pos=(0.27, 0.0, 0.0), arm_kp=120.0, object_half_size=SIZE_12_HALF,
+                                 max_episode_steps=1200, arm_gravity_compensation=False)
+    on_config = GraspEnvConfig(object_pos=(0.27, 0.0, 0.0), arm_kp=120.0, object_half_size=SIZE_12_HALF,
+                                max_episode_steps=1200, arm_gravity_compensation=True)
+    off_expert = SharpaBimanualGraspExpert(SharpaGraspEnv(off_config))
+    off_outcome = off_expert.run(max_total_steps=1200)
+    on_expert = SharpaBimanualGraspExpert(SharpaGraspEnv(on_config))
+    on_outcome = on_expert.run(max_total_steps=1200)
+
+    off_err = max(off_outcome.precontact_final_pos_error_m.values())
+    on_err = max(on_outcome.precontact_final_pos_error_m.values())
+    print(f"    gravity_compensation off: max_pos_err={off_err*100:.2f}cm | "
+          f"on: max_pos_err={on_err*100:.2f}cm")
+    assert on_err < off_err, (
+        f"arm_gravity_compensation did not reduce the measured FINGERTIP_PRECONTACT gap "
+        f"(off={off_err*100:.2f}cm, on={on_err*100:.2f}cm)"
+    )
+    assert on_err < 0.9 * off_err, "expected at least a 10% reduction from gravity compensation"
 
 
 def test_a_real_bimanual_gate_a_success_on_size_12():

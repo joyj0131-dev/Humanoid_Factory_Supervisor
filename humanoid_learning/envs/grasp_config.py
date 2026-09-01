@@ -94,6 +94,23 @@ class GraspEnvConfig:
     fingertip_pad_radius: float = 0.012
     fingertip_pad_friction: tuple[float, float, float] = (2.0, 0.02, 0.001)
 
+    # [Session 39, Sharpa track] Compliant kp=120 arm actuators have a real
+    # steady-state gravity/load droop (documented in coupled_ik.py's module
+    # docstring for Dex3, ~0.04m there; measured up to ~6.9cm for Sharpa's
+    # heavier hands at FINGERTIP_PRECONTACT reach -- see
+    # docs/history/PHASE4_GRASP_SESSION_39.md). A Cartesian-space IK-resolve
+    # compensation (grasp_expert.py's proven `_coupled_maybe_resolve`
+    # recipe for Dex3) was tried for Sharpa and causally measured to make
+    # this WORSE at this reach. This flag instead adds a direct, physically
+    # -grounded feedforward at the actuator: data.qfrc_bias (gravity +
+    # Coriolis, already computed by MuJoCo every step) divided by arm_kp,
+    # added to the arm/waist ctrl target every tick -- NOT a kp increase,
+    # NOT a kinematic guess, a bounded correction sized by the ACTUAL
+    # measured physical load. False (default) preserves every existing
+    # Sharpa/Dex3 test's behavior unchanged; only SharpaBimanualGraspExpert's
+    # env enables it (sharpa_grasp_env.py's step()).
+    arm_gravity_compensation: bool = False
+
     object_pos: tuple[float, float, float] = (0.27, 0.0, 0.0)  # z resolved at reset (on table surface)
     # 2x every linear dimension of the Foundation object (0.03 -> 0.06,
     # i.e. 6cm cube -> 12cm cube) -- see PROJECT_CONTEXT.md Phase 4 Grasp
