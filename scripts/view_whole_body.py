@@ -27,6 +27,15 @@ Modes:
                a live/dynamic attempt -- see PROJECT_CONTEXT.md, this
                candidate does not yet satisfy the intended fingertip-face
                assignment).
+    --grasp --hand-model sharpa  the OFFICIAL Sharpa Wave bimanual grasp
+               controller (SharpaBimanualGraspExpert), real MuJoCo physics,
+               fixed-base -- shown as-is, Gate A NOT yet passed (see
+               docs/END_EFFECTOR_SHARPA_WAVE.md /
+               docs/history/PHASE4_GRASP_SESSION_39.md). --hand-model
+               dex3 (default) is the existing --grasp behavior above,
+               unchanged. --no-restart stops the attempt loop on the first
+               terminal state (SUCCESS/FAILURE) instead of auto-restarting,
+               freezing the final pose so it can be inspected.
 
 Run locally (needs a real display):
     python scripts/view_whole_body.py --stand
@@ -35,6 +44,7 @@ Run locally (needs a real display):
     python scripts/view_whole_body.py --grasp
     python scripts/view_whole_body.py --grasp-safety-latch
     python scripts/view_whole_body.py --diagonal-feasibility
+    python scripts/view_whole_body.py --grasp --hand-model sharpa --no-restart
 """
 
 from __future__ import annotations
@@ -445,6 +455,7 @@ def mode_grasp(
     object_pos_x: float = 0.27,
     object_half_size: float | None = None,
     safety_latch: bool = False,
+    no_restart: bool = False,
 ):
     """Bimanual side-pinch attempt with the redesigned 9-state controller
     (STABLE_START..HOLD, rate-limited targets, grip_center/grip_half_width
@@ -515,15 +526,123 @@ def mode_grasp(
                 f"safety={outcome.substep_safety_event_count}  "
                 f"pre_lift_pop={outcome.pre_lift_pop_height:.4f}m  "
                 f"controlled_lift_gain={outcome.controlled_lift_gain:.4f}m  "
-                f"final_height_above_initial={outcome.final_height_above_initial:.4f}m\n  restarting...\n"
+                f"final_height_above_initial={outcome.final_height_above_initial:.4f}m"
             )
-            new_attempt()
+            if no_restart:
+                print("  --no-restart: holding final pose, closing the viewer window exits.")
+                state["done"] = True
+            else:
+                print("  restarting...\n")
+                new_attempt()
 
     with mujoco.viewer.launch_passive(state["env"].model, state["env"].data) as viewer:
         i = 0
         while viewer.is_running():
             step_start = time.time()
-            step(i)
+            if not state.get("done"):
+                step(i)
+            viewer.sync()
+            i += 1
+            elapsed = time.time() - step_start
+            if elapsed < state["env"].model.opt.timestep * 5:
+                time.sleep(state["env"].model.opt.timestep * 5 - elapsed)
+
+
+def mode_grasp_sharpa(
+    object_pos_x: float = 0.27,
+    object_half_size: float | None = None,
+    no_restart: bool = False,
+):
+    """OFFICIAL Sharpa Wave bimanual grasp controller
+    (SharpaBimanualGraspExpert), real MuJoCo physics, fixed-base -- shown
+    as-is, including its current failure mode. Independently implemented
+    (NOT copied from the uncommitted wip/phase4.5-viewer-rectangular
+    branch -- see docs/GIT_WORKFLOW.md) against SharpaGraspEnv/
+    SharpaBimanualGraspExpert, mirroring mode_grasp()'s viewer-loop shape
+    for the Dex3 controller above. Gate A has NOT been passed this session
+    (docs/history/PHASE4_GRASP_SESSION_39.md) -- this viewer does not hide
+    that; --no-restart freezes the final FAILURE pose for inspection
+    instead of looping forever."""
+    from humanoid_learning.envs.grasp_config import GraspEnvConfig
+    from humanoid_learning.envs.sharpa_grasp_env import SharpaGraspEnv
+    from humanoid_learning.expert.sharpa_bimanual_grasp_expert import (
+        BimanualGraspState,
+        SharpaBimanualGraspExpert,
+    )
+
+    print("Sharpa Wave bimanual grasp attempt (OFFICIAL controller) -- Gate A not yet passed.")
+    print(f"object_pos_x={object_pos_x}  object_half_size={object_half_size}")
+    print("Close the viewer window to exit."
+          + (" --no-restart: freezes on the first terminal state." if no_restart else " a new attempt restarts automatically."))
+
+    config_kwargs = dict(
+        object_pos=(object_pos_x, 0.0, 0.0),
+        arm_kp=120.0,
+        # Session 39 fix -- see grasp_config.py's arm_gravity_compensation
+        # docstring / docs/history/PHASE4_GRASP_SESSION_39.md.
+        arm_gravity_compensation=True,
+    )
+    if object_half_size is not None:
+        config_kwargs["object_half_size"] = object_half_size
+    env = SharpaGraspEnv(GraspEnvConfig(**config_kwargs))
+    state = {"env": env, "expert": None, "last_state": None, "frame": 0, "done": False}
+
+    def new_attempt():
+        # Matches the OFFICIAL test_sharpa_bimanual_grasp.py/run()
+        # convention exactly for the FIRST attempt: SharpaBimanualGraspExpert
+        # is constructed on the env's PRE-reset state (it captures its own
+        # rest_q/_arm_ik_target from env.data/_arm_target at construction
+        # time), THEN env.reset() runs -- run() does this same
+        # construct-then-reset order internally. A restart (no_restart=False)
+        # has no "pre-reset" state to return to (the env already ran an
+        # attempt), so it resets first and reconstructs against the
+        # freshly-reset stand pose instead -- a soft null-space regularization
+        # target either way, not a hard constraint (see coupled_ik.py).
+        if state["expert"] is None:
+            state["expert"] = SharpaBimanualGraspExpert(env)
+            env.reset(seed=0)
+        else:
+            env.reset(seed=0)
+            state["expert"] = SharpaBimanualGraspExpert(env)
+        state["last_state"] = None
+        state["frame"] = 0
+
+    new_attempt()
+
+    def step(_i):
+        env, expert = state["env"], state["expert"]
+        action = expert.step()
+        env.step(action)
+        if expert.state != state["last_state"]:
+            lp, rp = expert._precontact_final_pos_error, expert._precontact_final_ori_error_deg
+            print(
+                f"  [{state['frame']:4d}] -> {expert.state.name}  reason={expert.failure_reason}  "
+                f"precontact_pos_err(L,R)=({lp['left']*100:.2f},{lp['right']*100:.2f})cm  "
+                f"precontact_ori_err(L,R)=({rp['left']:.2f},{rp['right']:.2f})deg  "
+                f"bilateral_streak={expert._max_bilateral_streak}/{expert.config.bilateral_streak_required}"
+            )
+            state["last_state"] = expert.state
+        state["frame"] += 1
+        if expert.state in (BimanualGraspState.SUCCESS, BimanualGraspState.FAILURE):
+            print(
+                f"  attempt finished: {expert.state.name}  reason={expert.failure_reason}  "
+                f"bilateral_streak={expert._max_bilateral_streak}/{expert.config.bilateral_streak_required}  "
+                f"contact={ {s: dict(expert._group_ever_contacted[s]) for s in expert._group_ever_contacted} }  "
+                f"obj_xy_disp={expert.object_xy_displacement():.4f}m"
+            )
+            if no_restart:
+                print("  --no-restart: holding final pose, closing the viewer window exits.")
+                state["done"] = True
+            else:
+                print("  restarting...\n")
+                new_attempt()
+
+    with mujoco.viewer.launch_passive(state["env"].model, state["env"].data) as viewer:
+        i = 0
+        while viewer.is_running():
+            step_start = time.time()
+            if not state["done"]:
+                step(i)
             viewer.sync()
             i += 1
             elapsed = time.time() - step_start
@@ -542,6 +661,12 @@ def main():
     parser.add_argument("--whole-body-diagonal", action="store_true", help="run the SIZE_12 full-body (pelvis/legs/waist/arms) Stage W diagonal-reach static feasibility search and report the result")
     parser.add_argument("--object-pos-x", type=float, default=0.27, help="object x position, meters from robot origin (--grasp only)")
     parser.add_argument("--object-half-size", type=float, default=None, help="object half-size, meters (--grasp only; default: GraspEnvConfig's own default, 0.06)")
+    parser.add_argument("--hand-model", choices=["dex3", "sharpa"], default="dex3",
+                         help="--grasp only: dex3 (default, existing behavior, unchanged) or sharpa "
+                              "(OFFICIAL SharpaBimanualGraspExpert, see docs/END_EFFECTOR_SHARPA_WAVE.md)")
+    parser.add_argument("--no-restart", action="store_true",
+                         help="--grasp only: freeze on the first terminal state (SUCCESS/FAILURE) instead "
+                              "of auto-restarting, so the final pose can be inspected")
     args = parser.parse_args()
 
     modes = [args.stand, args.posture, args.planar, args.grasp, args.grasp_safety_latch, args.diagonal_feasibility, args.whole_body_diagonal]
@@ -555,12 +680,18 @@ def main():
     elif args.planar:
         mode_planar()
     elif args.grasp:
-        mode_grasp(object_pos_x=args.object_pos_x, object_half_size=args.object_half_size)
+        if args.hand_model == "sharpa":
+            mode_grasp_sharpa(object_pos_x=args.object_pos_x, object_half_size=args.object_half_size,
+                               no_restart=args.no_restart)
+        else:
+            mode_grasp(object_pos_x=args.object_pos_x, object_half_size=args.object_half_size,
+                       no_restart=args.no_restart)
     elif args.grasp_safety_latch:
         mode_grasp(
             object_pos_x=args.object_pos_x,
             object_half_size=args.object_half_size,
             safety_latch=True,
+            no_restart=args.no_restart,
         )
     elif args.diagonal_feasibility:
         mode_diagonal_feasibility()
