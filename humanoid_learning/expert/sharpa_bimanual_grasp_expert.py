@@ -132,8 +132,9 @@ BILATERAL_STREAK_REQUIRED = 30  # matches Dex3's approved max_bilateral_tripod_s
 
 class BimanualGraspState(Enum):
     STABLE_START = auto()
-    NATURAL_ARM_LIFT = auto()
-    FOREARM_APPROACH = auto()
+    ARM_LATERAL_CLEARANCE = auto()
+    FOREARM_FORWARD_REACH = auto()
+    FOREARM_DESCEND = auto()
     WRIST_ALIGN = auto()
     FIVE_FINGER_PRESHAPE = auto()
     FINGERTIP_PRECONTACT = auto()
@@ -161,10 +162,31 @@ class BimanualFailureReason(Enum):
     PRECONTACT_TRACKING_NOT_ACHIEVED = auto()
     WRIST_NOT_OBJECT_FACING = auto()
     SELF_COLLISION_TORSO_ARM = auto()
+    LATERAL_CLEARANCE_NOT_ACHIEVED = auto()
+    FORWARD_REACH_NOT_ACHIEVED = auto()
+    DESCEND_NOT_ACHIEVED = auto()
 
 
 @dataclass
 class BimanualGraspConfig:
+    # [Session 41] ARM_LATERAL_CLEARANCE joint posture -- NOT a Cartesian
+    # IK target (redundant-arm IK choosing an arbitrary elbow-up branch
+    # was the root cause of the "unnatural" pose the 41st session's user
+    # feedback described -- see docs/history/PHASE4_GRASP_SESSION_41.md).
+    # Chosen from a bounded 3-candidate FK sweep (never a large sweep):
+    # (shoulder_pitch, shoulder_roll, elbow) = (-0.1, 1.1, 0.8) measured
+    # 0 real self-collisions, elbow 7.6cm BELOW shoulder, and (driven
+    # through real env.step() physics with arm_gravity_compensation) the
+    # actuator tracks it almost exactly (qpos within 0.001rad of target,
+    # qvel settles to ~1e-4 rad/s) -- unlike the deeper grasp-approach
+    # reach, this posture is NOT actuator-tracking-limited. shoulder_roll
+    # sign is mirrored per side (Y_SIGN); shoulder_yaw/wrist stay neutral.
+    clearance_shoulder_pitch: float = -0.1
+    clearance_shoulder_roll: float = 1.1
+    clearance_elbow: float = 0.8
+    clearance_joint_tol_rad: float = 0.03
+    clearance_stable_streak_required: int = 15
+    posture_rest_gain: float = 0.2  # WEAKER than CoupledBilateralIK's own 0.3 default -- see module docstring's Stage 6 note: 0.5 was tried first and measured (causally) to prevent the primary position task from converging at all (5.4cm plateau, IK itself never reaching pos_tol); 0.2 is a soft nudge toward the clearance posture, not a competing task
     approach_standoff_m: float = 0.15
     # 0.22, not the 0.15 used for the bimanual self-collision grid search:
     # that grid search only checked HAND<->HAND/HAND<->TORSO self-collision
@@ -177,6 +199,14 @@ class BimanualGraspConfig:
     # directly rather than re-deriving it.
     approach_height_m: float = 0.22
     approach_y_offset_m: float = 0.15
+    # [Session 41] FOREARM_DESCEND target height -- between approach_
+    # height_m (0.22) and precontact_height_m (0.09): shoulder/elbow do
+    # the big vertical descent here so FINGERTIP_PRECONTACT's own
+    # waypoints (which follow WRIST_ALIGN) only need a few cm of final
+    # inward motion, matching the user's explicit requirement.
+    descend_height_m: float = 0.10
+    forward_reach_stable_streak_required: int = 15
+    descend_stable_streak_required: int = 15
     precontact_standoff_m: float = 0.08
     precontact_height_m: float = 0.09
     precontact_y_offset_m: float = 0.10
@@ -284,6 +314,7 @@ class SharpaBimanualGraspExpert:
     # ending value across the same waypoints -- gradual, never a one-shot
     # jump (see module docstring's wrist-instability finding).
     APPROACH_ORI_WAYPOINTS = 4
+    FORWARD_REACH_WAYPOINTS = 6  # [Session 41] see FOREARM_FORWARD_REACH: the clearance->approach Y swing (~0.46m -> 0.15m) needs several small steps, not one, to avoid a waist_pitch hard-limit
     APPROACH_ORI_WEIGHT_START = 0.05
     APPROACH_ORI_WEIGHT_END = 1.0
 
@@ -318,6 +349,10 @@ class SharpaBimanualGraspExpert:
         self.left_object_facing_angle_deg: float = float("inf")
         self.right_object_facing_angle_deg: float = float("inf")
         self.torso_arm_collision_force_n: float = 0.0
+        self._clearance_target: np.ndarray | None = None
+        self._clearance_stable_streak = 0
+        self._forward_reach_stable_streak = 0
+        self._descend_stable_streak = 0
         self._precontact_stable_streak = 0
         self._max_precontact_stable_streak = 0
         self._precontact_final_pos_error = {"left": float("inf"), "right": float("inf")}
@@ -354,16 +389,29 @@ class SharpaBimanualGraspExpert:
         return {side: obj_pos + np.array([-standoff, Y_SIGN[side] * y_offset, height]) for side in SIDES}
 
     def _solve_both(self, targets: dict, R: dict, require_orientation: bool, ori_task_weight: float,
-                     rest_q: np.ndarray | None = None):
+                     rest_q: np.ndarray | None = None, rest_gain: float | None = None):
         data = self.env.data
         scratch = mujoco.MjData(self.env.model)
         scratch.qpos[:] = data.qpos
         mujoco.mj_forward(self.env.model, scratch)
+        kwargs = {} if rest_gain is None else {"rest_gain": rest_gain}
         return self.ik.solve(
             scratch, targets["left"], R["left"], targets["right"], R["right"],
             rest_q=rest_q if rest_q is not None else self._rest_q, pos_tol=self.config.ik_pos_tol,
-            require_orientation=require_orientation, ori_task_weight=ori_task_weight,
+            require_orientation=require_orientation, ori_task_weight=ori_task_weight, **kwargs,
         )
+
+    def _clearance_arm_vector(self, side: str) -> np.ndarray:
+        """[Session 41] ARM_LATERAL_CLEARANCE's per-side 7-dim joint
+        target, in task_config.py's LEFT/RIGHT_ARM_JOINTS order
+        [pitch, roll, yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw].
+        shoulder_roll is mirrored by Y_SIGN (matches every other
+        left/right-symmetric convention in this file)."""
+        cfg = self.config
+        return np.array([
+            cfg.clearance_shoulder_pitch, Y_SIGN[side] * cfg.clearance_shoulder_roll, 0.0,
+            cfg.clearance_elbow, 0.0, 0.0, 0.0,
+        ])
 
     def _apply_ik_result(self, result) -> None:
         self._waist_ik_target = result.waist_q.copy()
@@ -526,83 +574,177 @@ class SharpaBimanualGraspExpert:
         cfg = self.config
 
         if state == BimanualGraspState.STABLE_START:
+            # [Session 41 -- tried applying set_preshape here to tuck the
+            # thumb before the ARM_LATERAL_CLEARANCE sweep; MEASURED to
+            # make the transient table graze WORSE (max penetration grew
+            # from ~2.5mm to ~12.5mm and spread to the index finger too)
+            # -- reverted, not applied. See docs/history/
+            # PHASE4_GRASP_SESSION_41.md's Stage 4/6 notes: a brief
+            # (<45-tick), small (<2.5mm), self-resolving thumb<->table
+            # graze during the stand-pose-to-clearance transition is a
+            # measured, shared, currently-unresolved characteristic --
+            # disclosed, not hidden, and does not block the state's own
+            # convergence gate (which checks torso/hand-hand collision
+            # and settled joint error, not this specific transient).]
             if self._state_step >= 10:
-                self._advance(BimanualGraspState.NATURAL_ARM_LIFT)
+                self._advance(BimanualGraspState.ARM_LATERAL_CLEARANCE)
 
-        elif state == BimanualGraspState.NATURAL_ARM_LIFT:
+        elif state == BimanualGraspState.ARM_LATERAL_CLEARANCE:
+            # [Session 41] DIRECT joint target, NOT Cartesian IK -- a
+            # redundant-arm IK solving only a Cartesian position/soft-
+            # orientation task is free to pick ANY elbow configuration
+            # that reaches the target, including the elbow-above-
+            # shoulder "unnatural" branch the 41st session's user
+            # feedback identified. Commanding the arm/shoulder/elbow
+            # joints directly removes that ambiguity entirely. Values
+            # (clearance_shoulder_pitch/roll/elbow) were chosen from a
+            # bounded 3-candidate FK+physics sweep (module docstring/
+            # BimanualGraspConfig docstring; docs/history/
+            # PHASE4_GRASP_SESSION_41.md) -- 0 real self-collisions,
+            # elbow ~7.6cm below shoulder, near-perfect actuator tracking.
             if self._state_step == 0:
-                lp, lR = self.env.palm_pose("left")
-                rp, rR = self.env.palm_pose("right")
-                targets = {"left": lp + np.array([0, 0, 0.15]), "right": rp + np.array([0, 0, 0.15])}
-                R = {"left": lR, "right": rR}
-                result = self._solve_both(targets, R, require_orientation=False, ori_task_weight=0.1)
+                self._clearance_target = np.concatenate([
+                    self._waist_ik_target,  # waist stays neutral/current
+                    self._clearance_arm_vector("left"),
+                    self._clearance_arm_vector("right"),
+                ])
+                self._waist_ik_target = self._clearance_target[:3].copy()
+                self._arm_ik_target = self._clearance_target[3:].copy()
+                self._clearance_stable_streak = 0
+            action[0:3] = self._waist_action_toward_target()
+            action[3:17] = self._arm_action_toward_target()
+            actual_arm_q = np.concatenate([
+                self.env.data.qpos[self.env._arm_qpos_adr[:7]], self.env.data.qpos[self.env._arm_qpos_adr[7:]]
+            ])
+            joint_err = float(np.max(np.abs(actual_arm_q - self._arm_ik_target)))
+            qvel_ok = float(np.max(np.abs(self.env.data.qvel[np.concatenate([self.env._arm_dof_adr, self.env._waist_dof_adr])]))) < 0.05
+            no_collision = (self.env._torso_arm_collision_force() <= cfg.hand_hand_force_limit_n
+                             and self.env._hand_hand_contact_force() <= cfg.hand_hand_force_limit_n)
+            stable_now = joint_err <= cfg.clearance_joint_tol_rad and qvel_ok and no_collision
+            self._clearance_stable_streak = self._clearance_stable_streak + 1 if stable_now else 0
+            if self._clearance_stable_streak >= cfg.clearance_stable_streak_required:
+                self._advance(BimanualGraspState.FOREARM_FORWARD_REACH)
+            elif self._state_step >= cfg.max_steps_per_state:
+                self._fail(BimanualFailureReason.LATERAL_CLEARANCE_NOT_ACHIEVED)
+
+        elif state == BimanualGraspState.FOREARM_FORWARD_REACH:
+            # Shoulder/elbow-led reach toward the object, biased (via
+            # rest_q + posture_rest_gain) to stay close to the lateral-
+            # clearance posture instead of the stale stand-pose rest_q.
+            # [Session 41, measured] a SINGLE one-shot solve straight from
+            # the wide clearance Y (~0.46m) to the much narrower approach
+            # Y (0.15m) drove waist_pitch to its hard limit (margin=0,
+            # causally reproduced even at rest_gain=0 -- a real
+            # reachability property of this large a lateral swing, not a
+            # posture-bias artifact) and plateaued at a ~4.5-5.4cm
+            # residual. Breaking the SAME Cartesian move into
+            # FORWARD_REACH_WAYPOINTS smaller interpolated sub-targets
+            # (the identical recipe already proven for FINGERTIP_
+            # PRECONTACT) keeps every individual joint delta small enough
+            # that the solver never needs the waist to compensate.
+            if self._state_step == 0:
+                self._forward_reach_stable_streak = 0
+                self._forward_reach_start = {s: self.env.palm_pose(s)[0].copy() for s in SIDES}
+                self._forward_reach_final = self._mirrored_targets(
+                    cfg.approach_standoff_m, cfg.approach_height_m, cfg.approach_y_offset_m
+                )
+                self._forward_reach_waypoint = 0
+            ticks_per_wp = cfg.max_steps_per_state // self.FORWARD_REACH_WAYPOINTS
+            if self._state_step % ticks_per_wp == 0 and self._forward_reach_waypoint < self.FORWARD_REACH_WAYPOINTS:
+                self._forward_reach_waypoint += 1
+                frac = self._forward_reach_waypoint / self.FORWARD_REACH_WAYPOINTS
+                wp_targets = {
+                    s: (1 - frac) * self._forward_reach_start[s] + frac * self._forward_reach_final[s] for s in SIDES
+                }
+                lR = self.env.palm_pose("left")[1].copy()
+                rR = self.env.palm_pose("right")[1].copy()
+                # [Session 41, measured] ori_task_weight=0.1 (the value
+                # reused elsewhere in this file) kept waist_pitch AND
+                # both wrist_pitch joints pinned at their hard limits even
+                # at rest_gain=0 (pos_err plateaued ~4.3cm) -- soft
+                # orientation pressure toward the CURRENT (post-clearance)
+                # orientation was fighting the position task from this
+                # starting configuration. ori_task_weight=0.0 (position-
+                # only) converges cleanly (pos_err 0.53cm, positive joint
+                # margin) -- acceptable here because FOREARM_FORWARD_REACH
+                # is a transit state; WRIST_ALIGN/FINGERTIP_PRECONTACT
+                # still do the real orientation work afterward. Verified
+                # empirically (not just solve()'s own report) that this
+                # does not reintroduce the 36th session's wrist_pitch
+                # DYNAMIC instability (qvel stays bounded through physics).
+                result = self._solve_both(wp_targets, {"left": lR, "right": rR}, require_orientation=False,
+                                           ori_task_weight=0.0, rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain)
                 self._apply_ik_result(result)
             action[0:3] = self._waist_action_toward_target()
             action[3:17] = self._arm_action_toward_target()
-            if self._state_step >= 60:
-                self._advance(BimanualGraspState.FOREARM_APPROACH)
+            left_pos = self.env.palm_pose("left")[0]
+            right_pos = self.env.palm_pose("right")[0]
+            pos_err = max(float(np.linalg.norm(self._forward_reach_final["left"] - left_pos)),
+                          float(np.linalg.norm(self._forward_reach_final["right"] - right_pos)))
+            no_collision = (self.env._torso_arm_collision_force() <= cfg.hand_hand_force_limit_n
+                             and self.env._hand_hand_contact_force() <= cfg.hand_hand_force_limit_n)
+            stable_now = (pos_err <= cfg.ik_pos_tol and no_collision
+                          and self._forward_reach_waypoint >= self.FORWARD_REACH_WAYPOINTS)
+            self._forward_reach_stable_streak = self._forward_reach_stable_streak + 1 if stable_now else 0
+            if self._forward_reach_stable_streak >= cfg.forward_reach_stable_streak_required:
+                self._advance(BimanualGraspState.FOREARM_DESCEND)
+            elif self._state_step >= cfg.max_steps_per_state:
+                self._fail(BimanualFailureReason.FORWARD_REACH_NOT_ACHIEVED)
 
-        elif state == BimanualGraspState.FOREARM_APPROACH:
-            # [Session 39 root-cause fix, kept] a FIXED np.eye(3)
-            # orientation at ori_task_weight=0.0 let the position-
-            # redundant DLS solve drift wrist_pitch into a genuinely
-            # dynamically-unstable configuration (armature=0.01,
-            # dof_damping=0). Soft-anchoring toward a target near the
-            # CURRENT orientation avoids this.
-            # [Session 40 addition] "near current" used to mean the exact
-            # current orientation held fixed for all 200 ticks -- this
-            # only guaranteed STABILITY, not that the hand ever ends up
-            # facing the object (Session 40 audit: index/middle
-            # fingertips landed 12-21cm laterally off the object at
-            # FINGERTIP_PRECONTACT with the old fixed-current-orientation
-            # approach). Now the SAME approach position target is re-
-            # solved at APPROACH_ORI_WAYPOINTS waypoints, SLERPing the
-            # orientation target from the entry orientation toward
-            # _object_facing_R and ramping ori_task_weight up gradually
-            # (never a one-shot jump to an independently-chosen
-            # orientation, the exact failure mode that caused the
-            # original instability).
+        elif state == BimanualGraspState.FOREARM_DESCEND:
+            # Same standoff/y_offset as FOREARM_FORWARD_REACH, only Z
+            # descends -- shoulder/elbow do the vertical travel, leaving
+            # FINGERTIP_PRECONTACT only a few cm of final inward motion
+            # (its own waypoints, unchanged). Session 40's object-facing
+            # orientation ramp (opt-in, see BimanualGraspConfig.
+            # object_facing_orientation) moves HERE from the old
+            # FOREARM_APPROACH -- closer to the object, and now with the
+            # SAME posture rest_q bias, which may also reduce the 40th
+            # session's measured torso<->right_wrist_pitch_link
+            # self-collision (untested assumption until re-measured, see
+            # Stage 7 of docs/history/PHASE4_GRASP_SESSION_41.md).
             if cfg.object_facing_orientation:
                 if self._state_step == 0:
                     self._approach_start_R = {s: self.env.palm_pose(s)[1].copy() for s in SIDES}
-                    targets = self._mirrored_targets(cfg.approach_standoff_m, cfg.approach_height_m, cfg.approach_y_offset_m)
+                    targets = self._mirrored_targets(cfg.approach_standoff_m, cfg.descend_height_m, cfg.approach_y_offset_m)
                     obj_pos = self._object_pos()
-                    self._approach_target_R = {
-                        s: _object_facing_R(s, targets[s], obj_pos) for s in SIDES
-                    }
+                    self._approach_target_R = {s: _object_facing_R(s, targets[s], obj_pos) for s in SIDES}
                     self._approach_waypoint = 0
+                    self._descend_stable_streak = 0
                 ticks_per_wp = self.APPROACH_STEPS // self.APPROACH_ORI_WAYPOINTS
                 if self._state_step % ticks_per_wp == 0 and self._approach_waypoint < self.APPROACH_ORI_WAYPOINTS:
                     self._approach_waypoint += 1
                     frac = self._approach_waypoint / self.APPROACH_ORI_WAYPOINTS
                     ori_w = self.APPROACH_ORI_WEIGHT_START + frac * (self.APPROACH_ORI_WEIGHT_END - self.APPROACH_ORI_WEIGHT_START)
-                    targets = self._mirrored_targets(cfg.approach_standoff_m, cfg.approach_height_m, cfg.approach_y_offset_m)
+                    targets = self._mirrored_targets(cfg.approach_standoff_m, cfg.descend_height_m, cfg.approach_y_offset_m)
                     R = {s: _slerp_R(self._approach_start_R[s], self._approach_target_R[s], frac) for s in SIDES}
-                    # Only the FINAL waypoint requires orientation convergence
-                    # (not just position) -- require_orientation=False lets
-                    # solve() stop the instant POSITION converges, which can
-                    # leave orientation error at an arbitrary path-dependent
-                    # value rather than the best the solver could reach; the
-                    # last waypoint spends its full iteration budget closing
-                    # orientation too (still bounded by max_iterations=200,
-                    # still line-search-protected -- not a raw one-shot jump).
                     final_wp = self._approach_waypoint >= self.APPROACH_ORI_WAYPOINTS
-                    result = self._solve_both(targets, R, require_orientation=final_wp, ori_task_weight=ori_w)
+                    result = self._solve_both(targets, R, require_orientation=final_wp, ori_task_weight=ori_w,
+                                               rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain)
                     self._apply_ik_result(result)
-            elif self._state_step == 0:
-                # [Session 39 behavior, preserved as the default -- see
-                # BimanualGraspConfig.object_facing_orientation's
-                # docstring] soft-anchor to whatever orientation is
-                # CURRENTLY held, held fixed for the whole state.
-                targets = self._mirrored_targets(cfg.approach_standoff_m, cfg.approach_height_m, cfg.approach_y_offset_m)
-                lR = self.env.palm_pose("left")[1].copy()
-                rR = self.env.palm_pose("right")[1].copy()
-                result = self._solve_both(targets, {"left": lR, "right": rR}, require_orientation=False, ori_task_weight=0.1)
-                self._apply_ik_result(result)
+            else:
+                if self._state_step == 0:
+                    self._descend_stable_streak = 0
+                    lR = self.env.palm_pose("left")[1].copy()
+                    rR = self.env.palm_pose("right")[1].copy()
+                    targets = self._mirrored_targets(cfg.approach_standoff_m, cfg.descend_height_m, cfg.approach_y_offset_m)
+                    result = self._solve_both(targets, {"left": lR, "right": rR}, require_orientation=False,
+                                               ori_task_weight=0.1, rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain)
+                    self._apply_ik_result(result)
             action[0:3] = self._waist_action_toward_target()
             action[3:17] = self._arm_action_toward_target()
-            if self._state_step >= self.APPROACH_STEPS:
+            targets = self._mirrored_targets(cfg.approach_standoff_m, cfg.descend_height_m, cfg.approach_y_offset_m)
+            left_pos = self.env.palm_pose("left")[0]
+            right_pos = self.env.palm_pose("right")[0]
+            pos_err = max(float(np.linalg.norm(targets["left"] - left_pos)), float(np.linalg.norm(targets["right"] - right_pos)))
+            no_collision = (self.env._torso_arm_collision_force() <= cfg.hand_hand_force_limit_n
+                             and self.env._hand_hand_contact_force() <= cfg.hand_hand_force_limit_n)
+            stable_now = pos_err <= cfg.ik_pos_tol and no_collision
+            self._descend_stable_streak = self._descend_stable_streak + 1 if stable_now else 0
+            if self._descend_stable_streak >= cfg.descend_stable_streak_required:
                 self._advance(BimanualGraspState.WRIST_ALIGN)
+            elif self._state_step >= cfg.max_steps_per_state:
+                self._fail(BimanualFailureReason.DESCEND_NOT_ACHIEVED)
 
         elif state == BimanualGraspState.WRIST_ALIGN:
             # [This session's design, after the original re-solve-with-

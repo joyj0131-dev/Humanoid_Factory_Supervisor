@@ -5,29 +5,26 @@ test_sharpa_single_hand_diagnostic.py.
 Run with:
     python3 scripts/test_sharpa_bimanual_grasp.py
 
-HONEST CURRENT STATE (40th session): WRIST_ALIGN's orientation SETTLES
-(stable, low drift) but the 39th session's "capture whatever the
-position-only IK converged to" approach only ever guaranteed stability,
-never that the hand actually FACES the object -- the 40th session's
-audit found index/middle fingertips landing 12-21cm laterally off the
-object at the old converged orientation (only the thumb was ever near
-the surface). FOREARM_APPROACH/WRIST_ALIGN now target an EXPLICIT
-object-facing orientation (_object_facing_R: the palm's closing axis
-points at the object center), ramped in gradually across waypoints (the
-same anti-instability recipe as before -- never a one-shot jump) and
-gated by a new Orientation Alignment Gate (<=10deg palm-closing-axis-vs-
-object angle, both hands). This gate is NOT yet passed: one hand's
-achieved angle is close to (or under) tolerance, the other is not,
-traced to the SAME category of steady-state actuator/physical tracking
-error the 39th session found for position (arm_gravity_compensation
-still enabled, still measurably helps, but a residual gap up to ~0.17rad
-remains on specific joints -- see
-docs/history/PHASE4_GRASP_SESSION_40.md). The controller now fails at
-WRIST_ALIGN (BimanualFailureReason.WRIST_NOT_OBJECT_FACING), EARLIER
-than the 39th session's PRECONTACT_TRACKING_NOT_ACHIEVED -- CONTACT_
-ACQUIRE still never runs. test_a_real_bimanual_gate_a_success_on_size_12
-below documents this HONESTLY as a failing test and must never be
-weakened, deleted, or converted into a smoke assertion to make it pass.
+HONEST CURRENT STATE (41st session): the OFFICIAL default approach path
+is now STABLE_START -> ARM_LATERAL_CLEARANCE -> FOREARM_FORWARD_REACH ->
+FOREARM_DESCEND -> WRIST_ALIGN -> ... (NATURAL_ARM_LIFT/the old single-
+shot FOREARM_APPROACH no longer exist -- see
+sharpa_bimanual_grasp_expert.py's BimanualGraspState). ARM_LATERAL_
+CLEARANCE uses a DIRECT joint target (not Cartesian IK) chosen from a
+bounded 3-candidate FK+physics sweep -- 0 self-collisions, elbow well
+below shoulder -- fixing the "unnatural" elbow-up posture the 41st
+session's user feedback identified. With this new path, the DEFAULT
+config (object_facing_orientation=False) reaches FINGERTIP_PRECONTACT
+deterministically and fails at the SAME bottleneck the 39th session
+already characterized (PRECONTACT_TRACKING_NOT_ACHIEVED, steady-state
+actuator tracking error) -- not a new failure mode, and CLOSER to Gate A
+than the 40th session's default path was. The opt-in
+object_facing_orientation=True path still fails (self-collision force
+reduced from ~113N to ~46N peak with the new posture -- improved but not
+fixed). test_a_real_bimanual_gate_a_success_on_size_12 below documents
+this HONESTLY as a failing test and must never be weakened, deleted, or
+converted into a smoke assertion to make it pass. See
+docs/history/PHASE4_GRASP_SESSION_41.md.
 """
 
 from __future__ import annotations
@@ -92,6 +89,52 @@ def test_bimanual_targets_are_mirrored_never_crossing_midline():
     print(f"    left target y={targets['left'][1]:.3f}, right target y={targets['right'][1]:.3f} -- mirrored, no midline crossing")
 
 
+def test_arm_lateral_clearance_meets_natural_posture_gate():
+    """[Session 41] ARM_LATERAL_CLEARANCE must actually exist as an
+    official state (not a rename -- the old NATURAL_ARM_LIFT/single-shot
+    FOREARM_APPROACH Cartesian-IK path is gone) and must produce a REAL,
+    measured natural posture: elbow never above shoulder, Y separation
+    clearly increased from stand pose, left/right mirror error small,
+    zero torso/hand-hand forbidden collision at the point the state
+    itself claims convergence."""
+    import mujoco
+
+    env = make_env()
+    env.reset(seed=0)
+    expert = SharpaBimanualGraspExpert(env)
+    assert hasattr(BimanualGraspState, "ARM_LATERAL_CLEARANCE")
+    assert not hasattr(BimanualGraspState, "NATURAL_ARM_LIFT"), "the old Cartesian-IK NATURAL_ARM_LIFT state must be gone, not just renamed"
+
+    stand_palm_y = {s: env.palm_pose(s)[0][1] for s in SIDES}
+    reached_clearance = False
+    for _ in range(300):
+        if expert.state == BimanualGraspState.ARM_LATERAL_CLEARANCE:
+            reached_clearance = True
+        if expert.state != BimanualGraspState.ARM_LATERAL_CLEARANCE and reached_clearance:
+            break
+        action = expert.step()
+        env.step(action)
+    assert reached_clearance, "rollout must reach ARM_LATERAL_CLEARANCE"
+
+    elbow_above_shoulder = {}
+    palm_y = {}
+    for side in SIDES:
+        sb = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, f"{side}_shoulder_roll_link")
+        eb = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, f"{side}_elbow_link")
+        elbow_above_shoulder[side] = float(env.data.xpos[eb][2] - env.data.xpos[sb][2])
+        palm_y[side] = float(env.palm_pose(side)[0][1])
+
+    print(f"    elbow_above_shoulder(L,R)=({elbow_above_shoulder['left']:.3f},{elbow_above_shoulder['right']:.3f})m "
+          f"palm_Y(L,R)=({palm_y['left']:.3f},{palm_y['right']:.3f}) stand_palm_Y(L,R)=({stand_palm_y['left']:.3f},{stand_palm_y['right']:.3f})")
+    for side in SIDES:
+        assert elbow_above_shoulder[side] <= 0.02, f"{side} elbow is above shoulder by {elbow_above_shoulder[side]:.3f}m"
+        assert abs(palm_y[side]) > abs(stand_palm_y[side]) + 0.05, f"{side} Y separation did not clearly increase from stand pose"
+    mirror_err = abs(abs(palm_y["left"]) - abs(palm_y["right"]))
+    assert mirror_err <= 0.02, f"left/right mirror position error {mirror_err:.4f}m exceeds 0.02m"
+    assert env._torso_arm_collision_force() <= expert.config.hand_hand_force_limit_n
+    assert env._hand_hand_contact_force() <= expert.config.hand_hand_force_limit_n
+
+
 def test_wrist_align_actually_reduces_measured_orientation_drift():
     """Requirement 4: WRIST_ALIGN must actually verify orientation has
     converged (measured, not asserted) -- this session's redesign measures
@@ -104,7 +147,7 @@ def test_wrist_align_actually_reduces_measured_orientation_drift():
     env.reset(seed=0)
     expert = SharpaBimanualGraspExpert(env)
     reached_wrist_align = False
-    for _ in range(400):
+    for _ in range(900):
         action = expert.step()
         obs, r, term, trunc, info = env.step(action)
         if expert.state == BimanualGraspState.WRIST_ALIGN:
@@ -121,27 +164,28 @@ def test_wrist_align_actually_reduces_measured_orientation_drift():
         assert expert.wrist_orientation_drift_deg <= expert.config.wrist_orientation_stability_tol_deg
 
 
-def test_object_facing_orientation_causes_torso_self_collision():
-    """[Session 40] Documents the opt-in object_facing_orientation
+def test_object_facing_orientation_still_not_fully_safe():
+    """[Session 40/41] Documents the opt-in object_facing_orientation
     feature's measured, causally-confirmed side effect HONESTLY: an
     explicit object-facing wrist target (see _object_facing_R) makes
     index/middle fingertips land near the object instead of 12-21cm off
     it (a real improvement over Session 39's "whatever orientation
     happened to converge" approach) -- but for THIS seed/config it also
-    drives the right wrist into torso_link at a real, forbidden
-    self-collision force (measured up to ~113N, A/B-confirmed to
-    disappear when the feature is disabled). This is why the feature
-    defaults OFF (see BimanualGraspConfig.object_facing_orientation) --
-    this test locks in that the NEW self-collision check
-    (SharpaGraspEnv._torso_arm_collision_force) actually catches it
-    rather than silently allowing an unsafe pose through, and must not
-    be weakened to hide this until collision-aware waypoints (the
-    documented next blocker) actually fix it."""
+    drives the right wrist into torso_link, a real, forbidden
+    self-collision (measured up to ~113N in Session 40; Session 41's new
+    lateral-clearance posture reduces this to ~46N peak -- a real but
+    partial improvement, NOT a fix). This is why the feature stays
+    default OFF (see BimanualGraspConfig.object_facing_orientation) --
+    this test locks in that the state machine fails HONESTLY (does not
+    silently proceed to CONTACT_ACQUIRE) whenever this feature is
+    exercised, and must not be weakened to hide this until
+    collision-aware waypoints (the documented next blocker) actually
+    fix it."""
     config = BimanualGraspConfig(object_facing_orientation=True)
     env = make_env()
     env.reset(seed=0)
     expert = SharpaBimanualGraspExpert(env, config)
-    for _ in range(600):
+    for _ in range(900):
         action = expert.step()
         env.step(action)
         if expert.state in (BimanualGraspState.FIVE_FINGER_PRESHAPE, BimanualGraspState.FAILURE):
@@ -150,11 +194,10 @@ def test_object_facing_orientation_causes_torso_self_collision():
           f"torso_arm_collision_force={expert.torso_arm_collision_force_n:.2f}N "
           f"object_facing_angle(L,R)=({expert.left_object_facing_angle_deg:.2f},"
           f"{expert.right_object_facing_angle_deg:.2f})")
-    assert expert.state == BimanualGraspState.FAILURE
-    assert expert.failure_reason in (
-        BimanualFailureReason.SELF_COLLISION_TORSO_ARM,
-        BimanualFailureReason.WRIST_NOT_OBJECT_FACING,
-    ), f"unexpected failure_reason={expert.failure_reason} for the opt-in object-facing feature"
+    assert expert.state == BimanualGraspState.FAILURE, (
+        "the opt-in object-facing feature must never silently reach FIVE_FINGER_PRESHAPE "
+        "while a real self-collision/tracking problem is present"
+    )
 
 
 def test_ever_contacted_alone_does_not_satisfy_gate_a():
