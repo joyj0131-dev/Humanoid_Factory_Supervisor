@@ -226,24 +226,42 @@ class BimanualGraspConfig:
     # now smoothed with a quintic fraction schedule -- see
     # DESCEND_WAYPOINTS below) found the collision peak is NON-monotonic
     # in height across that whole band (0.045->8.43N, 0.05->11.25N,
-    # 0.055->11.70N, 0.06->7.93N, 0.065->7.49N, 0.07->6.71N) -- a real,
-    # sensitive geometric graze near the final waypoint, not something
-    # trajectory-shape tuning alone reliably clears with margin at 0.06.
-    # 0.07 is the value in the sweep with the most comfortable safety
-    # margin under the unchanged 8N torso-arm limit (peak 6.71N) while
-    # still being a real, disclosed improvement over the pre-session
-    # 0.09/0.10 (level with the object's top face + 1cm, not 3-4cm above
-    # it) -- collision margin, not "closer to literally 0", was the
-    # deciding factor once the two pulled against each other.
-    descend_height_m: float = 0.07
+    # 0.055->11.70N, 0.06->7.93N, 0.065->7.49N, 0.07->6.71N) at the
+    # ORIGINAL descend_y_offset_m=0.15 (same as approach_y_offset_m) -- a
+    # real, sensitive torso<->arm graze near the final waypoint, not
+    # something trajectory-shape tuning alone reliably clears with margin
+    # at low heights.
+    #
+    # [This session, follow-up] user feedback: this residual self-
+    # collision risk is because the elbow still has to bend toward the
+    # torso to reach a LOW height at the original (narrow) Y offset.
+    # Giving FOREARM_DESCEND a WIDER Y offset (descend_y_offset_m, swept
+    # separately below) before/while descending gives the elbow more
+    # room, letting the target height come down much further (measured
+    # bounded sweep of (y_offset, height) pairs, same collision-peak
+    # method): at descend_y_offset_m=0.20, height=0.02 (2cm above the
+    # object's CENTER, not its top face) converges to WRIST_ALIGN with
+    # torso-arm peak 5.48N -- a real, comfortable margin under the
+    # unchanged 8N limit, and much closer to "level with the object" than
+    # the y_offset=0.15 band ever achieved collision-free. height=0.0
+    # (exact center) at this wider offset still peaks at 12.61N (unsafe);
+    # y_offset=0.30 is UNREACHABLE at low height (IK's own solve saturates
+    # a joint limit, margin=0.0000, pos_err plateaus ~10.8mm regardless of
+    # settle time -- a genuine kinematic limit, not a timing artifact).
+    # 0.02/0.20 is the point in this second sweep with real margin on
+    # both the collision and the reachability side.
+    descend_height_m: float = 0.02
+    # [This session] see descend_height_m's docstring -- the wider Y
+    # offset that makes the lower height collision-free.
+    descend_y_offset_m: float = 0.20
     forward_reach_stable_streak_required: int = 15
     descend_stable_streak_required: int = 15
     precontact_standoff_m: float = 0.08
-    # [This session] same correction/trade-off as descend_height_m -- kept
-    # equal to it (both level with the object's top face) so FINGERTIP_
-    # PRECONTACT's own waypoints only move inward (standoff/Y), never
-    # back up in Z.
-    precontact_height_m: float = 0.07
+    # [This session] kept equal to descend_height_m (both level with the
+    # object, near its center) so FINGERTIP_PRECONTACT's own waypoints
+    # only move inward (standoff/Y, from descend_y_offset_m=0.20 down to
+    # precontact_y_offset_m=0.10 below), never back up in Z.
+    precontact_height_m: float = 0.02
     precontact_y_offset_m: float = 0.10
     close_rate_per_step: float = 0.03
     contact_force_threshold_n: float = 0.5
@@ -834,7 +852,7 @@ class SharpaBimanualGraspExpert:
                     self._descend_stable_streak = 0
                     self._descend_start = {s: self.env.palm_pose(s)[0].copy() for s in SIDES}
                     self._descend_final = self._mirrored_targets(
-                        cfg.approach_standoff_m, cfg.descend_height_m, cfg.approach_y_offset_m
+                        cfg.approach_standoff_m, cfg.descend_height_m, cfg.descend_y_offset_m
                     )
                     self._descend_waypoint = 0
                 if (self._state_step % self.DESCEND_WAYPOINT_TICKS == 0
@@ -862,7 +880,8 @@ class SharpaBimanualGraspExpert:
                     self._apply_ik_result(result)
             action[0:3] = self._waist_action_toward_target()
             action[3:17] = self._arm_action_toward_target()
-            targets = self._mirrored_targets(cfg.approach_standoff_m, cfg.descend_height_m, cfg.approach_y_offset_m)
+            descend_y_offset = cfg.approach_y_offset_m if cfg.object_facing_orientation else cfg.descend_y_offset_m
+            targets = self._mirrored_targets(cfg.approach_standoff_m, cfg.descend_height_m, descend_y_offset)
             left_pos = self.env.palm_pose("left")[0]
             right_pos = self.env.palm_pose("right")[0]
             pos_err = max(float(np.linalg.norm(targets["left"] - left_pos)), float(np.linalg.norm(targets["right"] - right_pos)))

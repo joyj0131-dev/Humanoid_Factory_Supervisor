@@ -191,18 +191,24 @@ def test_descend_reaches_object_level_height_without_forbidden_collision():
     """[This session, user-directed geometry correction] Live-viewer
     feedback: the hand must come down BESIDE the object, level with it,
     not descend onto its top. descend_height_m/precontact_height_m moved
-    from +0.10/+0.09 (3-4cm above the object's TOP face) to +0.07 (about
-    1cm above the top face -- height=0.0, exactly level with the
-    object's CENTER, was tried first and measured to be physically
+    from +0.10/+0.09 (3-4cm above the object's TOP face) toward the
+    object's own center. height=0.0 at the original (narrow)
+    descend_y_offset_m=0.15 was tried first and measured to be physically
     infeasible: a real, growing torso<->arm contact resistance prevents
-    convergence, not a timing artifact). A bounded height sweep further
-    found the collision peak non-monotonic near the object's top face, so
-    0.07 was chosen for its comfortable safety margin (peak ~6.7N)
-    under the unchanged 8N torso-arm limit, not because it is the
-    smallest value tried. This test locks in that FOREARM_DESCEND now
-    actually reaches its target and WRIST_ALIGN, with real forbidden
-    collision forces measured (not assumed zero) safely under the
-    unchanged limit throughout the state."""
+    convergence (the elbow has to bend toward the torso to reach a low
+    height at a narrow lateral offset), not a timing artifact. A second
+    bounded sweep over (descend_y_offset_m, descend_height_m) pairs found
+    that widening the offset to 0.20 (a wider swing before/while
+    descending, independent of approach_y_offset_m -- FOREARM_FORWARD_
+    REACH's own already-fixed offset is untouched) lets the target height
+    come down to +0.02 (2cm above the object's CENTER, not its top face)
+    with a comfortable torso-arm margin (peak ~5.5N under the unchanged
+    8N limit); y_offset=0.30 was also tried and found kinematically
+    UNREACHABLE at low height (IK's own solve saturates a joint limit,
+    not a timing artifact either). This test locks in that FOREARM_DESCEND
+    now actually reaches its (now much more level, wider-offset) target
+    and WRIST_ALIGN, with real forbidden collision forces measured (not
+    assumed zero) safely under the unchanged limit throughout the state."""
     env = make_env()
     env.reset(seed=0)
     expert = SharpaBimanualGraspExpert(env)
