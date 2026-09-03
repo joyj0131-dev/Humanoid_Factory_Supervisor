@@ -63,51 +63,74 @@ small final inward move. Fixed by passing rest_q=self._clearance_target
 0.00N, and explicit torso-arm/hand-table fail-fast checks were added to
 FINGERTIP_PRECONTACT's own gate (previously only checked hand-hand).
 
-[Superseded, previous session] The rollout used to reach FINGERTIP_
+[Superseded, earlier session] The rollout used to reach FINGERTIP_
 PRECONTACT and fail there with PRECONTACT_TRACKING_NOT_ACHIEVED, with
 the Side-Grasp Posture Gate reporting PASS along the way.
 
-[This session -- Functional Orientation fix] That PASS was found to rest
-on a CIRCULAR metric: inward_angle_deg compared palm_R column 1 (the
-axis the wrist was SOLVED to align) against the object direction, so it
-could only ever report solver noise. A real, independent empirical audit
+[Functional Orientation fix] That PASS was found to rest on a CIRCULAR
+metric: inward_angle_deg compared palm_R column 1 (the axis the wrist
+was SOLVED to align) against the object direction, so it could only ever
+report solver noise. A real, independent empirical audit
 (scripts/audit_sharpa_local_closing_frame.py: hold the wrist fixed,
 apply an actual curl delta, read where the fingertips really move) found
 the TRUE closing axis is ~50deg off from that assumption. _object_
 facing_R is rebuilt via a 2-vector Kabsch/Wahba fit against the real
-axis (see that function's docstring in sharpa_bimanual_grasp_expert.py),
-and WRIST_SIDE_GRASP_ALIGN's own staging height/y_offset are raised
-because the old values were only ever proven safe under the WRONG
-orientation.
+axis (see that function's docstring in sharpa_bimanual_grasp_expert.py).
 
-Verified end-to-end (real env.step() physics): WRIST_SIDE_GRASP_ALIGN
-and FIVE_FINGER_PRESHAPE now measure 0.00N torso-arm, palm-inward angle
-13.7-14.4deg on the REAL non-circular metric (both hands, under the
-unchanged 15deg tolerance), and a real small-curl probe
-(_measure_functional_orientation) showing 4/4 nonthumb fingertips moving
-toward the object with >2mm net inward displacement -- the NEW
-Functional Orientation Gate (Section 9) genuinely PASSES here (see
-test_functional_orientation_gate_passes), and the (also corrected) OLD
-Side-Grasp Posture Gate passes too (test_side_grasp_posture_gate_passes,
-finger_down tolerance widened from 25 to 40deg -- a disclosed, measured
-byproduct of correctly aligning the closing axis, not a workaround: see
-side_grasp_finger_down_tol_deg's docstring).
+[Audit session] The commit that first landed this fix used a weight pair
+(0.95/0.05) that, while satisfying the closing-axis tolerance, forced
+finger_down to ~35deg -- and "fixed" the resulting Gate failure by
+WIDENING the Gate's own tolerance (25->40deg), an improper Gate
+relaxation. The SAME over-aggressive weight also caused an UNDISCLOSED
+upstream cause of a genuine ~200-300N torso-arm self-collision in
+FOREARM_SIDE_DESCEND: it forced a rotation large enough that the
+redundant 17-DOF solver needed a torso-colliding branch to also satisfy
+translation. Both were audited and fixed THIS session, not just
+diagnosed:
+  - side_grasp_finger_down_tol_deg reverted to its original 25deg (never
+    relaxed again).
+  - _object_facing_R's weight pair re-derived via a real-physics grid
+    sweep (0.68/0.32) that satisfies BOTH the unchanged 15deg
+    (closing-axis) and 25deg (finger-down) tolerances with real margin
+    (measured: inward 12.6-12.7deg, finger-down 22.6deg, both hands).
+  - FOREARM_SIDE_DESCEND's torso-arm collision is GONE under this
+    weight pair (0.00N, real physics, seed=0) -- it was never actually a
+    DESCEND-specific rest_q/path problem; fixing the upstream rotation
+    magnitude fixed it. A separate, small (~11.4mm) tracking-residual
+    plateau this surfaced (the wp10 solve's own claimed pos_error does
+    not survive the post-waypoint settle tail) is fixed by a periodic
+    correction re-solve after the waypoint schedule is exhausted (see
+    FOREARM_SIDE_DESCEND's docstring) -- the rollout now reaches
+    FINGERTIP_PRECONTACT again.
+  - The Functional Orientation Gate (Section 9) is rebuilt as an ACTUAL
+    combination of independently-measured subgates (finger-closure
+    direction >=3/4 fingers + >2mm, thumb opposition, palm-inside angle
+    <=15deg, finger-down angle <=25deg, swept torso-arm/hand-table
+    collision) -- see _measure_functional_orientation. The prior commit's
+    function of the same name only ever checked the 4-finger closure
+    direction (renamed _measure_finger_closure_direction) and never
+    checked thumb, never gated on finger-down, never checked collision
+    history.
+  - curl_target=0.95 in FOREARM_SIDE_DESCEND was re-verified (not just
+    inherited) under the corrected orientation: a real sweep over {0.3,
+    0.5, 0.6, 0.7, 0.8, 0.95} shows only 0.95 clears hand-table collision
+    (0.23N vs 8.1-14.9N for lower values) -- genuinely required, not an
+    artifact of the old orientation, though the true remaining fingertip
+    travel at 0.95 (~7mm, ~1.5mm toward the object, before the
+    CLOSE_FRACTION=0.85 ceiling) is disclosed as small.
 
-FOREARM_SIDE_DESCEND does NOT yet safely carry this corrected, larger
-reorientation through its own translate -- a genuine torso-arm self-
-collision (~200-300N) appears partway through, confirmed (this session,
-bounded investigation, see that state's own docstring) insensitive to
-waypoint count, curl target, and the descend target position itself; a
-higher shared rest_gain removes it here but breaks FOREARM_FORWARD_
-REACH elsewhere. This is a NEW, disclosed, NOT-yet-resolved blocker
-(SIDE_DESCEND_NOT_ACHIEVED) -- the rollout now stops one state earlier
-than the previous session's PRECONTACT_TRACKING_NOT_ACHIEVED, a real
-trade-off: this session prioritized functional orientation correctness
-over rollout depth, per explicit instruction not to touch Precontact
-tracking until the Functional Orientation Gate passes.
-test_a_real_bimanual_gate_a_success_on_size_12 below documents the
-overall Gate A outcome HONESTLY as a failing test and must never be
-weakened, deleted, or converted into a smoke assertion to make it pass.
+Verified end-to-end (real env.step() physics, seed=0, reproduced 3x):
+WRIST_SIDE_GRASP_ALIGN and FIVE_FINGER_PRESHAPE measure 0.00N torso-arm,
+0.76N hand-table; FOREARM_SIDE_DESCEND measures 0.00N torso-arm, 0.23N
+hand-table and reaches FINGERTIP_PRECONTACT; both the Side-Grasp Posture
+Gate and the (rebuilt) Functional Orientation Gate genuinely PASS under
+the ORIGINAL, unrelaxed tolerances. The rollout then fails at
+FINGERTIP_PRECONTACT with PRECONTACT_TRACKING_NOT_ACHIEVED -- a known,
+separate, disclosed blocker (Precontact tracking, out of THIS session's
+scope) documented since Session 39; test_a_real_bimanual_gate_a_success_
+on_size_12 below documents the overall Gate A outcome HONESTLY as a
+failing test and must never be weakened, deleted, or converted into a
+smoke assertion to make it pass.
 """
 
 from __future__ import annotations
@@ -307,14 +330,15 @@ def test_forward_reach_gate_now_passes_and_advances_to_next_blocker():
     assert not collision_during_forward_reach
 
     # Full rollout: still honestly fails later, at a separate gate.
-    # [This session] Both the Side-Grasp Posture Gate AND the new
-    # Functional Orientation Gate now pass en route -- see
+    # [Audit session] Both the Side-Grasp Posture Gate AND the (rebuilt)
+    # Functional Orientation Gate pass en route -- see
     # test_side_grasp_posture_gate_passes / test_functional_orientation_
-    # gate_passes. The rollout now stops one state earlier than the
-    # previous session (SIDE_DESCEND_NOT_ACHIEVED, not PRECONTACT_
-    # TRACKING_NOT_ACHIEVED) -- a disclosed, real trade-off: see
-    # FOREARM_SIDE_DESCEND's own docstring for the new torso-arm
-    # collision this corrected, larger reorientation uncovered there.
+    # gate_passes. FOREARM_SIDE_DESCEND's torso-arm collision (a prior
+    # commit's improper Gate relaxation's undisclosed side effect) is
+    # fixed -- the rollout now reaches FINGERTIP_PRECONTACT again and
+    # fails there with PRECONTACT_TRACKING_NOT_ACHIEVED, a known, separate,
+    # disclosed blocker (documented since Session 39) out of this
+    # session's scope.
     env2 = make_env()
     expert2 = SharpaBimanualGraspExpert(env2)
     outcome = expert2.run(max_total_steps=2000)
@@ -322,9 +346,10 @@ def test_forward_reach_gate_now_passes_and_advances_to_next_blocker():
           f"side_grasp_gate={outcome.side_grasp_gate} functional_orientation_gate={outcome.functional_orientation_gate}")
     assert outcome.side_grasp_gate is True, "Side-Grasp Posture Gate should still pass en route to the current next blocker"
     assert outcome.functional_orientation_gate is True, "Functional Orientation Gate should pass en route"
-    assert outcome.failure_reason == BimanualFailureReason.SIDE_DESCEND_NOT_ACHIEVED, (
-        "expected the CURRENT next independent blocker (FOREARM_SIDE_DESCEND's new torso-arm collision "
-        "under the corrected orientation); if this changed, the docstring/PROJECT_CONTEXT next-blocker note is now stale"
+    assert outcome.failure_reason == BimanualFailureReason.PRECONTACT_TRACKING_NOT_ACHIEVED, (
+        "expected the CURRENT next independent blocker (FINGERTIP_PRECONTACT's own tracking gap, "
+        "unrelated to this session's orientation fix); if this changed, the docstring/PROJECT_CONTEXT "
+        "next-blocker note is now stale"
     )
 
 
@@ -336,14 +361,16 @@ def test_side_grasp_posture_gate_passes():
     ALIGN itself gates the transition on -- not a looser or separately-
     computed check.
 
-    [This session] inward_angle_deg and normals_opposed are now backed
-    by the REAL, non-circular closing axis (see _object_facing_R's and
-    _object_facing_angle_deg's docstrings) instead of the previous
-    session's circularly-verified palm_R-column-1 assumption --
-    side_grasp_finger_down_tol_deg is widened 25->40deg, a disclosed,
-    measured byproduct of correctly aligning the closing axis (see that
-    field's own docstring for the insensitivity check ruling out a free
-    tunable parameter)."""
+    inward_angle_deg and normals_opposed are backed by the REAL,
+    non-circular closing axis (see _object_facing_R's and
+    _object_facing_angle_deg's docstrings) instead of the old
+    circularly-verified palm_R-column-1 assumption. [Audit session]
+    side_grasp_finger_down_tol_deg stays at its ORIGINAL 25deg -- a prior
+    commit widened it to 40deg to paper over a finger-down residual
+    caused by an overly-aggressive orientation weight; that Gate
+    relaxation is reverted, and _object_facing_R's weight pair is
+    re-derived instead so the ORIGINAL 25deg tolerance is met with real
+    margin (see that field's own docstring)."""
     env = make_env()
     expert = SharpaBimanualGraspExpert(env)
     outcome = expert.run(max_total_steps=2000)
@@ -352,6 +379,10 @@ def test_side_grasp_posture_gate_passes():
     for k, v in m.items():
         print(f"      {k}: {v}")
     assert m, "WRIST_SIDE_GRASP_ALIGN must be reached and measured (posture dict must not be empty)"
+    assert expert.config.side_grasp_finger_down_tol_deg == 25.0, (
+        "finger-down tolerance must stay at its ORIGINAL 25deg -- a prior commit improperly widened this "
+        "to 40deg to paper over an orientation problem instead of fixing it; this must never regress"
+    )
     assert outcome.side_grasp_gate is True
     assert all(m["outside_side_face"].values()), "both palms must be outside the object's own side faces"
     assert m["inward_angle_deg"]["left"] <= expert.config.side_grasp_inward_angle_tol_deg
@@ -426,23 +457,29 @@ def test_side_grasp_swept_path_has_no_forbidden_collision_before_side_descend():
     assert max_hand_hand <= limit
 
 
-def test_side_descend_now_fails_on_torso_collision_under_corrected_orientation():
-    """[This session -- DISCLOSED NEW BLOCKER, honest failing-state test,
-    same spirit as test_a_real_bimanual_gate_a_success_on_size_12] The
-    previous session's FOREARM_SIDE_DESCEND fix (curl retraction, ~2.96N
-    hand-table) was tuned around the OLD, circularly-verified orientation.
-    Under the corrected orientation (see module docstring), this state
-    now hits a genuine torso-arm self-collision instead, confirmed (this
-    session) insensitive to waypoint count/curl target/descend target
-    position -- see FOREARM_SIDE_DESCEND's own docstring for the bounded
-    investigation. This test locks in the CURRENT honest failure mode
-    (FOREARM_SIDE_DESCEND is reached, and the rollout fails there) rather
-    than asserting a fix that does not exist yet -- it must be updated,
-    not silently deleted, once FOREARM_SIDE_DESCEND is actually fixed."""
+def test_side_descend_reaches_precontact_with_zero_torso_collision():
+    """[Audit session] A prior commit on this branch reproduced a genuine
+    ~200-300N torso-arm self-collision here, disclosed but left on the
+    rollout's DEFAULT (only) path -- an unfixed safety regression. Root-
+    caused THIS session: it was not a DESCEND-specific rest_q/path
+    problem at all -- the same commit's overly-aggressive _object_
+    facing_R weight (0.95) forced a rotation large enough that the
+    redundant 17-DOF solver needed a torso-colliding branch to also
+    satisfy translation. Fixing the upstream weight (see _object_facing_
+    R's docstring) makes this collision GONE (0.00N, real physics) with
+    NO DESCEND-specific posture/path change. A separate, small (~11.4mm)
+    tracking-residual plateau this surfaced is fixed by a periodic
+    correction re-solve after the waypoint schedule is exhausted (see
+    FOREARM_SIDE_DESCEND's own docstring) -- the rollout now reaches
+    FINGERTIP_PRECONTACT swept-clean, at every tick through this state,
+    not just at the endpoint."""
     env = make_env()
     env.reset(seed=0)
     expert = SharpaBimanualGraspExpert(env)
     reached_descend = False
+    reached_precontact = False
+    max_torso_arm = 0.0
+    max_hand_table = 0.0
     for _ in range(1800):
         if expert.state in (BimanualGraspState.SUCCESS, BimanualGraspState.FAILURE):
             break
@@ -450,10 +487,20 @@ def test_side_descend_now_fails_on_torso_collision_under_corrected_orientation()
         env.step(action)
         if expert.state == BimanualGraspState.FOREARM_SIDE_DESCEND:
             reached_descend = True
-    print(f"    reached_descend={reached_descend} final_state={expert.state.name} reason={expert.failure_reason}")
+            max_torso_arm = max(max_torso_arm, env._torso_arm_collision_force())
+            max_hand_table = max(max_hand_table, env._hand_table_contact_force())
+        if expert.state == BimanualGraspState.FINGERTIP_PRECONTACT:
+            reached_precontact = True
+            break
+    print(f"    reached_descend={reached_descend} reached_precontact={reached_precontact} "
+          f"max_torso_arm={max_torso_arm:.2f}N max_hand_table={max_hand_table:.2f}N "
+          f"final_state={expert.state.name} reason={expert.failure_reason}")
     assert reached_descend, "FOREARM_SIDE_DESCEND must still be reached (WRIST_SIDE_GRASP_ALIGN/FIVE_FINGER_PRESHAPE unaffected)"
-    assert expert.state == BimanualGraspState.FAILURE
-    assert expert.failure_reason == BimanualFailureReason.SIDE_DESCEND_NOT_ACHIEVED
+    limit = expert.config.hand_hand_force_limit_n
+    assert max_torso_arm <= limit, f"FOREARM_SIDE_DESCEND torso-arm collision {max_torso_arm:.2f}N must not regress above {limit}N"
+    assert max_torso_arm == 0.0, "the specific ~200-300N regression this test guards against must be fully gone, not merely under the limit"
+    assert max_hand_table <= limit
+    assert reached_precontact, "FOREARM_SIDE_DESCEND must now converge and advance to FINGERTIP_PRECONTACT"
 
 
 def test_ever_contacted_alone_does_not_satisfy_gate_a():
@@ -659,23 +706,42 @@ def _run_to_align_end(env) -> SharpaBimanualGraspExpert:
 
 
 def test_functional_orientation_gate_passes():
-    """[This session] The core deliverable: a REAL, non-circular check
-    that the hand can actually functionally close onto the object --
-    applies an actual small additional closure from the CURRENT preshape
-    state and reads where the fingertips really move (never trusting
-    palm_R column 1). Must pass for BOTH hands independently (Section 4:
-    '좌우 손 모두 독립적으로 통과')."""
+    """The core deliverable: a REAL, non-circular check that the hand can
+    actually functionally close onto the object -- applies an actual
+    small additional closure from the CURRENT preshape state and reads
+    where the fingertips really move (never trusting palm_R column 1).
+    Must pass for BOTH hands independently (Section 4: '좌우 손 모두
+    독립적으로 통과').
+
+    [Audit session] The Gate is now an ACTUAL combination of independently
+    -measured subgates, not just the 4-finger closure-direction check a
+    prior commit used under this same function name: Finger-Closure
+    Direction Subgate, Thumb Opposition Subgate, palm-inside angle,
+    finger-down angle (at the ORIGINAL, un-relaxed 25deg), and swept
+    collision. Every sub-condition is asserted explicitly below so a
+    future change that silently drops one of them fails this test."""
     env = make_env()
     expert = _run_to_align_end(env)
     result = expert._measure_functional_orientation()
     print(f"    functional_orientation gate={result['gate']}")
+    fc = result["finger_closure_direction"]
+    th = result["thumb_opposition"]
+    assert fc["gate"] is True, "Finger-Closure Direction Subgate must pass"
+    assert th["gate"] is True, "Thumb Opposition Subgate must pass"
+    assert result["inward_ok"] is True
+    assert result["finger_down_ok"] is True
+    assert result["swept_collision_ok"] is True
     for side in SIDES:
-        r = result["per_side"][side]
+        r = fc["per_side"][side]
+        t = th["per_side"][side]
         print(f"      {side}: n_positive={r['n_positive']} mean_disp_inward_mm={r['mean_disp_inward_mm']:.3f} "
-              f"inward_angle_deg={r['inward_angle_deg']:.2f}")
+              f"inward_angle_deg={r['inward_angle_deg']:.2f} finger_down_deg={r['finger_down_deg']:.2f} "
+              f"thumb_opposed={t['opposed']} aperture_mm={t['aperture_dist_mm']:.1f}")
         assert r["n_positive"] >= 3, f"{side}: fewer than 3/4 nonthumb fingers move toward the object"
         assert r["mean_disp_inward_mm"] > 2.0, f"{side}: mean inward displacement not >2mm"
         assert r["inward_angle_deg"] <= expert.config.side_grasp_inward_angle_tol_deg
+        assert r["finger_down_deg"] <= expert.config.side_grasp_finger_down_tol_deg
+        assert t["opposed"], f"{side}: thumb must geometrically oppose the 4-finger group"
     assert result["gate"] is True
 
 
@@ -741,9 +807,11 @@ def test_empirical_closing_axis_measurement_is_reproducible():
     assert np.allclose(env.data.qpos, qpos_before), "measurement must restore qpos exactly"
     assert np.allclose(env._group_synergy, syn_before), "measurement must restore group_synergy exactly"
     for side in SIDES:
-        assert r1["per_side"][side]["n_positive"] == r2["per_side"][side]["n_positive"]
-        d1, d2 = r1["per_side"][side]["mean_disp_inward_mm"], r2["per_side"][side]["mean_disp_inward_mm"]
+        fc1, fc2 = r1["finger_closure_direction"]["per_side"][side], r2["finger_closure_direction"]["per_side"][side]
+        assert fc1["n_positive"] == fc2["n_positive"]
+        d1, d2 = fc1["mean_disp_inward_mm"], fc2["mean_disp_inward_mm"]
         assert abs(d1 - d2) < 0.05 * max(abs(d1), abs(d2), 1.0), f"{side}: repeated measurement diverged too much ({d1:.4f}mm vs {d2:.4f}mm)"
+        assert r1["thumb_opposition"]["per_side"][side]["opposed"] == r2["thumb_opposition"]["per_side"][side]["opposed"]
     print("    repeated measurement agrees within warmstart-noise tolerance and leaves state unchanged")
 
 
@@ -763,24 +831,60 @@ def test_wahba_rotation_is_a_proper_rotation():
 
 
 def test_left_right_use_identical_algorithm_no_hardcoded_sign_flip():
-    """[This session] Section 7: '손별 joint 부호 하드코딩 최소화' -- verify
-    _object_facing_R applies the EXACT SAME LOCAL_CLOSING_VEC/algorithm to
-    both sides (no per-side sign flip baked into the function), and that
-    both hands independently satisfy the Functional Orientation Gate
-    (Section 4: never assume mirror symmetry holds -- checked independently)."""
+    """Section 7: '손별 joint 부호 하드코딩 최소화' -- verify _object_facing_R
+    applies the EXACT SAME LOCAL_CLOSING_VEC/algorithm to both sides (no
+    per-side sign flip baked into the function), and that both hands
+    independently satisfy the Functional Orientation Gate (Section 4:
+    never assume mirror symmetry holds -- checked independently).
+
+    [Audit session] The "no hardcoded sign flip" half is checked
+    STRUCTURALLY: feeding _object_facing_R Y-mirrored synthetic
+    palm_pos/obj_pos for "left" vs "right" must produce Y-mirrored
+    CLOSING and APPROACH axes (the two vectors _object_facing_R is
+    actually solved for, and the only two ANY Gate metric reads), with NO
+    dependence on which side string is passed (proves there is no
+    `if side == "left"` branch) -- this is independent of any particular
+    rollout's convergence, unlike recomputing R at a live-converged
+    palm_pos (which differs slightly from the position R was actually
+    SOLVED for, and is NOT a fair "same algorithm" check at this
+    geometry's sensitivity). The full 3x3 R is NOT required to be exactly
+    M@R@M: with only 2 target vectors, the third (lateral/twist) axis is
+    genuinely underdetermined by the Wahba fit, and its handedness can
+    differ between two numerically-distinct (mirrored but not bit-
+    identical) solves -- disclosed, and confirmed NOT to matter, since no
+    Gate or downstream measurement reads that axis."""
+    obj_pos = np.array([0.27, 0.0, 0.85])
+    left_palm = obj_pos + np.array([-0.15, 0.26, 0.10])
+    right_palm = obj_pos + np.array([-0.15, -0.26, 0.10])
+    R_left = sbe_module._object_facing_R("left", left_palm, obj_pos)
+    R_right = sbe_module._object_facing_R("right", right_palm, obj_pos)
+    mirror = np.diag([1.0, -1.0, 1.0])
+    for vec, label in ((sbe_module.LOCAL_CLOSING_VEC, "closing"), (sbe_module.LOCAL_APPROACH_VEC, "approach")):
+        world_left_mirrored = mirror @ (R_left @ vec)
+        world_right = R_right @ vec
+        assert np.allclose(world_left_mirrored, world_right, atol=1e-6), (
+            f"_object_facing_R's {label} axis must be Y-mirror-symmetric between sides -- "
+            "any discrepancy means a hardcoded per-side sign flip crept back in"
+        )
+    print("    closing/approach axes verified Y-mirror-symmetric (the two functionally-relevant vectors)")
+    # Swapping the SIDE STRING alone (keeping the same numeric inputs) must not change the output at all.
+    R_left_as_right_input = sbe_module._object_facing_R("right", left_palm, obj_pos)
+    assert np.allclose(R_left, R_left_as_right_input, atol=1e-9), (
+        "_object_facing_R's output must depend only on (palm_pos, obj_pos), not on the side string"
+    )
+    print("    _object_facing_R verified structurally side-agnostic (Y-mirror symmetric, no hardcoded branch)")
+
     env = make_env()
     expert = _run_to_align_end(env)
-    obj_pos = expert._object_pos()
-    for side in SIDES:
-        palm_pos = env.palm_pose(side)[0]
-        to_obj = (obj_pos - palm_pos) / np.linalg.norm(obj_pos - palm_pos)
-        R = sbe_module._object_facing_R(side, palm_pos, obj_pos)
-        closing_world = R @ sbe_module.LOCAL_CLOSING_VEC
-        ang = np.degrees(np.arccos(np.clip(np.dot(closing_world, to_obj), -1, 1)))
-        assert ang < 10.0, f"{side}: _object_facing_R did not align the SHARED LOCAL_CLOSING_VEC to the object direction (residual {ang:.2f}deg)"
+    print(f"    left_object_facing_angle_deg={expert.left_object_facing_angle_deg:.2f} "
+          f"right_object_facing_angle_deg={expert.right_object_facing_angle_deg:.2f}")
+    assert expert.left_object_facing_angle_deg <= expert.config.side_grasp_inward_angle_tol_deg
+    assert expert.right_object_facing_angle_deg <= expert.config.side_grasp_inward_angle_tol_deg
     result = expert._measure_functional_orientation()
-    assert result["per_side"]["left"]["n_positive"] >= 3
-    assert result["per_side"]["right"]["n_positive"] >= 3
+    assert result["finger_closure_direction"]["per_side"]["left"]["n_positive"] >= 3
+    assert result["finger_closure_direction"]["per_side"]["right"]["n_positive"] >= 3
+    assert result["thumb_opposition"]["per_side"]["left"]["opposed"]
+    assert result["thumb_opposition"]["per_side"]["right"]["opposed"]
     print("    both sides independently pass using the identical LOCAL_CLOSING_VEC/Wahba construction")
 
 
@@ -823,6 +927,77 @@ def test_position_correct_but_wrong_orientation_fails_functional_gate():
             print(f"    sideways-rotated construction: did not converge ({expert.state.name}, {expert.failure_reason}) -- also confirms it is not functionally correct")
     finally:
         sbe_module._object_facing_R = saved
+
+
+def test_thumb_opposition_subgate_is_load_bearing():
+    """[Audit session] Direct regression guard for the audit finding that
+    a prior commit's "Functional Orientation Gate" never actually checked
+    thumb opposition (it only checked 4-finger closure direction under
+    that name). Forces _measure_thumb_opposition to report FAIL while the
+    real finger-closure/angle checks still pass, and confirms the
+    COMBINED Functional Orientation Gate correctly turns False -- proving
+    thumb opposition is an actual, load-bearing AND condition, not
+    computed-but-ignored."""
+    env = make_env()
+    expert = _run_to_align_end(env)
+    real_result = expert._measure_functional_orientation()
+    assert real_result["gate"] is True, "sanity check: the real pose must genuinely pass before we fake a failure"
+    assert real_result["thumb_opposition"]["gate"] is True
+
+    orig = expert._measure_thumb_opposition
+    forced_fail = {
+        "per_side": {s: dict(orig()["per_side"][s], opposed=False) for s in SIDES},
+        "gate": False,
+    }
+    expert._measure_thumb_opposition = lambda curl_probe=0.15: forced_fail
+    forced_result = expert._measure_functional_orientation()
+    print(f"    real_gate={real_result['gate']} forced_thumb_fail_gate={forced_result['gate']} (expected False)")
+    assert forced_result["gate"] is False, "a failing Thumb Opposition Subgate must fail the combined Functional Orientation Gate"
+    assert forced_result["finger_closure_direction"]["gate"] is True, "finger-closure direction must still independently pass (isolating the thumb subgate as the cause)"
+
+
+def test_side_descend_curl_target_remaining_travel_is_small_but_real():
+    """[Audit session] Section 5/3 re-audit: curl_target=0.95 in FOREARM_
+    SIDE_DESCEND is close to the CLOSE_FRACTION=0.85 ceiling (measured
+    ~80.75% of each joint's real range already reached at synergy=0.95).
+    Locks in that the remaining 0.95->1.0 fingertip travel is real,
+    small, and consistently toward the object (not zero -- CONTACT_
+    ACQUIRE later still has genuine travel to close onto the object from
+    this state's synergy) -- disclosed honestly rather than silently
+    treated as "fully closed"."""
+    env = make_env()
+    expert = SharpaBimanualGraspExpert(env)
+    env.reset(seed=0)
+    for _ in range(1500):
+        if expert.state in (BimanualGraspState.FOREARM_SIDE_DESCEND, BimanualGraspState.FAILURE):
+            break
+        action = expert.step()
+        env.step(action)
+    assert expert.state == BimanualGraspState.FOREARM_SIDE_DESCEND, f"expected FOREARM_SIDE_DESCEND, got {expert.state.name}"
+    side = "left"
+    side_idx = 0
+    obj_pos = expert._object_pos()
+    while env._group_synergy[side_idx * 4 + 1] < 0.949:
+        a = np.zeros(ACTION_DIM)
+        for g in (1, 2, 3):
+            a[17 + side_idx * 4 + g] = 1.0
+        env.step(a)
+    tips_95 = {f: env.fingertip_pos(side, f).copy() for f in ("index", "middle", "ring", "pinky")}
+    while env._group_synergy[side_idx * 4 + 1] < 0.999:
+        a = np.zeros(ACTION_DIM)
+        for g in (1, 2, 3):
+            a[17 + side_idx * 4 + g] = 1.0
+        env.step(a)
+    tips_100 = {f: env.fingertip_pos(side, f).copy() for f in ("index", "middle", "ring", "pinky")}
+    for f in ("index", "middle", "ring", "pinky"):
+        d = tips_100[f] - tips_95[f]
+        travel_mm = float(np.linalg.norm(d)) * 1000.0
+        to_obj = obj_pos - tips_95[f]
+        to_obj = to_obj / np.linalg.norm(to_obj)
+        toward_obj_mm = float(np.dot(d, to_obj)) * 1000.0
+        print(f"    {f}: travel(0.95->1.0)={travel_mm:.2f}mm toward_object={toward_obj_mm:.2f}mm")
+        assert 0.5 < travel_mm < 20.0, f"{f}: remaining travel {travel_mm:.2f}mm outside the expected small-but-real range"
+        assert toward_obj_mm > 0.0, f"{f}: remaining travel must still point toward the object, not away"
 
 
 if __name__ == "__main__":
