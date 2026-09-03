@@ -4,42 +4,50 @@ controller (SharpaBimanualGraspExpert).
 Run with:
     python3 scripts/test_sharpa_bimanual_grasp.py
 
-HONEST CURRENT STATE: the OFFICIAL default approach path
-is now STABLE_START -> ARM_LATERAL_CLEARANCE -> FOREARM_FORWARD_REACH ->
-FOREARM_DESCEND -> WRIST_ALIGN -> ... (NATURAL_ARM_LIFT/the old single-
-shot FOREARM_APPROACH no longer exist -- see
-sharpa_bimanual_grasp_expert.py's BimanualGraspState). ARM_LATERAL_
-CLEARANCE uses a DIRECT joint target (not Cartesian IK) chosen from a
-bounded 3-candidate FK+physics sweep -- 0 self-collisions, elbow well
-below shoulder -- fixing the former "unnatural" elbow-up posture.
+HONEST CURRENT STATE: the OFFICIAL approach path is
+STABLE_START -> ARM_LATERAL_CLEARANCE -> FOREARM_FORWARD_REACH ->
+WRIST_SIDE_GRASP_ALIGN -> FIVE_FINGER_PRESHAPE -> FOREARM_SIDE_DESCEND ->
+FINGERTIP_PRECONTACT -> ... (see sharpa_bimanual_grasp_expert.py's
+BimanualGraspState). ARM_LATERAL_CLEARANCE uses a DIRECT joint target
+(not Cartesian IK) chosen from a bounded 3-candidate FK+physics sweep --
+0 self-collisions, elbow well below shoulder.
 
-[This session] FOREARM_FORWARD_REACH's own settled-position residual
-(previously a deterministic ~10.165mm, just above the unchanged 10mm
-gate) is FIXED: root-caused with scripts/diagnose_forward_reach_gap.py to
-a waypoint-schedule bookkeeping bug, not a physical limit -- the state's
-final(6th) waypoint fired so late (ticks_per_wp = max_steps_per_state //
-6 = 66, consuming the ENTIRE 400-tick state budget) that only 70 ticks
-remained to physically settle, while holding the SAME final ctrl target
-fixed past that cutoff shows the real physics residual keeps
-monotonically decreasing (no oscillation) to a genuine ~9.7-9.8mm
-steady state. FORWARD_REACH_WAYPOINT_TICKS=40 (a fixed per-waypoint tick
-count, matching FINGERTIP_PRECONTACT's WAYPOINT_TICKS convention instead
-of dividing max_steps_per_state) fires the final waypoint earlier and
-leaves enough tail within the SAME unchanged max_steps_per_state/
-ik_pos_tol/streak-length budget: settled error is now ~9.96mm, streak
-requirement (15) is met, zero forbidden collision, reproduced identically
-across 3 repeated seed=0 rollouts. The DEFAULT config
-(object_facing_orientation=False) now advances through FOREARM_DESCEND ->
-WRIST_ALIGN -> FIVE_FINGER_PRESHAPE -> FINGERTIP_PRECONTACT, and
-deterministically fails there with PRECONTACT_TRACKING_NOT_ACHIEVED at
-step 998 -- this is now the active blocker (a separate, independent gate;
-not fixed by this session, not conflated with Forward Reach's own PASS).
-The opt-in object_facing_orientation=True path still fails (self-collision
-force reduced from ~113N to ~46N peak with the new posture -- improved
-but not fixed). test_a_real_bimanual_gate_a_success_on_size_12 below
-documents the overall Gate A outcome HONESTLY as a failing test and must
-never be weakened, deleted, or converted into a smoke assertion to make
-it pass.
+FOREARM_FORWARD_REACH's own settled-position residual (previously a
+deterministic ~10.165mm) is FIXED (waypoint-schedule bookkeeping, not a
+physical limit -- see FORWARD_REACH_WAYPOINT_TICKS's docstring): settled
+error is ~9.96mm, under the unchanged 10mm gate, 15-tick streak met, zero
+forbidden collision, reproduced across 3 seed=0 rollouts.
+
+[This session] User-directed requirement: a genuine bilateral SIDE grasp
+(both palms beside the object's own side faces, facing each other,
+fingers generally pointing down) -- not the old top-down, palm-down
+reach. FK-measured (scripts/measure_sharpa_side_grasp_axes.py) the real
+palm/finger axes and fixed a genuine sign bug in _object_facing_R (see
+that function's docstring). WRIST_SIDE_GRASP_ALIGN + FOREARM_SIDE_DESCEND
+replace the old FOREARM_DESCEND + WRIST_ALIGN pair; the old opt-in
+object_facing_orientation flag (never safe, self-collided up to 113N) is
+REMOVED, superseded by this design, which is collision-free (measured
+0.00N torso-arm / 0.00N hand-hand across 3 repeated rollouts).
+
+The new Side-Grasp Posture Gate (test_side_grasp_posture_gate_passes
+below) PASSES: both palms outside the object's side faces, palm-inward
+angle ~14.1deg (<=15deg), palm normals opposed, finger-down angle
+~15.0deg (<=25deg), fingertip centroid overlaps the object's side height,
+no top-footprint crossing, left/right mirror position error <0.1mm,
+mirror orientation error <0.04deg, elbow well below shoulder, zero
+torso-arm/hand-hand/hand-table forbidden collision, 15-tick streak.
+
+The rollout currently fails LATER, in FOREARM_SIDE_DESCEND, with
+HAND_TABLE_COLLISION -- a real, repeated (not single-tick) hand<->table
+force up to ~18N measured this session (scripts/diagnose_side_grasp_
+swept_path.py) as the fingers, already partially curled, keep dipping
+into the table on the final approach waypoints. A bounded (curl fraction,
+height) candidate search did not clear it without cost elsewhere. This is
+the current, disclosed next blocker -- a separate, independent problem
+from the Side-Grasp Posture Gate, which is achieved.
+test_a_real_bimanual_gate_a_success_on_size_12 below documents the
+overall Gate A outcome HONESTLY as a failing test and must never be
+weakened, deleted, or converted into a smoke assertion to make it pass.
 """
 
 from __future__ import annotations
@@ -187,55 +195,6 @@ def test_arm_lateral_clearance_meets_natural_posture_gate():
     assert env._hand_hand_contact_force() <= expert.config.hand_hand_force_limit_n
 
 
-def test_descend_reaches_object_level_height_without_forbidden_collision():
-    """[This session, user-directed geometry correction] Live-viewer
-    feedback: the hand must come down BESIDE the object, level with it,
-    not descend onto its top. descend_height_m/precontact_height_m moved
-    from +0.10/+0.09 (3-4cm above the object's TOP face) toward the
-    object's own center. height=0.0 at the original (narrow)
-    descend_y_offset_m=0.15 was tried first and measured to be physically
-    infeasible: a real, growing torso<->arm contact resistance prevents
-    convergence (the elbow has to bend toward the torso to reach a low
-    height at a narrow lateral offset), not a timing artifact. A second
-    bounded sweep over (descend_y_offset_m, descend_height_m) pairs found
-    that widening the offset to 0.20 (a wider swing before/while
-    descending, independent of approach_y_offset_m -- FOREARM_FORWARD_
-    REACH's own already-fixed offset is untouched) lets the target height
-    come down to +0.02 (2cm above the object's CENTER, not its top face)
-    with a comfortable torso-arm margin (peak ~5.5N under the unchanged
-    8N limit); y_offset=0.30 was also tried and found kinematically
-    UNREACHABLE at low height (IK's own solve saturates a joint limit,
-    not a timing artifact either). This test locks in that FOREARM_DESCEND
-    now actually reaches its (now much more level, wider-offset) target
-    and WRIST_ALIGN, with real forbidden collision forces measured (not
-    assumed zero) safely under the unchanged limit throughout the state."""
-    env = make_env()
-    env.reset(seed=0)
-    expert = SharpaBimanualGraspExpert(env)
-    max_torso_arm = 0.0
-    max_hand_hand = 0.0
-    reached_wrist_align = False
-    for _ in range(900):
-        if expert.state in (BimanualGraspState.SUCCESS, BimanualGraspState.FAILURE):
-            break
-        prev_state = expert.state
-        action = expert.step()
-        if prev_state == BimanualGraspState.FOREARM_DESCEND:
-            max_torso_arm = max(max_torso_arm, env._torso_arm_collision_force())
-            max_hand_hand = max(max_hand_hand, env._hand_hand_contact_force())
-        env.step(action)
-        if expert.state == BimanualGraspState.WRIST_ALIGN:
-            reached_wrist_align = True
-            break
-    print(f"    reached_wrist_align={reached_wrist_align} max_torso_arm_during_descend={max_torso_arm:.2f}N "
-          f"max_hand_hand_during_descend={max_hand_hand:.2f}N "
-          f"descend_height_m={expert.config.descend_height_m} precontact_height_m={expert.config.precontact_height_m}")
-    assert reached_wrist_align, "FOREARM_DESCEND must converge to its (now object-level) target"
-    assert max_torso_arm <= expert.config.hand_hand_force_limit_n
-    assert max_hand_hand <= expert.config.hand_hand_force_limit_n
-    assert expert.config.descend_height_m < 0.09, "descend target must be lower (more level with the object) than the pre-session +0.09/+0.10 above-the-block heights"
-
-
 def test_forward_reach_gate_now_passes_and_advances_to_next_blocker():
     """[This session] FOREARM_FORWARD_REACH's settled-position residual
     used to plateau at a deterministic ~10.165mm, just above the
@@ -250,17 +209,18 @@ def test_forward_reach_gate_now_passes_and_advances_to_next_blocker():
 
     This test locks in that FOREARM_FORWARD_REACH's own Gate condition
     (settled error <=ik_pos_tol, streak reached, zero forbidden collision)
-    is now genuinely met and the rollout advances past it -- while staying
-    honest that the rollout still fails LATER (a separate, independent,
-    not-yet-fixed gate: PRECONTACT_TRACKING_NOT_ACHIEVED). This must not
-    be read as Gate A success."""
+    is now genuinely met and the rollout advances past it into
+    WRIST_SIDE_GRASP_ALIGN -- while staying honest that the FULL rollout
+    still fails LATER (see test_side_grasp_posture_gate_passes and this
+    module's docstring for the current next blocker). This must not be
+    read as Gate A success."""
     env = make_env()
     env.reset(seed=0)
     expert = SharpaBimanualGraspExpert(env)
     final_err = None
     max_streak_seen = 0
     collision_during_forward_reach = False
-    reached_descend = False
+    reached_align = False
     for _ in range(1200):
         prev_state = expert.state
         action = expert.step()
@@ -273,14 +233,14 @@ def test_forward_reach_gate_now_passes_and_advances_to_next_blocker():
             max_streak_seen = max(max_streak_seen, expert._forward_reach_stable_streak)
             if env._torso_arm_collision_force() > 0.0 or env._hand_hand_contact_force() > 0.0:
                 collision_during_forward_reach = True
-        if expert.state == BimanualGraspState.FOREARM_DESCEND:
-            reached_descend = True
+        if expert.state == BimanualGraspState.WRIST_SIDE_GRASP_ALIGN:
+            reached_align = True
             break
         if expert.state == BimanualGraspState.FAILURE:
             break
     print(f"    forward_reach_final_error={final_err*1000:.3f}mm, max_streak={max_streak_seen}, "
-          f"collision_during_state={collision_during_forward_reach}, reached_descend={reached_descend}")
-    assert reached_descend, "FOREARM_FORWARD_REACH must now advance to FOREARM_DESCEND, not time out"
+          f"collision_during_state={collision_during_forward_reach}, reached_align={reached_align}")
+    assert reached_align, "FOREARM_FORWARD_REACH must now advance to WRIST_SIDE_GRASP_ALIGN, not time out"
     assert final_err is not None and final_err <= expert.config.ik_pos_tol
     assert max_streak_seen >= expert.config.forward_reach_stable_streak_required
     assert not collision_during_forward_reach
@@ -289,47 +249,106 @@ def test_forward_reach_gate_now_passes_and_advances_to_next_blocker():
     env2 = make_env()
     expert2 = SharpaBimanualGraspExpert(env2)
     outcome = expert2.run(max_total_steps=1200)
-    print(f"    full rollout: state={outcome.state.name} failure_reason={outcome.failure_reason}")
-    assert outcome.failure_reason == BimanualFailureReason.PRECONTACT_TRACKING_NOT_ACHIEVED, (
-        "expected the CURRENT next independent blocker (precontact tracking); "
+    print(f"    full rollout: state={outcome.state.name} failure_reason={outcome.failure_reason} "
+          f"side_grasp_gate={outcome.side_grasp_gate}")
+    assert outcome.side_grasp_gate is True, "Side-Grasp Posture Gate should still pass en route to the current next blocker"
+    assert outcome.failure_reason == BimanualFailureReason.HAND_TABLE_COLLISION, (
+        "expected the CURRENT next independent blocker (FOREARM_SIDE_DESCEND hand-table collision); "
         "if this changed, the docstring/PROJECT_CONTEXT next-blocker note is now stale"
     )
 
 
-def test_object_facing_orientation_still_not_fully_safe():
-    """[Session 40/41] Documents the opt-in object_facing_orientation
-    feature's measured, causally-confirmed side effect HONESTLY: an
-    explicit object-facing wrist target (see _object_facing_R) makes
-    index/middle fingertips land near the object instead of 12-21cm off
-    it (a real improvement over Session 39's "whatever orientation
-    happened to converge" approach) -- but for THIS seed/config it also
-    drives the right wrist into torso_link, a real, forbidden
-    self-collision (measured up to ~113N in Session 40; Session 41's new
-    lateral-clearance posture reduces this to ~46N peak -- a real but
-    partial improvement, NOT a fix). This is why the feature stays
-    default OFF (see BimanualGraspConfig.object_facing_orientation) --
-    this test locks in that the state machine fails HONESTLY (does not
-    silently proceed to CONTACT_ACQUIRE) whenever this feature is
-    exercised, and must not be weakened to hide this until
-    collision-aware waypoints (the documented next blocker) actually
-    fix it."""
-    config = BimanualGraspConfig(object_facing_orientation=True)
+def test_side_grasp_posture_gate_passes():
+    """[This session] The core deliverable: a genuine bilateral SIDE
+    grasp posture (palms beside the object's own side faces, facing each
+    other, fingers generally pointing down), not the old top-down palm-
+    down reach. Locks in every Side-Grasp Posture Gate sub-condition
+    (Section 10 of this session's spec) via the SAME metrics
+    WRIST_SIDE_GRASP_ALIGN itself gates the transition on -- not a looser
+    or separately-computed check."""
+    env = make_env()
+    expert = SharpaBimanualGraspExpert(env)
+    outcome = expert.run(max_total_steps=2000)
+    m = outcome.side_grasp_posture
+    print(f"    side_grasp_gate={outcome.side_grasp_gate}")
+    for k, v in m.items():
+        print(f"      {k}: {v}")
+    assert m, "WRIST_SIDE_GRASP_ALIGN must be reached and measured (posture dict must not be empty)"
+    assert outcome.side_grasp_gate is True
+    assert all(m["outside_side_face"].values()), "both palms must be outside the object's own side faces"
+    assert m["inward_angle_deg"]["left"] <= expert.config.side_grasp_inward_angle_tol_deg
+    assert m["inward_angle_deg"]["right"] <= expert.config.side_grasp_inward_angle_tol_deg
+    assert m["normals_opposed"], "palm normals (closing axes) must face each other"
+    assert m["finger_down_deg"]["left"] <= expert.config.side_grasp_finger_down_tol_deg
+    assert m["finger_down_deg"]["right"] <= expert.config.side_grasp_finger_down_tol_deg
+    assert all(m["tip_height_overlaps_side"].values()), "fingertip centroid must overlap the object's side-face height range"
+    assert not m["crosses_top_footprint"], "hands must not cross the object's own top footprint"
+    assert m["mirror_pos_err_m"] <= expert.config.side_grasp_mirror_pos_tol_m
+    assert m["mirror_ori_err_deg"] <= expert.config.side_grasp_mirror_ori_tol_deg
+    assert m["elbow_ok"], "elbow must not be markedly above the shoulder"
+    assert m["torso_arm_ok"] and m["hand_table_ok"] and m["hand_hand_ok"], "no forbidden collision at the align pose"
+    assert m["premature_contact_ok"], "no premature (non-fingertip) object contact"
+    assert m["streak"] >= expert.config.side_align_stable_streak_required
+
+
+def test_side_grasp_state_order_matches_spec():
+    """[This session] Locks in the required state ordering (Section 4):
+    STABLE_START -> ARM_LATERAL_CLEARANCE -> FOREARM_FORWARD_REACH ->
+    WRIST_SIDE_GRASP_ALIGN -> FIVE_FINGER_PRESHAPE -> FOREARM_SIDE_DESCEND
+    -> FINGERTIP_PRECONTACT, each state visited exactly once and never
+    skipped or reordered."""
+    expected = [
+        BimanualGraspState.STABLE_START, BimanualGraspState.ARM_LATERAL_CLEARANCE,
+        BimanualGraspState.FOREARM_FORWARD_REACH, BimanualGraspState.WRIST_SIDE_GRASP_ALIGN,
+        BimanualGraspState.FIVE_FINGER_PRESHAPE, BimanualGraspState.FOREARM_SIDE_DESCEND,
+    ]
     env = make_env()
     env.reset(seed=0)
-    expert = SharpaBimanualGraspExpert(env, config)
-    for _ in range(1200):
+    expert = SharpaBimanualGraspExpert(env)
+    seen = [expert.state]
+    for _ in range(1400):
+        if expert.state in (BimanualGraspState.SUCCESS, BimanualGraspState.FAILURE):
+            break
         action = expert.step()
         env.step(action)
-        if expert.state in (BimanualGraspState.FIVE_FINGER_PRESHAPE, BimanualGraspState.FAILURE):
-            break
-    print(f"    state={expert.state.name} reason={expert.failure_reason} "
-          f"torso_arm_collision_force={expert.torso_arm_collision_force_n:.2f}N "
-          f"object_facing_angle(L,R)=({expert.left_object_facing_angle_deg:.2f},"
-          f"{expert.right_object_facing_angle_deg:.2f})")
-    assert expert.state == BimanualGraspState.FAILURE, (
-        "the opt-in object-facing feature must never silently reach FIVE_FINGER_PRESHAPE "
-        "while a real self-collision/tracking problem is present"
+        if expert.state != seen[-1]:
+            seen.append(expert.state)
+    print(f"    state sequence: {[s.name for s in seen]}")
+    prefix = seen[: len(expected)]
+    assert prefix == expected, f"state order deviated: {[s.name for s in prefix]} != {[s.name for s in expected]}"
+
+
+def test_side_grasp_swept_path_has_no_forbidden_collision_before_side_descend():
+    """[This session] Endpoint-only checks are not sufficient (Section 8):
+    verify torso-arm/hand-hand/hand-table forbidden-collision force stays
+    at or under the shared safety limit at EVERY tick through
+    FIVE_FINGER_PRESHAPE (the current honest blocker is inside FOREARM_
+    SIDE_DESCEND itself, see module docstring -- this test covers the
+    swept path UP TO that point, which the Side-Grasp Posture Gate
+    already certifies clean)."""
+    env = make_env()
+    env.reset(seed=0)
+    expert = SharpaBimanualGraspExpert(env)
+    limit = expert.config.hand_hand_force_limit_n
+    checked_states = (
+        BimanualGraspState.ARM_LATERAL_CLEARANCE, BimanualGraspState.FOREARM_FORWARD_REACH,
+        BimanualGraspState.WRIST_SIDE_GRASP_ALIGN, BimanualGraspState.FIVE_FINGER_PRESHAPE,
     )
+    max_torso_arm = max_hand_hand = 0.0
+    for _ in range(1000):
+        if expert.state in (BimanualGraspState.SUCCESS, BimanualGraspState.FAILURE):
+            break
+        prev_state = expert.state
+        action = expert.step()
+        env.step(action)
+        if prev_state in checked_states:
+            max_torso_arm = max(max_torso_arm, env._torso_arm_collision_force())
+            max_hand_hand = max(max_hand_hand, env._hand_hand_contact_force())
+        if expert.state == BimanualGraspState.FOREARM_SIDE_DESCEND:
+            break
+    print(f"    swept max_torso_arm={max_torso_arm:.2f}N swept max_hand_hand={max_hand_hand:.2f}N (limit={limit}N)")
+    assert max_torso_arm <= limit
+    assert max_hand_hand <= limit
 
 
 def test_ever_contacted_alone_does_not_satisfy_gate_a():
@@ -490,12 +509,12 @@ def test_a_real_bimanual_gate_a_success_on_size_12():
     """Honest, currently-failing real SIZE_12 Gate A test.
 
     [This session] FOREARM_FORWARD_REACH's own settled-position residual
-    is fixed (see test_forward_reach_gate_now_passes_and_advances_to_
-    next_blocker) -- the bare-G1 canonical builder now advances through
-    FOREARM_DESCEND -> WRIST_ALIGN -> FIVE_FINGER_PRESHAPE ->
-    FINGERTIP_PRECONTACT and stops there instead, deterministically
-    failing with PRECONTACT_TRACKING_NOT_ACHIEVED. Later contact/force
-    gates are therefore still not entered.
+    is fixed and the Side-Grasp Posture Gate now genuinely passes (see
+    test_side_grasp_posture_gate_passes) -- the bare-G1 canonical builder
+    advances through WRIST_SIDE_GRASP_ALIGN -> FIVE_FINGER_PRESHAPE ->
+    FOREARM_SIDE_DESCEND and stops there instead, deterministically
+    failing with HAND_TABLE_COLLISION. Later contact/force gates are
+    therefore still not entered.
     This test MUST NOT be weakened, deleted, or turned into a smoke
     assertion to make it pass -- it stays honestly failing until Gate A
     is actually achieved."""

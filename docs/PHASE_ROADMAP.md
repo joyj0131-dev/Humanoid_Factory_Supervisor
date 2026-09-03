@@ -35,10 +35,13 @@
 
 - Mount Integration Gate: PASS
 - Natural Posture Gate: PASS
-- Wrist Transition Gate: FAIL (`5.12rad/s > 2.0rad/s`)
-- Forward Reach Gate: FAIL (`10.165mm > 10mm`, 금지 충돌 0건)
-- Orientation Alignment Gate: FAIL (opt-in 경로 self-collision 잔존)
-- Precontact Tracking Gate: 미도달 (Forward Reach 선행 Gate 실패)
+- Wrist Transition Gate: FAIL (`5.125rad/s > 2.0rad/s`)
+- Forward Reach Gate: PASS (`9.96mm ≤ 10mm`, 15-tick streak, 금지 충돌 0건)
+- Side-Grasp Posture Gate: PASS (양손이 물체 좌우 측면에서 마주보고
+  손가락이 아래를 향하는 bilateral side-grasp 자세, mirror 오차
+  <0.1mm/<0.04°, 금지 충돌 0건, 15-tick streak)
+- Precontact Tracking Gate: 미도달 (`FOREARM_SIDE_DESCEND`의 hand-table
+  collision 최대 약 18.21N로 막힘)
 - Gate A: FAIL (`0/30`), Gate B/C/D: 미시도
 
 Gate A 이전 실패를 성공으로 포장하거나 threshold를 낮추지 않는다. Gate

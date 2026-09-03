@@ -52,7 +52,10 @@ pre-hand-equipped base가 남기던 손목당 0.202839kg의 ghost hand mass도
 
 ## Current blocker
 
-Phase 4.5는 미완료다. bare-base 전환 후 official rollout은 collision 없이
-`FOREARM_FORWARD_REACH`까지 진행하지만 최종 palm error가 약 10.16mm로
-1cm gate를 0.16mm 초과한다. Gate를 완화하지 않고 solver target과 실제
-physics tracking 차이를 해결한 뒤 WRIST_ALIGN/precontact/contact로 진행한다.
+Phase 4.5는 미완료다. `FOREARM_FORWARD_REACH` Gate(9.96mm)와 신규
+Side-Grasp Posture Gate(양손이 물체 좌우에서 마주보고 손가락이 아래를
+향하는 bilateral side-grasp 자세)는 모두 PASS했다. official rollout은
+collision 없이 `FOREARM_SIDE_DESCEND`까지 진행하지만 그 상태의 후반
+waypoint에서 hand-table collision(최대 약 18.21N, 8N 한계 초과)으로
+막힌다. Gate를 완화하지 않고 이 충돌을 해결한 뒤 FINGERTIP_PRECONTACT/
+contact로 진행한다.

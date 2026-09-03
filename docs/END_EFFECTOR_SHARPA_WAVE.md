@@ -47,10 +47,15 @@ Phase 4.5는 미완료다.
 
 - Natural Posture Gate: PASS
 - Wrist Transition Gate: FAIL (`5.125rad/s > 2.0rad/s`)
-- Forward Reach: bare-base 전환 후 최종 palm error 약 10.16mm로 1cm 기준
-  0.16mm 초과, collision 0
-- Object-Facing Alignment: FAIL/opt-in
-- Precontact/Contact Acquisition: 미도달
+- Forward Reach Gate: PASS (settled palm error 약 9.96mm, streak 15,
+  collision 0 — waypoint 스케줄 버그 수정으로 해결)
+- Side-Grasp Posture Gate: **PASS** — 양손이 물체 좌우 측면 바깥에서
+  서로 마주보고, 손가락이 아래를 향하는 실제 bilateral side-grasp 자세를
+  달성했다(palm inward angle ≈14°, finger-down angle ≈15°, 좌우 mirror
+  오차 <0.1mm, forbidden collision 0). `WRIST_SIDE_GRASP_ALIGN` +
+  `FOREARM_SIDE_DESCEND`가 과거 `FOREARM_DESCEND`/`WRIST_ALIGN`을 대체한다.
+- Precontact/Contact Acquisition: 미도달 — `FOREARM_SIDE_DESCEND`에서
+  hand-table collision(최대 약 18.21N, 8N 한계 초과)으로 막힘
 - Gate A: FAIL
 - Gate B/C/D: 미시도
 

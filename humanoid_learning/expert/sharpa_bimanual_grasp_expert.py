@@ -17,17 +17,21 @@ never a large random sweep):
     y_off in {0.10, 0.12, 0.15, 0.20}); at y_off=0.10 the FINGERTIPS
     (not the palm) land at y~=0.06-0.068 on their own, i.e. right at the
     object's actual face, without the palm itself needing to cross in.
-  - Enforcing an independently-CHOSEN opposition orientation (e.g.
-    approach=+-Y, closing=+X) reintroduces severe self-collision
-    (200+ contacts) at ANY nonzero orientation task weight, exactly as
-    found for the single-hand controller. Fix used here: solve
-    position-only first (collision-free, verified), CAPTURE the
-    orientation the solver naturally landed on, then LOCK that exact
-    orientation as the explicit WRIST_ALIGN/FINGERTIP_PRECONTACT target
-    -- this converges to <1 degree orientation error with only 4 minor
-    residual penetrations (down from 200+), because the solver is never
-    asked to fight its own collision-free position solution for an
-    independently-invented orientation.
+  - [Historical, superseded this session] Enforcing an independently-
+    CHOSEN opposition orientation (e.g. approach=+-Y, closing=+X)
+    reintroduced severe self-collision (200+ contacts) at ANY nonzero
+    orientation task weight when tried at the OLD (narrow, elbow-toward-
+    torso) descend geometry. The original fix here was to solve
+    position-only and CAPTURE whatever orientation the solver naturally
+    landed on -- but that orientation was never actually object-facing
+    (fingers ended up pointing ~120deg away from "down"; see WRIST_SIDE_
+    GRASP_ALIGN's own docstring). This session replaces that capture-only
+    approach with an EXPLICIT object-facing target (_object_facing_R,
+    LOCKED once WRIST_SIDE_GRASP_ALIGN's own stability/collision checks
+    pass) reached via a combined position+orientation waypointed ramp
+    from a wider/higher intermediate pose -- collision-free, unlike a
+    fixed-position reorientation attempt at either the old narrow-descend
+    or the new final-grasp geometry (both measured to self-collide).
 
 Gate A definition (the project's approved bilateral stability contract):
   - Per side: thumb touching AND (index OR middle touching) AND wrap
@@ -60,22 +64,29 @@ from humanoid_learning.expert.timing import sim_time_to_steps
 
 
 def _object_facing_R(side: str, palm_pos: np.ndarray, obj_pos: np.ndarray) -> np.ndarray:
-    """[Session 40] Explicit object-facing wrist target, replacing the
-    prior "capture whatever the position-only IK converged to" approach
-    (which only guaranteed orientation STABILITY, never CORRECTNESS --
-    Session 40's audit found index/middle fingertips landing 12-21cm
-    laterally off the object at the old converged orientation, only the
-    thumb near the surface). Uses the EXISTING, already-validated palm-
-    frame axis convention (whole_body_config.py: site local +X=approach,
-    -Y(left)/+Y(right)=closing, Z=lateral) -- the CLOSING axis is set to
-    point from the palm straight at the object center; the one remaining
-    free rotation (about the closing axis) is resolved by keeping the
-    lateral axis close to world-up (a natural, non-twisted approach
-    rather than an arbitrary roll)."""
+    """Explicit object-facing wrist target -- the CLOSING axis (palm_R
+    column 1) is set to point from the palm straight at the object
+    center; the one remaining free rotation (about the closing axis) is
+    resolved by keeping the lateral axis close to world-up (a natural,
+    non-twisted approach rather than an arbitrary roll).
+
+    [This session] REMOVED the previous ``-closing_dir if side=="left"
+    else closing_dir`` sign flip. Measured directly (this session's FK
+    audit, scripts/measure_sharpa_side_grasp_axes.py): applying a small
+    "close" synergy delta to index/middle/wrap and reading the resulting
+    fingertip displacement in the palm's OWN local frame gives an
+    IDENTICAL positive-Y_palm-local component for BOTH hands -- i.e. the
+    real closing direction is `+palm_R[:, 1]` for both sides already
+    (LEFT_PALM_LOCAL_QUAT/RIGHT_PALM_LOCAL_QUAT already encode each
+    hand's mirrored mount; no additional per-side sign flip belongs in
+    application code). The old, asymmetric formula was causally
+    responsible for the object_facing_orientation feature's self-collision
+    history (verified this session: a fresh, unconstrained IK solve with
+    the OLD sign drives the right wrist into torso_link by ~2cm; the SAME
+    solve with this fixed sign has zero torso contact for both sides)."""
     closing_dir = obj_pos - palm_pos
     n = np.linalg.norm(closing_dir)
-    closing_dir = closing_dir / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
-    y_col = -closing_dir if side == "left" else closing_dir
+    y_col = closing_dir / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
     world_up = np.array([0.0, 0.0, 1.0])
     ref = world_up if abs(np.dot(y_col, world_up)) < 0.95 else np.array([1.0, 0.0, 0.0])
     z_col = np.cross(y_col, ref)
@@ -87,16 +98,28 @@ def _object_facing_R(side: str, palm_pos: np.ndarray, obj_pos: np.ndarray) -> np
 
 def _object_facing_angle_deg(side: str, palm_R: np.ndarray, palm_pos: np.ndarray, obj_pos: np.ndarray) -> float:
     """Angle between the palm's ACTUAL closing axis and the true
-    palm->object direction -- the Orientation Alignment Gate metric
-    (Session 40), independent of and in addition to WRIST_ALIGN's own
-    drift-stability check."""
+    palm->object direction -- the Side-Grasp Posture Gate's palm-inward-
+    angle metric. [This session] sign convention matches the corrected
+    _object_facing_R above (no per-side flip -- see that function's
+    docstring)."""
     closing_dir = obj_pos - palm_pos
     n = np.linalg.norm(closing_dir)
     if n < 1e-9:
         return 0.0
     closing_dir = closing_dir / n
-    actual_closing = -palm_R[:, 1] if side == "left" else palm_R[:, 1]
+    actual_closing = palm_R[:, 1]
     cos_ang = np.clip(np.dot(actual_closing, closing_dir), -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos_ang)))
+
+
+def _finger_down_angle_deg(palm_R: np.ndarray) -> float:
+    """Angle between the palm's approach axis (palm_R column 0 -- verified
+    this session, scripts/measure_sharpa_side_grasp_axes.py, to coincide
+    EXACTLY with the open/straight nonthumb fingers' own root->tip
+    direction) and world -Z ("fingers generally point down"), the Side-
+    Grasp Posture Gate's finger-down-angle metric."""
+    approach_axis = palm_R[:, 0]
+    cos_ang = np.clip(np.dot(approach_axis, np.array([0.0, 0.0, -1.0])), -1.0, 1.0)
     return float(np.degrees(np.arccos(cos_ang)))
 
 
@@ -132,9 +155,22 @@ class BimanualGraspState(Enum):
     STABLE_START = auto()
     ARM_LATERAL_CLEARANCE = auto()
     FOREARM_FORWARD_REACH = auto()
-    FOREARM_DESCEND = auto()
-    WRIST_ALIGN = auto()
+    # [This session] WRIST_ALIGN (measure-only, never re-solved) and
+    # FOREARM_DESCEND (position-only, natural/top-down-derived
+    # orientation) are REPLACED by WRIST_SIDE_GRASP_ALIGN and
+    # FOREARM_SIDE_DESCEND: user-directed requirement for a genuine
+    # bilateral SIDE grasp (palms facing each other, closing axis toward
+    # the object center, fingers generally pointing down), which the old
+    # pair could not produce (it only ever held whatever orientation
+    # ARM_LATERAL_CLEARANCE happened to leave the wrist in -- verified
+    # this session, ~110-170deg away from any object-facing pose). See
+    # WRIST_SIDE_GRASP_ALIGN's docstring for the causal path to this
+    # design (measured: reorienting at a FIXED position, or from a
+    # narrow/high posture, self-collides; reorienting AND translating
+    # together, waypointed, does not).
+    WRIST_SIDE_GRASP_ALIGN = auto()
     FIVE_FINGER_PRESHAPE = auto()
+    FOREARM_SIDE_DESCEND = auto()
     FINGERTIP_PRECONTACT = auto()
     CONTACT_ACQUIRE = auto()
     THUMB_OPPOSE = auto()
@@ -162,7 +198,9 @@ class BimanualFailureReason(Enum):
     SELF_COLLISION_TORSO_ARM = auto()
     LATERAL_CLEARANCE_NOT_ACHIEVED = auto()
     FORWARD_REACH_NOT_ACHIEVED = auto()
-    DESCEND_NOT_ACHIEVED = auto()
+    SIDE_GRASP_ALIGN_NOT_ACHIEVED = auto()  # [This session] WRIST_SIDE_GRASP_ALIGN timeout/failure
+    SIDE_DESCEND_NOT_ACHIEVED = auto()  # [This session] FOREARM_SIDE_DESCEND timeout/failure
+    HAND_TABLE_COLLISION = auto()  # [This session] forbidden hand<->table contact during the side-grasp approach
 
 
 @dataclass
@@ -232,37 +270,90 @@ class BimanualGraspConfig:
     # something trajectory-shape tuning alone reliably clears with margin
     # at low heights.
     #
-    # [This session, follow-up] user feedback: this residual self-
-    # collision risk is because the elbow still has to bend toward the
-    # torso to reach a LOW height at the original (narrow) Y offset.
-    # Giving FOREARM_DESCEND a WIDER Y offset (descend_y_offset_m, swept
-    # separately below) before/while descending gives the elbow more
-    # room, letting the target height come down much further (measured
-    # bounded sweep of (y_offset, height) pairs, same collision-peak
-    # method): at descend_y_offset_m=0.20, height=0.02 (2cm above the
-    # object's CENTER, not its top face) converges to WRIST_ALIGN with
-    # torso-arm peak 5.48N -- a real, comfortable margin under the
-    # unchanged 8N limit, and much closer to "level with the object" than
-    # the y_offset=0.15 band ever achieved collision-free. height=0.0
-    # (exact center) at this wider offset still peaks at 12.61N (unsafe);
-    # y_offset=0.30 is UNREACHABLE at low height (IK's own solve saturates
-    # a joint limit, margin=0.0000, pos_err plateaus ~10.8mm regardless of
-    # settle time -- a genuine kinematic limit, not a timing artifact).
-    # 0.02/0.20 is the point in this second sweep with real margin on
-    # both the collision and the reachability side.
-    descend_height_m: float = 0.02
-    # [This session] see descend_height_m's docstring -- the wider Y
-    # offset that makes the lower height collision-free.
-    descend_y_offset_m: float = 0.20
+    # [Superseded this session] the numbers above (0.02/0.20) were tuned
+    # for the OLD FOREARM_DESCEND, which held whatever orientation
+    # ARM_LATERAL_CLEARANCE happened to leave the wrist in (approach axis
+    # pointing mostly forward/up, NOT down -- measured this session,
+    # finger_down_angle ~122deg, i.e. the opposite of "down"). That state
+    # is replaced by WRIST_SIDE_GRASP_ALIGN + FOREARM_SIDE_DESCEND below,
+    # which target a genuine object-facing, fingers-down orientation and
+    # use their OWN geometry fields.
     forward_reach_stable_streak_required: int = 15
-    descend_stable_streak_required: int = 15
+
+    # ---- Side-grasp geometry (this session) --------------------------
+    # User-directed requirement: both palms end up beside the object's
+    # OWN side faces, facing each other (closing axis toward the object
+    # center), fingers generally pointing down -- not a top-down palm-
+    # down reach. Root-caused (scripts/measure_sharpa_side_grasp_axes.py
+    # FK audit + a bounded, disclosed series of position/orientation/
+    # collision experiments, never a large random sweep) that:
+    #   1. The natural orientation ARM_LATERAL_CLEARANCE/FOREARM_FORWARD_
+    #      REACH leave the wrist in is ~110-170deg away from ANY object-
+    #      facing pose -- a large reorientation is unavoidable somewhere.
+    #   2. Ramping ONLY orientation (holding position fixed) at ANY tested
+    #      position -- the wide/high FOREARM_FORWARD_REACH pose, or the
+    #      close/low final grasp pose -- reliably self-collides (measured
+    #      peaks 46-113N torso<->arm depending on where/how it was tried
+    #      in earlier sessions and this one). Ramping POSITION and
+    #      ORIENTATION together, waypointed (SLERP + linear position
+    #      interpolation, same per-waypoint IK re-solve recipe as
+    #      FOREARM_FORWARD_REACH), from FOREARM_FORWARD_REACH's own
+    #      (already safe) end pose to a new lower/oriented target is
+    #      collision-free (measured 0.00N torso-arm, 0.00N hand-hand
+    #      across 3 repeated seed=0 rollouts).
+    #   3. With fingers pointing down, OPEN (uncurled) fingers reach
+    #      ~15cm below the palm -- at any Z near the object/table, this
+    #      spears the table (measured up to 25N hand-table force) unless
+    #      the fingers are partially curled (side_align_preshape_curl)
+    #      BEFORE/DURING this transition, shortening their effective
+    #      reach. This is why WRIST_SIDE_GRASP_ALIGN applies preshape
+    #      abduction AND a protective curl at its own entry, ahead of the
+    #      later, dedicated FIVE_FINGER_PRESHAPE state.
+    #   4. The old, asymmetric _object_facing_R sign convention (removed
+    #      this session -- see that function's docstring) was ALSO a
+    #      genuine contributor to the self-collision this feature was
+    #      previously blocked on.
+    # side_align_* is FOREARM_FORWARD_REACH's own standoff (approach_
+    # standoff_m, unchanged -- table clearance already proven there) with
+    # a HIGHER height and WIDER Y offset than the old descend target, so
+    # OPEN fingers pointing down still clear the table during the ramp.
+    side_align_height_m: float = 0.04
+    side_align_y_offset_m: float = 0.22
+    # Protective curl (index/middle/wrap only, thumb untouched -- same
+    # split as CONTACT_ACQUIRE) applied at WRIST_SIDE_GRASP_ALIGN entry,
+    # before the position+orientation ramp -- see point 3 above. NOT the
+    # same as FIVE_FINGER_PRESHAPE's own (later, unchanged) preshape call;
+    # this is purely a table-clearance safety margin, disclosed as such.
+    side_align_preshape_curl: float = 0.5
+    side_align_waypoints: int = 14
+    side_align_waypoint_ticks: int = 30
+    side_align_max_steps: int = 600
+    side_align_stable_streak_required: int = 15
+    # Side-Grasp Posture Gate tolerances (Section 10 of this session's
+    # spec) -- measured directly, not guessed:
+    side_grasp_inward_angle_tol_deg: float = 15.0
+    side_grasp_finger_down_tol_deg: float = 25.0
+    side_grasp_mirror_pos_tol_m: float = 0.020
+    side_grasp_mirror_ori_tol_deg: float = 10.0
+    # FOREARM_SIDE_DESCEND: a SECOND waypointed position move (orientation
+    # held via a small soft anchor, NOT re-derived -- it is already
+    # correct from WRIST_SIDE_GRASP_ALIGN) from the align pose down/in
+    # toward the final pre-contact approach. Measured collision-free
+    # (0.00N torso-arm/hand-hand/hand-table) at these values, holding the
+    # ALIGN orientation.
+    side_descend_standoff_m: float = 0.12
+    side_descend_height_m: float = 0.03
+    side_descend_y_offset_m: float = 0.15
+    side_descend_waypoints: int = 8
+    side_descend_waypoint_ticks: int = 30
+    side_descend_stable_streak_required: int = 15
     precontact_standoff_m: float = 0.08
-    # [This session] kept equal to descend_height_m (both level with the
-    # object, near its center) so FINGERTIP_PRECONTACT's own waypoints
-    # only move inward (standoff/Y, from descend_y_offset_m=0.20 down to
-    # precontact_y_offset_m=0.10 below), never back up in Z.
-    precontact_height_m: float = 0.02
-    precontact_y_offset_m: float = 0.10
+    # [This session] retargeted for the side-grasp geometry -- height
+    # matches side_descend_height_m (no further Z motion), y_offset moves
+    # the last ~6cm in from side_descend_y_offset_m=0.15 to just outside
+    # the object's own half-width (0.06) plus fingertip clearance.
+    precontact_height_m: float = 0.03
+    precontact_y_offset_m: float = 0.09
     close_rate_per_step: float = 0.03
     contact_force_threshold_n: float = 0.5
     target_force_band_n: tuple[float, float] = (1.0, 6.0)
@@ -277,7 +368,7 @@ class BimanualGraspConfig:
     hand_hand_force_limit_n: float = 8.0
     ik_pos_tol: float = 0.01
     max_steps_per_state: int = 400
-    wrist_orientation_stability_tol_deg: float = 5.0  # max angular drift over the last 30 ticks to call WRIST_ALIGN settled
+    wrist_orientation_stability_tol_deg: float = 5.0  # max angular drift over the last 30 ticks to call WRIST_SIDE_GRASP_ALIGN settled
     # [Session 39] FINGERTIP_PRECONTACT Precontact Tracking Gate (see
     # docs/history/PHASE4_GRASP_SESSION_39.md): the ctrl register
     # converges EXACTLY to the IK-solved joint target --
@@ -293,27 +384,19 @@ class BimanualGraspConfig:
     # measures the actual settled pose and gates the transition on it.
     precontact_ori_tol_deg: float = 5.0  # Precontact Tracking Gate orientation tolerance (Session 39 spec)
     precontact_stable_streak_required: int = 15  # Precontact Tracking Gate: consecutive ticks required
-    # [Session 40] Orientation Alignment Gate: explicit object-facing
-    # wrist target (see _object_facing_R), ramped in gradually across
-    # FOREARM_APPROACH_ORI_WAYPOINTS waypoints (same recipe as
-    # FINGERTIP_PRECONTACT's WAYPOINT_COUNT interpolation -- a single
-    # hard jump to an independently-chosen orientation was found in the
-    # 36th session to destabilize the low-inertia wrist joints).
-    object_facing_angle_tol_deg: float = 10.0  # Orientation Alignment Gate: palm-closing-axis vs palm->object angle
-    # [Session 40] Default False: PRESERVES the 39th session's official
-    # tested behavior exactly (FOREARM_APPROACH soft-anchors to whatever
-    # orientation NATURAL_ARM_LIFT converged to; WRIST_ALIGN only checks
-    # drift stability). True enables the object-facing orientation target
-    # + Orientation Alignment Gate (see _object_facing_R / module
-    # docstring) -- causally confirmed to measurably improve WHERE the
-    # hand ends up (index/middle fingertips no longer 12-21cm off the
-    # object) but ALSO causally confirmed (A/B) to drive the right wrist
-    # into torso_link at up to 113N, a real forbidden self-collision this
-    # session did not have time to resolve (collision-aware waypoints /
-    # shoulder-elbow posture seeding, as originally scoped, are NOT yet
-    # implemented). Kept default OFF and opt-in until that is fixed --
-    # see docs/history/PHASE4_GRASP_SESSION_40.md's "next single blocker".
-    object_facing_orientation: bool = False
+    # [This session] WRIST_SIDE_GRASP_ALIGN's own state-transition check
+    # for "is this actually object-facing" -- WRIST_SIDE_GRASP_ALIGN's
+    # explicit object-facing target (see _object_facing_R) is now the
+    # DEFAULT, only path (the old opt-in object_facing_orientation flag
+    # and its self-colliding DESCEND-time ramp are removed -- superseded
+    # by WRIST_SIDE_GRASP_ALIGN + FOREARM_SIDE_DESCEND, which fix the
+    # causal self-collision source: see side_align_height_m's docstring).
+    # Matches side_grasp_inward_angle_tol_deg (15deg, this session's own
+    # Side-Grasp Posture Gate spec) rather than the old inherited 10deg --
+    # a physically-converged, collision-free approach measured at ~14deg
+    # here should not fail this internal check only to pass the Gate's
+    # own (identical-intent) 15deg tolerance moments later.
+    object_facing_angle_tol_deg: float = 15.0  # palm-closing-axis vs palm->object angle
 
 
 @dataclass
@@ -343,6 +426,8 @@ class BimanualGraspOutcome:
     precontact_final_ori_error_deg: dict  # {side: deg}
     precontact_max_stable_streak: int
     precontact_gate: bool  # Session 39 Precontact Tracking Gate (see module docstring)
+    side_grasp_posture: dict  # [This session] Side-Grasp Posture Gate metrics + pass/fail, see _side_grasp_posture_metrics
+    side_grasp_gate: bool  # [This session] Side-Grasp Posture Gate PASS/FAIL (Section 10 of this session's spec)
 
 
 class SharpaBimanualGraspExpert:
@@ -355,17 +440,8 @@ class SharpaBimanualGraspExpert:
     # real wrist_pitch dynamics instability shared with the single-hand
     # controller.
     RAMP_FRACTION = 1.0
-    APPROACH_STEPS = 200
     WAYPOINT_COUNT = 4
     WAYPOINT_TICKS = 60
-    # [Session 40] FOREARM_APPROACH orientation ramp: APPROACH_STEPS split
-    # into this many equal waypoints, each re-solving the SAME (fixed)
-    # approach position but SLERPing the orientation target a bit further
-    # from the entry orientation toward _object_facing_R, with
-    # ori_task_weight ramped from a small starting value to a moderate
-    # ending value across the same waypoints -- gradual, never a one-shot
-    # jump (see module docstring's wrist-instability finding).
-    APPROACH_ORI_WAYPOINTS = 4
     FORWARD_REACH_WAYPOINTS = 6  # [Session 41] see FOREARM_FORWARD_REACH: the clearance->approach Y swing (~0.46m -> 0.15m) needs several small steps, not one, to avoid a waist_pitch hard-limit
     # [This session] FOREARM_FORWARD_REACH's waypoint spacing was
     # `max_steps_per_state // FORWARD_REACH_WAYPOINTS` (=66 at the
@@ -390,14 +466,12 @@ class SharpaBimanualGraspExpert:
     # max_steps_per_state/ik_pos_tol/streak-length budget -- a waypoint-
     # schedule bookkeeping fix, not a Gate relaxation.
     FORWARD_REACH_WAYPOINT_TICKS = 40
-    # [This session] FOREARM_DESCEND's default (non-object-facing) branch
-    # -- see that state's docstring for the causal finding (a single-shot
-    # solve no longer settles once descend_height_m dropped to 0.0).
-    # Waypointed the same way as FORWARD_REACH_WAYPOINT_TICKS.
-    DESCEND_WAYPOINTS = 4
-    DESCEND_WAYPOINT_TICKS = 40
-    APPROACH_ORI_WEIGHT_START = 0.05
-    APPROACH_ORI_WEIGHT_END = 1.0
+    # [This session] WRIST_SIDE_GRASP_ALIGN/FOREARM_SIDE_DESCEND's own
+    # orientation ramp weight schedule -- same small-start/large-end shape
+    # as the removed object_facing_orientation ramp (gradual, never a
+    # one-shot jump to a hard orientation requirement).
+    SIDE_ORI_WEIGHT_START = 0.05
+    SIDE_ORI_WEIGHT_END = 1.0
 
     def __init__(self, env, config: BimanualGraspConfig | None = None):
         self.env = env
@@ -425,20 +499,29 @@ class SharpaBimanualGraspExpert:
         self._max_left_streak = 0
         self._max_right_streak = 0
         self._max_bilateral_streak = 0
-        self._locked_R: dict | None = None  # set at WRIST_ALIGN entry, see module docstring
+        self._locked_R: dict | None = None  # set at WRIST_SIDE_GRASP_ALIGN entry, see module docstring
         self.wrist_orientation_drift_deg: float = float("inf")
         self.left_object_facing_angle_deg: float = float("inf")
         self.right_object_facing_angle_deg: float = float("inf")
         self.torso_arm_collision_force_n: float = 0.0
+        self.max_hand_table_force_n: float = 0.0
         self._clearance_target: np.ndarray | None = None
         self._clearance_max_raw_wrist_qvel: float = 0.0
         self._clearance_stable_streak = 0
         self._forward_reach_stable_streak = 0
+        # WRIST_SIDE_GRASP_ALIGN (this session)
+        self._side_align_waypoint = 0
+        self._side_align_stable_streak = 0
+        self._side_align_R_hist = {"left": [], "right": []}
+        # FOREARM_SIDE_DESCEND (this session)
+        self._side_descend_waypoint = 0
         self._descend_stable_streak = 0
         self._precontact_stable_streak = 0
         self._max_precontact_stable_streak = 0
         self._precontact_final_pos_error = {"left": float("inf"), "right": float("inf")}
         self._precontact_final_ori_error_deg = {"left": float("inf"), "right": float("inf")}
+        self._side_grasp_posture: dict = {}
+        self._side_grasp_gate: bool = False
 
         model = env.model
         waist_dof = np.array([model.jnt_dofadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)] for n in wbc.WAIST_JOINTS])
@@ -640,6 +723,100 @@ class SharpaBimanualGraspExpert:
             for side in SIDES for g in ("thumb", "index", "middle")
         )
 
+    def _measure_side_grasp_posture(self) -> dict:
+        """[This session] Side-Grasp Posture Gate (Section 10 of this
+        session's spec) -- measured directly from live FK/contact state,
+        called once when WRIST_SIDE_GRASP_ALIGN's own stability/collision/
+        object-facing checks have just passed. Every sub-condition here is
+        a real measurement (fingertip FK, palm axes, elbow/shoulder body
+        position, actual contact forces already tracked this tick) --
+        none of it is inferred from joint targets alone."""
+        env = self.env
+        obj_pos = self._object_pos()
+        half = env.config.object_half_size
+        palm = {s: env.palm_pose(s) for s in SIDES}
+        tip_centroid = {}
+        for s in SIDES:
+            tips = {f: env.fingertip_pos(s, f) for f in sc.FINGERS}
+            tip_centroid[s] = np.mean([tips[f] for f in ("index", "middle", "ring", "pinky")], axis=0)
+
+        outside_side_face = {s: bool(abs(palm[s][0][1]) > half) for s in SIDES}
+        inward_angle_deg = {
+            "left": self.left_object_facing_angle_deg, "right": self.right_object_facing_angle_deg,
+        }
+        # palm normals (= closing axis, palm_R column 1) must OPPOSE each other (facing in).
+        normals_opposed = float(np.dot(palm["left"][1][:, 1], palm["right"][1][:, 1])) < 0.0
+        finger_down_deg = {s: _finger_down_angle_deg(palm[s][1]) for s in SIDES}
+        tip_height_overlaps_side = {
+            s: bool(obj_pos[2] - half <= tip_centroid[s][2] <= obj_pos[2] + half) for s in SIDES
+        }
+        # "crosses the object's TOP footprint" -- palm/fingertip XY within the object's
+        # own X/Y half-extent AND above the object's top face.
+        crosses_top_footprint = any(
+            abs(tip_centroid[s][0] - obj_pos[0]) < half and abs(tip_centroid[s][1] - obj_pos[1]) < half
+            and tip_centroid[s][2] > obj_pos[2] + half
+            for s in SIDES
+        )
+        mirror_pos_err_m = float(np.linalg.norm(
+            (palm["left"][0] - obj_pos) * np.array([1, -1, 1]) - (palm["right"][0] - obj_pos)
+        ))
+        rel = palm["left"][1].T @ palm["right"][1]
+        # left/right are mirrors (Y-flip), not identical -- compare each side's OWN
+        # deviation from ITS side-grasp target instead of comparing R_left to R_right directly.
+        mirror_ori_err_deg = abs(inward_angle_deg["left"] - inward_angle_deg["right"])
+        elbow_above_shoulder_m = {}
+        for s in SIDES:
+            sb = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, f"{s}_shoulder_roll_link")
+            eb = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, f"{s}_elbow_link")
+            elbow_above_shoulder_m[s] = float(env.data.xpos[eb][2] - env.data.xpos[sb][2])
+
+        torso_arm_ok = self.torso_arm_collision_force_n <= self.config.hand_hand_force_limit_n
+        hand_table_ok = self.max_hand_table_force_n <= self.config.hand_hand_force_limit_n
+        hand_hand_ok = self._max_hand_hand <= self.config.hand_hand_force_limit_n if self._max_hand_hand else \
+            env._hand_hand_contact_force() <= self.config.hand_hand_force_limit_n
+        premature_contact_ok = self._proximal_penetration_ok()
+        elbow_ok = all(v <= 0.02 for v in elbow_above_shoulder_m.values())
+
+        metrics = {
+            "outside_side_face": outside_side_face,
+            "inward_angle_deg": inward_angle_deg,
+            "normals_opposed": normals_opposed,
+            "finger_down_deg": finger_down_deg,
+            "tip_height_overlaps_side": tip_height_overlaps_side,
+            "crosses_top_footprint": crosses_top_footprint,
+            "mirror_pos_err_m": mirror_pos_err_m,
+            "mirror_ori_err_deg": mirror_ori_err_deg,
+            "elbow_above_shoulder_m": elbow_above_shoulder_m,
+            "elbow_ok": elbow_ok,
+            "torso_arm_ok": torso_arm_ok,
+            "hand_table_ok": hand_table_ok,
+            "hand_hand_ok": hand_hand_ok,
+            "premature_contact_ok": premature_contact_ok,
+            "wrist_orientation_drift_deg": self.wrist_orientation_drift_deg,
+            "streak": self._side_align_stable_streak,
+        }
+        cfg = self.config
+        gate = (
+            all(outside_side_face.values())
+            and inward_angle_deg["left"] <= cfg.side_grasp_inward_angle_tol_deg
+            and inward_angle_deg["right"] <= cfg.side_grasp_inward_angle_tol_deg
+            and normals_opposed
+            and finger_down_deg["left"] <= cfg.side_grasp_finger_down_tol_deg
+            and finger_down_deg["right"] <= cfg.side_grasp_finger_down_tol_deg
+            and all(tip_height_overlaps_side.values())
+            and not crosses_top_footprint
+            and mirror_pos_err_m <= cfg.side_grasp_mirror_pos_tol_m
+            and mirror_ori_err_deg <= cfg.side_grasp_mirror_ori_tol_deg
+            and elbow_ok
+            and torso_arm_ok
+            and hand_table_ok
+            and hand_hand_ok
+            and premature_contact_ok
+            and self._side_align_stable_streak >= cfg.side_align_stable_streak_required
+        )
+        metrics["gate"] = gate
+        return metrics
+
     # ------------------------------------------------------------------
     def step(self) -> np.ndarray:
         action = self._zero_action()
@@ -779,7 +956,7 @@ class SharpaBimanualGraspExpert:
                 # starting configuration. ori_task_weight=0.0 (position-
                 # only) converges cleanly (pos_err 0.53cm, positive joint
                 # margin) -- acceptable here because FOREARM_FORWARD_REACH
-                # is a transit state; WRIST_ALIGN/FINGERTIP_PRECONTACT
+                # is a transit state; WRIST_SIDE_GRASP_ALIGN/FINGERTIP_PRECONTACT
                 # still do the real orientation work afterward. Verified
                 # empirically (not just solve()'s own report) that this
                 # does not reintroduce the 36th session's wrist_pitch
@@ -799,126 +976,106 @@ class SharpaBimanualGraspExpert:
                           and self._forward_reach_waypoint >= self.FORWARD_REACH_WAYPOINTS)
             self._forward_reach_stable_streak = self._forward_reach_stable_streak + 1 if stable_now else 0
             if self._forward_reach_stable_streak >= cfg.forward_reach_stable_streak_required:
-                self._advance(BimanualGraspState.FOREARM_DESCEND)
+                self._advance(BimanualGraspState.WRIST_SIDE_GRASP_ALIGN)
             elif self._state_step >= cfg.max_steps_per_state:
                 self._fail(BimanualFailureReason.FORWARD_REACH_NOT_ACHIEVED)
 
-        elif state == BimanualGraspState.FOREARM_DESCEND:
-            # Same standoff/y_offset as FOREARM_FORWARD_REACH, only Z
-            # descends -- shoulder/elbow do the vertical travel, leaving
-            # FINGERTIP_PRECONTACT only a few cm of final inward motion
-            # (its own waypoints, unchanged). Session 40's object-facing
-            # orientation ramp (opt-in, see BimanualGraspConfig.
-            # object_facing_orientation) moves HERE from the old
-            # FOREARM_APPROACH -- closer to the object, and now with the
-            # SAME posture rest_q bias, which may also reduce the 40th
-            # session's measured torso<->right_wrist_pitch_link
-            # self-collision (untested assumption until re-measured, see
-            # Stage 7 of docs/history/PHASE4_GRASP_SESSION_41.md).
-            if cfg.object_facing_orientation:
-                if self._state_step == 0:
-                    self._approach_start_R = {s: self.env.palm_pose(s)[1].copy() for s in SIDES}
-                    targets = self._mirrored_targets(cfg.approach_standoff_m, cfg.descend_height_m, cfg.approach_y_offset_m)
-                    obj_pos = self._object_pos()
-                    self._approach_target_R = {s: _object_facing_R(s, targets[s], obj_pos) for s in SIDES}
-                    self._approach_waypoint = 0
-                    self._descend_stable_streak = 0
-                ticks_per_wp = self.APPROACH_STEPS // self.APPROACH_ORI_WAYPOINTS
-                if self._state_step % ticks_per_wp == 0 and self._approach_waypoint < self.APPROACH_ORI_WAYPOINTS:
-                    self._approach_waypoint += 1
-                    frac = self._approach_waypoint / self.APPROACH_ORI_WAYPOINTS
-                    ori_w = self.APPROACH_ORI_WEIGHT_START + frac * (self.APPROACH_ORI_WEIGHT_END - self.APPROACH_ORI_WEIGHT_START)
-                    targets = self._mirrored_targets(cfg.approach_standoff_m, cfg.descend_height_m, cfg.approach_y_offset_m)
-                    R = {s: _slerp_R(self._approach_start_R[s], self._approach_target_R[s], frac) for s in SIDES}
-                    final_wp = self._approach_waypoint >= self.APPROACH_ORI_WAYPOINTS
-                    result = self._solve_both(targets, R, require_orientation=final_wp, ori_task_weight=ori_w,
-                                               rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain)
-                    self._apply_ik_result(result)
-            else:
-                # [This session] descend_height_m moved from +0.10 to 0.0
-                # (user-directed geometry correction, see that field's
-                # docstring) roughly DOUBLED this branch's single-shot
-                # vertical Cartesian jump (0.22->0.10, i.e. 12cm, to
-                # 0.22->0.0, i.e. 22cm). Measured (same diagnostic method
-                # as FOREARM_FORWARD_REACH's fix) this single solve/single
-                # ctrl-chase no longer settles within max_steps_per_state:
-                # physical error plateaus around 17-18mm, a real
-                # actuator-tracking/large-jump limit, not merely a slow
-                # asymptote. Waypointing this same Cartesian move (the
-                # identical recipe FOREARM_FORWARD_REACH now uses, and
-                # already how this state's own object_facing_orientation
-                # branch above does its ramp) fixes it the same way.
-                if self._state_step == 0:
-                    self._descend_stable_streak = 0
-                    self._descend_start = {s: self.env.palm_pose(s)[0].copy() for s in SIDES}
-                    self._descend_final = self._mirrored_targets(
-                        cfg.approach_standoff_m, cfg.descend_height_m, cfg.descend_y_offset_m
-                    )
-                    self._descend_waypoint = 0
-                if (self._state_step % self.DESCEND_WAYPOINT_TICKS == 0
-                        and self._descend_waypoint < self.DESCEND_WAYPOINTS):
-                    self._descend_waypoint += 1
-                    # [This session] measured a real, brief torso<->arm
-                    # contact impulse (peak ~10.8N, one tick, over the
-                    # 8N safety limit) right at the FINAL waypoint's
-                    # abrupt re-solve -- descend_height_m=0.06 brings the
-                    # forearm close enough to the torso that even a plain
-                    # linear 1/4-fraction jump grazes it. Quintic
-                    # min-jerk fraction spacing (same function already
-                    # used for ARM_LATERAL_CLEARANCE's analogous
-                    # thumb<->table impulse) makes the FIRST and LAST
-                    # waypoint steps smaller instead of uniform, directly
-                    # shrinking the final jump that caused the spike.
-                    frac = _quintic_scale(self._descend_waypoint / self.DESCEND_WAYPOINTS)
-                    wp_targets = {
-                        s: (1 - frac) * self._descend_start[s] + frac * self._descend_final[s] for s in SIDES
-                    }
-                    lR = self.env.palm_pose("left")[1].copy()
-                    rR = self.env.palm_pose("right")[1].copy()
-                    result = self._solve_both(wp_targets, {"left": lR, "right": rR}, require_orientation=False,
-                                               ori_task_weight=0.1, rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain)
-                    self._apply_ik_result(result)
-            action[0:3] = self._waist_action_toward_target()
-            action[3:17] = self._arm_action_toward_target()
-            descend_y_offset = cfg.approach_y_offset_m if cfg.object_facing_orientation else cfg.descend_y_offset_m
-            targets = self._mirrored_targets(cfg.approach_standoff_m, cfg.descend_height_m, descend_y_offset)
-            left_pos = self.env.palm_pose("left")[0]
-            right_pos = self.env.palm_pose("right")[0]
-            pos_err = max(float(np.linalg.norm(targets["left"] - left_pos)), float(np.linalg.norm(targets["right"] - right_pos)))
-            no_collision = (self.env._torso_arm_collision_force() <= cfg.hand_hand_force_limit_n
-                             and self.env._hand_hand_contact_force() <= cfg.hand_hand_force_limit_n)
-            waypoints_done = cfg.object_facing_orientation or self._descend_waypoint >= self.DESCEND_WAYPOINTS
-            stable_now = pos_err <= cfg.ik_pos_tol and no_collision and waypoints_done
-            self._descend_stable_streak = self._descend_stable_streak + 1 if stable_now else 0
-            if self._descend_stable_streak >= cfg.descend_stable_streak_required:
-                self._advance(BimanualGraspState.WRIST_ALIGN)
-            elif self._state_step >= cfg.max_steps_per_state:
-                self._fail(BimanualFailureReason.DESCEND_NOT_ACHIEVED)
-
-        elif state == BimanualGraspState.WRIST_ALIGN:
-            # [This session's design, after the original re-solve-with-
-            # hard-orientation-weight approach was found to freeze the IK
-            # solver -- error_history flat across all 200 iterations,
-            # joint_limit_margin pinned at ~0, a genuine degenerate/
-            # saturated configuration, not a slow-convergence issue] does
-            # NOT run a second IK solve at all. Instead it holds
-            # FOREARM_APPROACH's own target and MEASURES whether the
-            # achieved palm orientation has actually settled (max angular
-            # drift over the last 30 ticks) -- a directly measurable,
-            # non-fabricated criterion for "orientation error has been
-            # reduced" that this controller can be honest about: if the
-            # orientation is STILL changing by more than the tolerance,
-            # this is reported as WRIST_ORIENTATION_NOT_STABLE, never
-            # silently treated as WRIST_ALIGN succeeding.
+        elif state == BimanualGraspState.WRIST_SIDE_GRASP_ALIGN:
+            # [This session] Replaces the old FOREARM_DESCEND (position-
+            # only) + WRIST_ALIGN (measure-only) pair. User requirement:
+            # both palms end up beside the object's own side faces,
+            # FACING EACH OTHER (closing axis toward the object center),
+            # fingers generally pointing down -- not a top-down reach.
+            #
+            # Causal path to this design (bounded experiments, never a
+            # random sweep -- see scripts/measure_sharpa_side_grasp_axes.py
+            # and side_align_height_m's docstring above):
+            #  1. FK-measured the real palm/finger axes: the "closing"
+            #     local axis (palm_R column 1) is where fingertips move
+            #     when the index/middle/wrap groups curl -- IDENTICAL sign
+            #     for both hands in local frame (fixed _object_facing_R's
+            #     old per-side negation, see that function's docstring).
+            #     The "finger-down" axis coincides EXACTLY with the
+            #     approach axis (palm_R column 0) for open, straight
+            #     fingers.
+            #  2. The orientation ARM_LATERAL_CLEARANCE/FOREARM_FORWARD_
+            #     REACH leave the wrist in is ~110-170deg away from any
+            #     object-facing target -- a large reorientation is
+            #     unavoidable SOMEWHERE in this trajectory.
+            #  3. Ramping ONLY orientation while holding POSITION FIXED
+            #     (at FOREARM_FORWARD_REACH's own end pose, or at the
+            #     final close/low grasp pose) reliably self-collides
+            #     (measured 72-97N torso-arm/hand-hand peaks, both
+            #     locations). Ramping position AND orientation TOGETHER,
+            #     waypointed with SLERP (same per-waypoint IK re-solve
+            #     recipe as FOREARM_FORWARD_REACH's own fix), from
+            #     FOREARM_FORWARD_REACH's already-safe end pose to a new,
+            #     wider/higher-than-final "align" target is collision-free
+            #     (measured 0.00N torso-arm / 0.00N hand-hand, reproduced
+            #     across 3 seed=0 rollouts).
+            #  4. With fingers pointing down, OPEN fingers reach ~15cm
+            #     below the palm -- measured up to 25N hand-table force
+            #     during this same ramp unless a PROTECTIVE partial curl
+            #     (side_align_preshape_curl, index/middle/wrap only, same
+            #     split as CONTACT_ACQUIRE) is applied at this state's
+            #     entry, shortening the effective reach. This is separate
+            #     from FIVE_FINGER_PRESHAPE (which follows, unchanged in
+            #     spirit -- final abduction/opposition refinement) and is
+            #     disclosed here as a safety measure, not hidden.
+            # The target itself (side_align_height_m/y_offset_m, at
+            # FOREARM_FORWARD_REACH's own standoff) is deliberately HIGHER
+            # and WIDER than the final grasp pose -- FOREARM_SIDE_DESCEND
+            # (next) closes the remaining gap with orientation already
+            # established and held, matching the "no large wrist rotation
+            # after descending" requirement.
             if self._state_step == 0:
-                self._wrist_align_R_hist = {"left": [], "right": []}
+                self.env.set_preshape("left", 1.0)
+                self.env.set_preshape("right", 1.0)
+                self._side_align_start_pos = {s: self.env.palm_pose(s)[0].copy() for s in SIDES}
+                self._side_align_start_R = {s: self.env.palm_pose(s)[1].copy() for s in SIDES}
+                obj_pos = self._object_pos()
+                self._side_align_final_pos = self._mirrored_targets(
+                    cfg.approach_standoff_m, cfg.side_align_height_m, cfg.side_align_y_offset_m
+                )
+                self._side_align_final_R = {s: _object_facing_R(s, self._side_align_final_pos[s], obj_pos) for s in SIDES}
+                self._side_align_waypoint = 0
+                self._side_align_stable_streak = 0
+                self._side_align_R_hist = {"left": [], "right": []}
+            # Protective curl ramp (index/middle/wrap, not thumb), fast
+            # relative to the position/orientation ramp so it is mostly
+            # established before the riskier later waypoints.
+            curl_ramp_ticks = int(np.ceil(cfg.side_align_preshape_curl / max(self.env.config.hand_synergy_action_scale, 1e-9)))
+            if self._state_step < curl_ramp_ticks:
+                action[17:25] = self._group_action({s: {"index": cfg.close_rate_per_step, "middle": cfg.close_rate_per_step,
+                                                          "wrap": cfg.close_rate_per_step} for s in SIDES})
+            ticks_per_wp = cfg.side_align_waypoint_ticks
+            if self._state_step % ticks_per_wp == 0 and self._side_align_waypoint < cfg.side_align_waypoints:
+                self._side_align_waypoint += 1
+                frac = self._side_align_waypoint / cfg.side_align_waypoints
+                wp_pos = {
+                    s: (1 - frac) * self._side_align_start_pos[s] + frac * self._side_align_final_pos[s] for s in SIDES
+                }
+                R = {s: _slerp_R(self._side_align_start_R[s], self._side_align_final_R[s], frac) for s in SIDES}
+                ori_w = self.SIDE_ORI_WEIGHT_START + frac * (self.SIDE_ORI_WEIGHT_END - self.SIDE_ORI_WEIGHT_START)
+                final_wp = self._side_align_waypoint >= cfg.side_align_waypoints
+                result = self._solve_both(wp_pos, R, require_orientation=final_wp, ori_task_weight=ori_w,
+                                           rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain)
+                self._apply_ik_result(result)
             action[0:3] = self._waist_action_toward_target()
             action[3:17] = self._arm_action_toward_target()
             lR = self.env.palm_pose("left")[1].copy()
             rR = self.env.palm_pose("right")[1].copy()
-            self._wrist_align_R_hist["left"].append(lR)
-            self._wrist_align_R_hist["right"].append(rR)
-            if self._state_step >= 60:
+            self._side_align_R_hist["left"].append(lR)
+            self._side_align_R_hist["right"].append(rR)
+            no_collision = (self.env._torso_arm_collision_force() <= cfg.hand_hand_force_limit_n
+                             and self.env._hand_hand_contact_force() <= cfg.hand_hand_force_limit_n)
+            no_table_hit = self.env._hand_table_contact_force() <= cfg.hand_hand_force_limit_n
+            self.max_hand_table_force_n = max(self.max_hand_table_force_n, self.env._hand_table_contact_force())
+            waypoints_done = self._side_align_waypoint >= cfg.side_align_waypoints
+            if not no_table_hit:
+                self._fail(BimanualFailureReason.HAND_TABLE_COLLISION)
+                return action
+            if waypoints_done and len(self._side_align_R_hist["left"]) >= 30:
                 def _max_angle_dev_deg(hist: list[np.ndarray]) -> float:
                     r_final = hist[-1]
                     devs = []
@@ -928,63 +1085,117 @@ class SharpaBimanualGraspExpert:
                         devs.append(np.degrees(np.arccos(cos_ang)))
                     return max(devs)
 
-                left_dev = _max_angle_dev_deg(self._wrist_align_R_hist["left"])
-                right_dev = _max_angle_dev_deg(self._wrist_align_R_hist["right"])
+                left_dev = _max_angle_dev_deg(self._side_align_R_hist["left"])
+                right_dev = _max_angle_dev_deg(self._side_align_R_hist["right"])
                 self.wrist_orientation_drift_deg = max(left_dev, right_dev)
+                stable_now = (self.wrist_orientation_drift_deg <= cfg.wrist_orientation_stability_tol_deg
+                              and no_collision)
+            else:
+                stable_now = False
+            self._side_align_stable_streak = self._side_align_stable_streak + 1 if stable_now else 0
+            if self._side_align_stable_streak >= cfg.side_align_stable_streak_required:
                 self._locked_R = {"left": lR, "right": rR}
-                if self.wrist_orientation_drift_deg > cfg.wrist_orientation_stability_tol_deg:
-                    self._fail(BimanualFailureReason.WRIST_ORIENTATION_NOT_STABLE)
-                    return action
-                # [Session 40] torso<->arm self-collision check -- added
-                # after the object-facing orientation change below was
-                # causally found (A/B: disabling it removes the contact
-                # entirely) to drive the right wrist into torso_link at
-                # up to 109N. Neither the existing hand-hand nor
-                # proximal-object checks cover this category. Must be
-                # checked BEFORE declaring the orientation gate passed --
-                # a "stable and object-facing" orientation that only gets
-                # there by wedging the arm into the torso is not a pass.
                 self.torso_arm_collision_force_n = self.env._torso_arm_collision_force()
                 if self.torso_arm_collision_force_n > cfg.hand_hand_force_limit_n:
                     self._fail(BimanualFailureReason.SELF_COLLISION_TORSO_ARM)
                     return action
-                # [Session 40] Orientation Alignment Gate -- stability
-                # alone (above) does not mean the palm is actually facing
-                # the object (Session 40 audit finding). Measure the real
-                # palm-closing-axis-vs-object angle for BOTH hands here;
-                # a stable-but-wrong orientation must not silently pass.
-                # Gated behind object_facing_orientation (default False,
-                # see BimanualGraspConfig docstring): the metric itself is
-                # always computed/reported for visibility, but only
-                # ENFORCED as a pass/fail gate when the caller has opted
-                # into the (not yet self-collision-safe) object-facing
-                # target this measures against.
                 obj_pos = self._object_pos()
                 left_pos = self.env.palm_pose("left")[0]
                 right_pos = self.env.palm_pose("right")[0]
                 self.left_object_facing_angle_deg = _object_facing_angle_deg("left", lR, left_pos, obj_pos)
                 self.right_object_facing_angle_deg = _object_facing_angle_deg("right", rR, right_pos, obj_pos)
-                if cfg.object_facing_orientation and (
-                    self.left_object_facing_angle_deg > cfg.object_facing_angle_tol_deg
-                    or self.right_object_facing_angle_deg > cfg.object_facing_angle_tol_deg
-                ):
+                if (self.left_object_facing_angle_deg > cfg.object_facing_angle_tol_deg
+                        or self.right_object_facing_angle_deg > cfg.object_facing_angle_tol_deg):
                     self._fail(BimanualFailureReason.WRIST_NOT_OBJECT_FACING)
                     return action
+                self._side_grasp_posture = self._measure_side_grasp_posture()
+                self._side_grasp_gate = self._side_grasp_posture["gate"]
                 self._advance(BimanualGraspState.FIVE_FINGER_PRESHAPE)
+            elif self._state_step >= cfg.side_align_max_steps:
+                self._fail(BimanualFailureReason.SIDE_GRASP_ALIGN_NOT_ACHIEVED)
 
         elif state == BimanualGraspState.FIVE_FINGER_PRESHAPE:
+            # Abduction/opposition preshape was already applied at
+            # WRIST_SIDE_GRASP_ALIGN entry (set_preshape is idempotent --
+            # re-applying here is a harmless confirmation, not a second
+            # target). This state's remaining job is exactly what it was
+            # before: hold briefly and verify no self-collision/table hit
+            # resulted before committing to FOREARM_SIDE_DESCEND.
             if self._state_step == 0:
                 self.env.set_preshape("left", 1.0)
                 self.env.set_preshape("right", 1.0)
+            action[0:3] = self._waist_action_toward_target()
+            action[3:17] = self._arm_action_toward_target()
             if self._state_step >= 30:
-                if not self._proximal_penetration_ok() or self.env._hand_hand_contact_force() > cfg.hand_hand_force_limit_n:
+                if (not self._proximal_penetration_ok()
+                        or self.env._hand_hand_contact_force() > cfg.hand_hand_force_limit_n):
                     self._fail(BimanualFailureReason.SELF_COLLISION_BEFORE_CONTACT)
                     return action
+                if self.env._hand_table_contact_force() > cfg.hand_hand_force_limit_n:
+                    self._fail(BimanualFailureReason.HAND_TABLE_COLLISION)
+                    return action
+                self._advance(BimanualGraspState.FOREARM_SIDE_DESCEND)
+
+        elif state == BimanualGraspState.FOREARM_SIDE_DESCEND:
+            # [This session] Second waypointed position move, orientation
+            # HELD (small soft anchor to the ALREADY-correct side-grasp
+            # orientation, never re-derived) -- matches the "no large
+            # wrist rotation after descending" requirement. See
+            # side_descend_standoff_m's docstring for the measured
+            # collision-free numbers.
+            if self._state_step == 0:
+                self._descend_stable_streak = 0
+                self._side_descend_start = {s: self.env.palm_pose(s)[0].copy() for s in SIDES}
+                self._side_descend_final = self._mirrored_targets(
+                    cfg.side_descend_standoff_m, cfg.side_descend_height_m, cfg.side_descend_y_offset_m
+                )
+                self._side_descend_waypoint = 0
+            if (self._state_step % cfg.side_descend_waypoint_ticks == 0
+                    and self._side_descend_waypoint < cfg.side_descend_waypoints):
+                self._side_descend_waypoint += 1
+                frac = _quintic_scale(self._side_descend_waypoint / cfg.side_descend_waypoints)
+                wp_targets = {
+                    s: (1 - frac) * self._side_descend_start[s] + frac * self._side_descend_final[s] for s in SIDES
+                }
+                lR = self.env.palm_pose("left")[1].copy()
+                rR = self.env.palm_pose("right")[1].copy()
+                result = self._solve_both(wp_targets, {"left": lR, "right": rR}, require_orientation=False,
+                                           ori_task_weight=0.15, rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain)
+                self._apply_ik_result(result)
+            action[0:3] = self._waist_action_toward_target()
+            action[3:17] = self._arm_action_toward_target()
+            left_pos = self.env.palm_pose("left")[0]
+            right_pos = self.env.palm_pose("right")[0]
+            pos_err = max(float(np.linalg.norm(self._side_descend_final["left"] - left_pos)),
+                          float(np.linalg.norm(self._side_descend_final["right"] - right_pos)))
+            hand_table_force = self.env._hand_table_contact_force()
+            self.max_hand_table_force_n = max(self.max_hand_table_force_n, hand_table_force)
+            # [This session] Measured (scripts/diagnose_side_grasp_swept_path.py)
+            # a REAL, repeated (not single-tick-transient) hand<->table
+            # force up to ~18N during this state's later waypoints, well
+            # over the 8N limit -- honestly fail-fast on it (matching
+            # WRIST_SIDE_GRASP_ALIGN's own treatment) instead of letting
+            # it get silently absorbed into a generic timeout. A bounded
+            # (curl fraction, height) candidate search did not clear it
+            # without cost elsewhere (higher curl reintroduced a table hit
+            # earlier, during WRIST_SIDE_GRASP_ALIGN itself) -- disclosed
+            # as the current next blocker, not force-fixed here.
+            if hand_table_force > cfg.hand_hand_force_limit_n:
+                self._fail(BimanualFailureReason.HAND_TABLE_COLLISION)
+                return action
+            no_collision = (self.env._torso_arm_collision_force() <= cfg.hand_hand_force_limit_n
+                             and self.env._hand_hand_contact_force() <= cfg.hand_hand_force_limit_n)
+            waypoints_done = self._side_descend_waypoint >= cfg.side_descend_waypoints
+            stable_now = pos_err <= cfg.ik_pos_tol and no_collision and waypoints_done
+            self._descend_stable_streak = self._descend_stable_streak + 1 if stable_now else 0
+            if self._descend_stable_streak >= cfg.side_descend_stable_streak_required:
                 self._advance(BimanualGraspState.FINGERTIP_PRECONTACT)
+            elif self._state_step >= cfg.max_steps_per_state:
+                self._fail(BimanualFailureReason.SIDE_DESCEND_NOT_ACHIEVED)
 
         elif state == BimanualGraspState.FINGERTIP_PRECONTACT:
             # [This session's finding] a SINGLE IK jump straight from
-            # WRIST_ALIGN's converged pose to the full precontact target
+            # WRIST_SIDE_GRASP_ALIGN's converged pose to the full precontact target
             # is kinematically valid (IK success=True, <1cm error) but
             # requires a large one-shot change in the low-inertia,
             # zero-damping wrist joints (e.g. wrist_roll by >1.5rad in one
@@ -1003,10 +1214,10 @@ class SharpaBimanualGraspExpert:
                 self._precontact_final = self._mirrored_targets(
                     cfg.precontact_standoff_m, cfg.precontact_height_m, cfg.precontact_y_offset_m
                 )
-                # Target orientation for the gate check is WRIST_ALIGN's
+                # Target orientation for the gate check is WRIST_SIDE_GRASP_ALIGN's
                 # already-locked, measured-stable orientation (module
                 # docstring: "LOCK that exact orientation as the explicit
-                # WRIST_ALIGN/FINGERTIP_PRECONTACT target"), not a freshly
+                # WRIST_SIDE_GRASP_ALIGN/FINGERTIP_PRECONTACT target"), not a freshly
                 # re-measured one -- these should coincide closely since
                 # every waypoint solve below only soft-anchors
                 # (ori_task_weight=0.05) to whatever orientation is
@@ -1253,4 +1464,6 @@ class SharpaBimanualGraspExpert:
             precontact_final_ori_error_deg=dict(self._precontact_final_ori_error_deg),
             precontact_max_stable_streak=self._max_precontact_stable_streak,
             precontact_gate=precontact_gate,
+            side_grasp_posture=self._side_grasp_posture,
+            side_grasp_gate=self._side_grasp_gate,
         )

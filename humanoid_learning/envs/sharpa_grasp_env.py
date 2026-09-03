@@ -298,6 +298,28 @@ class SharpaGraspEnv(gym.Env):
             peak = max(peak, float(np.linalg.norm(force6[:3])))
         return peak
 
+    def _hand_table_contact_force(self) -> float:
+        """[This session] Sharpa-Wave hand (any body) vs the table --
+        needed once the side-grasp approach lets fingers point down near
+        table height (see sharpa_bimanual_grasp_expert.py's
+        WRIST_SIDE_GRASP_ALIGN docstring): open, straight fingers reach
+        ~15cm below the palm, easily spearing the table at a naive low
+        approach height without this check."""
+        model, data = self.model, self.data
+        peak = 0.0
+        for i in range(data.ncon):
+            c = data.contact[i]
+            b1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom1]) or ""
+            b2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom2]) or ""
+            is_hand_table = (("table" in b1 and (b2.startswith("left_left_") or b2.startswith("right_right_"))) or
+                              ("table" in b2 and (b1.startswith("left_left_") or b1.startswith("right_right_"))))
+            if not is_hand_table:
+                continue
+            force6 = np.zeros(6)
+            mujoco.mj_contactForce(model, data, i, force6)
+            peak = max(peak, float(np.linalg.norm(force6[:3])))
+        return peak
+
     def _proximal_object_penetration(self) -> float:
         """Max penetration between any NON-fingertip Sharpa link (i.e. any
         hand body that is not a *_DP fingertip body) and the object --

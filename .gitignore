@@ -47,6 +47,8 @@ results/manifold_grasp_multistart.json
 results/manifold_grasp_collision_aware_ab.json
 results/precontact_gap/
 results/forward_reach_gap/
+results/side_grasp_swept_path/
+results/side_grasp_pose/
 results/session41_visual_before/
 results/session41_visual_after/
 results/session42_before/

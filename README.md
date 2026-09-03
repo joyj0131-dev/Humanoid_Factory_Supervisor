@@ -5,9 +5,11 @@ MuJoCo에서 Unitree G1이 공장 자동화의 예외 상황을 복구하도록 
 dropped part, misalignment, jam 같은 예외에 whole-body로 개입한다.
 
 현재 개발 대상은 G1 + Sharpa Wave 양손의 fixed-base grasp다. Phase 4.5는
-아직 미완료이며, SIZE_12에서 Forward Reach Gate를 0.165mm 초과해
-Precontact에 도달하지 못했다. 따라서 Gate A(안정 파지) 이후의 hold/lift는
-시작하지 않았다. 과거 Dex3 연구는
+아직 미완료다. Forward Reach Gate와 신규 Side-Grasp Posture Gate(양손이
+물체 좌우 측면에서 마주보고 손가락이 아래를 향하는 bilateral side-grasp
+자세)는 모두 PASS했지만, `FOREARM_SIDE_DESCEND`의 hand-table collision으로
+Precontact에 아직 도달하지 못했다. 따라서 Gate A(안정 파지) 이후의
+hold/lift는 시작하지 않았다. 과거 Dex3 연구는
 `phase4/dex3-grasp` 브랜치에 보존한다.
 
 ## 현재 실행
