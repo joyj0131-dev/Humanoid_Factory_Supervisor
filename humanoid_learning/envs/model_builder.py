@@ -1,9 +1,7 @@
-"""Builds the Phase 1 MuJoCo model from the vendored Unitree G1 with-hands MJCF.
+"""Canonical MuJoCo builders for bare Unitree G1 + Sharpa Wave.
 
-The vendored file at assets/robots/g1/g1_with_hands.xml (mujoco_menagerie,
-BSD-3-Clause) is never edited directly. All Phase-1-specific structure is
-added programmatically via mujoco.MjSpec, so the original asset stays
-untouched and can be diffed/updated independently:
+Vendored assets are never edited directly.  Sharpa, sites and task objects
+are attached programmatically with :class:`mujoco.MjSpec`.
 
 - Lower-body fixing: the floating_base_joint (a freejoint on the pelvis) is
   deleted, making the pelvis a static zero-DOF body welded to the world by
@@ -17,9 +15,7 @@ untouched and can be diffed/updated independently:
   Deleting the joint outright removes the degree of freedom entirely: zero
   drift, zero oscillation, verified over 2000 steps (see Phase 1 report).
 
-- End-effector sites: the stock model has no site at the hands. One is
-  added per wrist at the same local offset as the existing
-  left/right_hand_palm_link geom, so it sits at the palm center.
+- End-effector sites are added on each wrist for the common reach contract.
 
 - Table + manipulation object: not present in the stock model, added as new
   worldbody children.
@@ -152,11 +148,12 @@ def build_model(config) -> mujoco.MjModel:
 # ---------------------------------------------------------------------------
 # Phase 4: whole-body (floating-base) and planar-debug builders.
 #
-# Both start from the same vendored g1_with_hands.xml and add the same
-# floor/EE-site/table/object pieces as build_model() above, but unlike
-# build_model() they do NOT delete floating_base_joint -- see
-# PROJECT_CONTEXT.md Phase 4, Section B. build_model() itself is untouched
-# above (Foundation preserved byte-for-byte; verified by regression tests).
+# Both start from the same vendored bare G1 and attach the canonical Sharpa
+# hands. They add the same floor/EE-site/table/object pieces as build_model()
+# above, but unlike build_model() they do NOT delete floating_base_joint --
+# see PROJECT_CONTEXT.md Phase 4, Section B. The Foundation's public
+# observation/action contract is preserved and verified by regression tests;
+# its internal robot model is intentionally migrated to Sharpa.
 # ---------------------------------------------------------------------------
 
 
@@ -173,10 +170,7 @@ def _add_palm_sites(spec: "mujoco.MjSpec") -> None:
     """The wrist "palm frame" sites ONLY -- see whole_body_config.py for
     the empirically-derived convention (approach/closing/lateral axes).
     This frame is defined on {side}_wrist_yaw_link itself, so it is
-    reusable UNCHANGED regardless of which hand is mounted there (Dex3 or
-    Sharpa) -- split out of _add_grasp_sites (which also adds Dex3-
-    specific fingertip sites) so the Sharpa path can reuse just this
-    part."""
+    reusable independently of the Sharpa mesh attachment."""
     spec.body("left_wrist_yaw_link").add_site(
         name=wbc.LEFT_PALM_SITE,
         pos=list(wbc.LEFT_PALM_LOCAL_POS),
@@ -189,43 +183,6 @@ def _add_palm_sites(spec: "mujoco.MjSpec") -> None:
         quat=list(wbc.RIGHT_PALM_LOCAL_QUAT),
         size=[0.008, 0.008, 0.008],
     )
-
-
-def _add_grasp_sites(spec: "mujoco.MjSpec") -> None:
-    """Palm-frame and Dex3 fingertip reference sites. Never modifies the
-    stock XML; added via MjSpec like _add_ee_sites."""
-    _add_palm_sites(spec)
-    for site_name, body_name in wbc.FINGERTIP_SITE_BODIES.items():
-        spec.body(body_name).add_site(
-            name=site_name, pos=list(wbc.FINGERTIP_SITE_LOCAL_POS[site_name]), size=[0.004, 0.004, 0.004]
-        )
-
-
-def _use_fingertip_collision_pads(spec: "mujoco.MjSpec", config) -> None:
-    """Grasp-only Dex3 collision proxy with six compliant tip pads.
-
-    Visual meshes and all joints/actuators remain untouched.  Only their
-    collision participation is disabled; one sphere at each measured
-    fingertip becomes the physical contact surface.  This avoids several
-    simultaneous hard mesh contacts masquerading as one low-force finger
-    reading and represents a plausible rubber-pad end-effector upgrade.
-    """
-    for body in spec.bodies:
-        if body.name.startswith("left_hand") or body.name.startswith("right_hand"):
-            for geom in body.geoms:
-                geom.contype = 0
-                geom.conaffinity = 0
-    for site_name, body_name in wbc.FINGERTIP_SITE_BODIES.items():
-        spec.body(body_name).add_geom(
-            name=f"{site_name}_collision_pad",
-            type=mujoco.mjtGeom.mjGEOM_SPHERE,
-            pos=list(wbc.FINGERTIP_SITE_LOCAL_POS[site_name]),
-            size=[config.fingertip_pad_radius, 0.0, 0.0],
-            friction=list(config.fingertip_pad_friction),
-            condim=4,
-            solref=[0.03, 1.0],
-            rgba=[0.08, 0.08, 0.08, 1.0],
-        )
 
 
 def _add_floor(spec: "mujoco.MjSpec") -> None:
@@ -285,108 +242,17 @@ def build_whole_body_model(config, include_object: bool = False) -> mujoco.MjMod
     return model
 
 
-def build_grasp_model(config, hard_fixed_waist: bool = False) -> mujoco.MjModel:
-    """Fixed-base grasp validation model: same lower-body-fixing approach as
-    build_model() (Foundation, proven stable), but the object's mass/
-    friction/size are configurable (GraspEnvConfig) instead of hard-coded,
-    and object placement is a single deterministic point (not a randomized
-    range) -- this env validates grasp PHYSICS, not reaching generalization.
-
-    ``hard_fixed_waist`` (Net-Torque Root Cause Isolation session, default
-    False -- the existing, unchanged behavior): when True, adds a physical
-    <equality joint> constraint pinning each of the 3 waist joints to their
-    stand-keyframe value, via the constraint solver (not a per-step qpos
-    teleport -- the waist actuators/kp are untouched, this is a genuine
-    holonomic constraint MuJoCo enforces every physics substep). Used ONLY
-    by the grasp-only diagnostic/experimental path (--grasp-experimental,
-    scripts/test_grasp.py's waist A/B comparison) to test whether the
-    small (~0.088 rad measured) waist drift under compliant position
-    control is a meaningful contributor to object net torque -- the
-    default fixed-base grasp model (hard_fixed_waist=False, what --grasp
-    and every existing test still use) is completely unaffected."""
-    spec = mujoco.MjSpec.from_file(str(config.g1_xml_path))
-
-    freejoint = spec.joint(tc.FLOATING_BASE_JOINT)
-    spec.delete(freejoint)
-    stand_key = spec.key(tc.STAND_KEYFRAME)
-    stand_qpos = np.asarray(stand_key.qpos)[7:].tolist()
-    stand_key.qpos = stand_qpos
-
-    _add_ee_sites(spec)
-    _add_grasp_sites(spec)
-    if config.use_fingertip_collision_pads:
-        _use_fingertip_collision_pads(spec, config)
-    _add_floor(spec)
-
-    table = spec.worldbody.add_body(name=tc.TABLE_BODY, pos=list(config.table_pos))
-    table.add_geom(
-        name=tc.TABLE_GEOM,
-        type=mujoco.mjtGeom.mjGEOM_BOX,
-        size=list(config.table_half_size),
-        rgba=[0.55, 0.4, 0.25, 1],
-    )
-    obj_z = config.table_pos[2] + config.table_half_size[2] + config.object_half_size + tc.OBJECT_TABLE_GAP
-    obj = spec.worldbody.add_body(
-        name=tc.OBJECT_BODY,
-        pos=[config.object_pos[0], config.object_pos[1], obj_z],
-    )
-    obj.add_freejoint(name=tc.OBJECT_JOINT)
-    obj.add_geom(
-        name=tc.OBJECT_GEOM,
-        type=mujoco.mjtGeom.mjGEOM_BOX,
-        size=[config.object_half_size] * 3,
-        rgba=[0.85, 0.15, 0.15, 1],
-        mass=config.object_mass,
-        friction=list(config.object_friction),
-    )
-
-    if hard_fixed_waist:
-        # spec.joint(name).qpos0 order matches tc's own qpos layout (post
-        # freejoint deletion) -- find each waist joint's stand-keyframe
-        # value by its position in the (now-headless) stand_qpos list via
-        # the SAME joint-name-to-index walk _apply_compliant_kp/the env
-        # itself use elsewhere (jnt_qposadr), done here at MjSpec level by
-        # re-deriving it from the compiled joint order below instead
-        # (simpler: pin to the joint's own default qpos0, which for a
-        # freshly-compiled spec still reflects the stand keyframe only if
-        # explicitly set -- so pin to the ACTUAL stand_qpos value looked
-        # up by name, computed after a throwaway compile pass would be
-        # circular; instead locate each waist joint's index directly in
-        # tc's known qpos ordering for this fixed-base spec).
-        all_joint_names_in_order = [j.name for j in spec.joints]
-        for wj in wbc.WAIST_JOINTS:
-            idx = all_joint_names_in_order.index(wj)
-            pin_value = float(stand_qpos[idx])
-            spec.add_equality(
-                type=mujoco.mjtEq.mjEQ_JOINT,
-                name1=wj,
-                objtype=mujoco.mjtObj.mjOBJ_JOINT,
-                data=[pin_value, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            )
-
-    model = spec.compile()
-    _apply_compliant_kp(model, tc.LEFT_ARM_JOINTS + tc.RIGHT_ARM_JOINTS, config.arm_kp)
-    finger_joints = [n for n, _, _ in wbc.LEFT_HAND_SYNERGY_TARGETS + wbc.RIGHT_HAND_SYNERGY_TARGETS]
-    _apply_compliant_kp(model, finger_joints, config.hand_kp)
-    return model
-
-
 def _apply_compliant_kp(model: mujoco.MjModel, joint_names: list[str], kp: float) -> None:
     """Lowers the given actuators' position gain from whatever the stock
-    XML set (kp=500 for both arms and hands) to ``kp`` (grasp-model-only
+    XML set (kp=500 for the G1 arms) to ``kp`` (grasp-model-only
     compliance -- see grasp_config.py and PROJECT_CONTEXT.md Phase 4,
     Section 6). kv is rescaled by sqrt(kp / old_kp) to keep the same
     dampratio=1 critical-damping relationship the stock XML's
     <position dampratio="1"/> establishes at kp=500, rather than becoming
     under- or over-damped at the new kp.
 
-    Originally applied only to the 14 arm joints; extended to the finger
-    joints too after diagnosing (Phase 4 Grasp Track redesign) that a
-    STIFF kp=500 finger actuator was the actual cause of an 8-13N force
-    spike appearing within a single control step the instant a fingertip
-    first touched the object -- the compliant arm was never the
-    bottleneck for that particular spike, the untouched finger actuators
-    were."""
+    Sharpa finger gains remain those authored by the vendor model; this
+    helper is currently called only for the 14 G1 arm joints."""
     for name in joint_names:
         aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
         assert aid >= 0, f"actuator not found: {name}"
@@ -454,10 +320,7 @@ def build_planar_debug_model(config) -> mujoco.MjModel:
 
 
 # ---------------------------------------------------------------------------
-# Phase 4, 35th session: Sharpa Wave end-effector (replaces Dex3 as the
-# active development target; g1_with_hands.xml -- and build_model()/
-# build_grasp_model() above -- are UNTOUCHED and keep building the Dex3
-# configuration, preserved as the legacy comparison baseline).
+# Sharpa Wave end-effector attachment.
 #
 # Mount-transform derivation (Stage 2): the existing, empirically-validated
 # "palm frame" convention (whole_body_config.py) defines, for a site on
@@ -519,7 +382,7 @@ def _sharpa_mount_quat(side: str) -> list[float]:
     return q.tolist()
 
 
-# [Session 40, Stage 8] Reused VERBATIM from g1_with_hands.xml's own
+# Reused from the bare G1 material definitions.
 # <material> definitions (rgba only -- see that file's "metal"/"black"
 # entries) rather than inventing new colors, so the Sharpa hands visually
 # match the rest of G1 instead of the vendored light-lavender
@@ -541,7 +404,7 @@ def _apply_sharpa_visual_style(spec: "mujoco.MjSpec", side: str, style: str) -> 
     vendored lavender (0.79,0.82,0.93) under the viewer's lighting (user-
     confirmed: "still looks the same"). This version instead ASSIGNS the
     geom to G1's own actual named material ("black"/"metal", already
-    defined in this spec since it started from g1_with_hands.xml) --
+    defined in the bare G1 spec) --
     verifiable post-compile via geom_matid, not just an approximately-
     matching rgba -- and, per the user's explicit palette split, uses
     "black" (not "metal") for the LARGE housing/base surfaces (the
@@ -579,13 +442,10 @@ def _apply_sharpa_visual_style(spec: "mujoco.MjSpec", side: str, style: str) -> 
 
 
 def attach_sharpa_hands(spec: "mujoco.MjSpec", mount: str = "wrist", visual_style: str = "upstream") -> None:
-    """[35th session, Stage 2] Removes the Dex3 hand (finger-root bodies +
-    palm-plate geom) from each {side}_wrist_yaw_link and attaches the
-    vendored Sharpa Wave hand in its place, via a mount SITE (MjSpec.attach
-    requires a site or frame) using the derived quat above. The
-    {side}_wrist_yaw_link body's OWN mesh geoms (the real G1 wrist joint
-    housing, present even in the bare no-hand G1 model) are left
-    untouched -- only Dex3-specific geometry is removed. Sharpa's own
+    """Attach a vendored Sharpa Wave hand to each bare-G1 wrist.
+
+    The stock rubber-hand visual is removed; the real wrist joint housing
+    remains.  Sharpa's own
     shared (non-side-prefixed) mesh names (e.g. "MCP_VL", "elastomer")
     collide between left/right if both are attached to the same spec, so
     MjSpec.attach's ``prefix`` is used -- this makes the resulting body/
@@ -594,16 +454,8 @@ def attach_sharpa_hands(spec: "mujoco.MjSpec", mount: str = "wrist", visual_styl
     not a bug (verified: does not collide with any other name)."""
     for side in ("left", "right"):
         wrist = spec.body(f"{side}_wrist_yaw_link")
-        # Compatibility cleanup for an old g1_with_hands.xml caller.  The
-        # active path starts from bare g1.xml, so these bodies normally do
-        # not exist.  Keeping this conditional during migration makes the
-        # helper safe without retaining a Dex3 requirement.
-        for finger_root in (f"{side}_hand_thumb_0_link", f"{side}_hand_middle_0_link", f"{side}_hand_index_0_link"):
-            body = spec.body(finger_root)
-            if body is not None:
-                spec.delete(body)
         for g in list(wrist.geoms):
-            if g.meshname in {f"{side}_hand_palm_link", f"{side}_rubber_hand"}:
+            if g.meshname == f"{side}_rubber_hand":
                 spec.delete(g)
         mount_site = wrist.add_site(
             name=f"{side}_sharpa_mount", pos=list(_SHARPA_MOUNT_POS), quat=_sharpa_mount_quat(side)
@@ -617,8 +469,7 @@ def _add_sharpa_grasp_sites(spec: "mujoco.MjSpec") -> None:
     """[35th session, Stage 4] The palm-frame sites (reused unchanged --
     see _add_palm_sites) plus a fingertip reference site for each of the
     10 Sharpa fingertips, placed at that fingertip's real elastomer
-    collision geom's own local position (the actual compliant contact
-    pad, not a hand-tuned offset like Dex3's FINGERTIP_SITE_LOCAL_POS)."""
+    collision geom's own local position."""
     from humanoid_learning.envs import sharpa_config as sc
 
     _add_palm_sites(spec)
@@ -633,15 +484,7 @@ def _add_sharpa_grasp_sites(spec: "mujoco.MjSpec") -> None:
 
 
 def build_grasp_model_sharpa(config) -> mujoco.MjModel:
-    """[35th session, Stage 2/4] Same fixed-base grasp validation
-    structure as build_grasp_model() (lower-body fixing, EE/grasp sites,
-    floor, table+object), but with the Dex3 hand replaced by Sharpa Wave
-    via attach_sharpa_hands(). Stage 4 adds fingertip sites
-    (_add_sharpa_grasp_sites) so sharpa_grasp_env.py/sharpa_grasp_expert.py
-    can reference real Sharpa contact points -- still NOT wired into the
-    Dex3-specific GraspEnvConfig/FixedBaseGraspEnv (those keep resolving
-    Dex3 joint/actuator names unchanged); Sharpa gets its OWN env/expert
-    pair instead (sharpa_grasp_env.py)."""
+    """Build the canonical fixed-base G1 + Sharpa grasp model."""
     spec = mujoco.MjSpec.from_file(str(config.g1_xml_path))
 
     freejoint = spec.joint(tc.FLOATING_BASE_JOINT)

@@ -45,9 +45,7 @@ RIGHT_ARM_JOINTS = [
 LEFT_ARM_ACTUATORS = LEFT_ARM_JOINTS
 RIGHT_ARM_ACTUATORS = RIGHT_ARM_JOINTS
 
-# End-effector reference sites. Not present in the stock model; added at
-# build time (see model_builder.py) at the same offset as the existing
-# left/right_hand_palm_link geom, so they sit at the palm center.
+# End-effector reference sites on the G1 wrists, added at build time.
 LEFT_EE_SITE = "left_ee"
 RIGHT_EE_SITE = "right_ee"
 LEFT_EE_OFFSET = (0.0415, 0.003, 0.0)

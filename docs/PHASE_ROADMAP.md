@@ -23,20 +23,22 @@
 
 ## Phase 4.5 acceptance order
 
-1. Wrist Transition / Natural Posture / Orientation Alignment
-2. Precontact Tracking / Contact Acquisition
-3. Gate A — 안정 파지
-4. Gate B — 2초 tabletop hold
-5. Gate C — 5cm lift
-6. Gate D — 5초 air hold
+1. Wrist Transition / Natural Posture
+2. Forward Reach / Orientation Alignment
+3. Precontact Tracking / Contact Acquisition
+4. Gate A — 안정 파지
+5. Gate B — 2초 tabletop hold
+6. Gate C — 5cm lift
+7. Gate D — 5초 air hold
 
 현재 확인 상태:
 
 - Mount Integration Gate: PASS
 - Natural Posture Gate: PASS
 - Wrist Transition Gate: FAIL (`5.12rad/s > 2.0rad/s`)
+- Forward Reach Gate: FAIL (`10.165mm > 10mm`, 금지 충돌 0건)
 - Orientation Alignment Gate: FAIL (opt-in 경로 self-collision 잔존)
-- Precontact Tracking Gate: FAIL
+- Precontact Tracking Gate: 미도달 (Forward Reach 선행 Gate 실패)
 - Gate A: FAIL (`0/30`), Gate B/C/D: 미시도
 
 Gate A 이전 실패를 성공으로 포장하거나 threshold를 낮추지 않는다. Gate

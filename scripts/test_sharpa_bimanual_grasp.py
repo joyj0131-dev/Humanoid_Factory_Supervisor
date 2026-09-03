@@ -1,30 +1,28 @@
 """sharpa_bimanual tests: the Phase 4 OFFICIAL Sharpa Wave bimanual grasp
-controller (SharpaBimanualGraspExpert). Run AFTER
-test_sharpa_single_hand_diagnostic.py.
+controller (SharpaBimanualGraspExpert).
 
 Run with:
     python3 scripts/test_sharpa_bimanual_grasp.py
 
-HONEST CURRENT STATE (41st session): the OFFICIAL default approach path
+HONEST CURRENT STATE: the OFFICIAL default approach path
 is now STABLE_START -> ARM_LATERAL_CLEARANCE -> FOREARM_FORWARD_REACH ->
 FOREARM_DESCEND -> WRIST_ALIGN -> ... (NATURAL_ARM_LIFT/the old single-
 shot FOREARM_APPROACH no longer exist -- see
 sharpa_bimanual_grasp_expert.py's BimanualGraspState). ARM_LATERAL_
 CLEARANCE uses a DIRECT joint target (not Cartesian IK) chosen from a
 bounded 3-candidate FK+physics sweep -- 0 self-collisions, elbow well
-below shoulder -- fixing the "unnatural" elbow-up posture the 41st
-session's user feedback identified. With this new path, the DEFAULT
-config (object_facing_orientation=False) reaches FINGERTIP_PRECONTACT
-deterministically and fails at the SAME bottleneck the 39th session
-already characterized (PRECONTACT_TRACKING_NOT_ACHIEVED, steady-state
-actuator tracking error) -- not a new failure mode, and CLOSER to Gate A
-than the 40th session's default path was. The opt-in
+below shoulder -- fixing the former "unnatural" elbow-up posture. With
+the canonical bare-G1 base, the DEFAULT config
+(object_facing_orientation=False) currently stops at
+FOREARM_FORWARD_REACH with a deterministic 10.165mm settled position
+error against the unchanged 10mm gate and zero forbidden collision.
+This is the active blocker; the controller must not claim that it reached
+FINGERTIP_PRECONTACT. The opt-in
 object_facing_orientation=True path still fails (self-collision force
 reduced from ~113N to ~46N peak with the new posture -- improved but not
 fixed). test_a_real_bimanual_gate_a_success_on_size_12 below documents
 this HONESTLY as a failing test and must never be weakened, deleted, or
-converted into a smoke assertion to make it pass. See
-docs/history/PHASE4_GRASP_SESSION_41.md.
+converted into a smoke assertion to make it pass.
 """
 
 from __future__ import annotations
@@ -172,33 +170,32 @@ def test_arm_lateral_clearance_meets_natural_posture_gate():
     assert env._hand_hand_contact_force() <= expert.config.hand_hand_force_limit_n
 
 
-def test_wrist_align_actually_reduces_measured_orientation_drift():
-    """Requirement 4: WRIST_ALIGN must actually verify orientation has
-    converged (measured, not asserted) -- this session's redesign measures
-    real angular drift over a settle window instead of trusting a
-    (previously found to freeze) secondary IK re-solve. Uses the
-    DEFAULT config (object_facing_orientation=False, Session 39's
-    unchanged, official behavior -- see test_object_facing_orientation_
-    causes_torso_self_collision below for the opt-in Session 40 feature)."""
+def test_bare_base_forward_reach_blocker_is_measured_without_collision():
+    """Characterize the current pre-WRIST_ALIGN blocker without weakening
+    its 1cm gate.  Removing inherited hand mass shifts the settled palm
+    error to just above the existing threshold; the failure must be a
+    deterministic tracking residual, not a hidden collision."""
     env = make_env()
     env.reset(seed=0)
     expert = SharpaBimanualGraspExpert(env)
-    reached_wrist_align = False
+    final_err = None
     for _ in range(900):
         action = expert.step()
         obs, r, term, trunc, info = env.step(action)
-        if expert.state == BimanualGraspState.WRIST_ALIGN:
-            reached_wrist_align = True
-        if expert.state in (BimanualGraspState.FIVE_FINGER_PRESHAPE, BimanualGraspState.FAILURE):
+        if expert.state == BimanualGraspState.FOREARM_FORWARD_REACH and hasattr(expert, "_forward_reach_final"):
+            final_err = max(
+                float(np.linalg.norm(expert._forward_reach_final["left"] - env.palm_pose("left")[0])),
+                float(np.linalg.norm(expert._forward_reach_final["right"] - env.palm_pose("right")[0])),
+            )
+        if expert.state == BimanualGraspState.FAILURE:
             break
-    assert reached_wrist_align, "rollout must actually reach WRIST_ALIGN"
-    print(f"    wrist_orientation_drift_deg={expert.wrist_orientation_drift_deg:.4f} "
-          f"(tolerance={expert.config.wrist_orientation_stability_tol_deg}), "
-          f"state after WRIST_ALIGN={expert.state.name}")
-    if expert.state == BimanualGraspState.FAILURE:
-        assert expert.failure_reason == BimanualFailureReason.WRIST_ORIENTATION_NOT_STABLE
-    else:
-        assert expert.wrist_orientation_drift_deg <= expert.config.wrist_orientation_stability_tol_deg
+    print(f"    forward_reach_final_error={final_err*1000:.3f}mm, "
+          f"torso_arm_force={env._torso_arm_collision_force():.3f}N, "
+          f"hand_hand_force={env._hand_hand_contact_force():.3f}N")
+    assert expert.failure_reason == BimanualFailureReason.FORWARD_REACH_NOT_ACHIEVED
+    assert final_err is not None and expert.config.ik_pos_tol < final_err < 0.011
+    assert env._torso_arm_collision_force() == 0.0
+    assert env._hand_hand_contact_force() == 0.0
 
 
 def test_object_facing_orientation_still_not_fully_safe():
@@ -392,21 +389,12 @@ def test_arm_gravity_compensation_reduces_precontact_tracking_error():
 
 
 def test_a_real_bimanual_gate_a_success_on_size_12():
-    """HONEST, CURRENTLY-FAILING TEST (Section 8 requirement 13): a real
-    SIZE_12 bimanual Gate A success. As of this session (40th):
-      - WRIST_ALIGN's orientation SETTLES (drift well under tolerance)
-        but at an object-facing angle that fails the Orientation
-        Alignment Gate for at least one hand (see
-        docs/history/PHASE4_GRASP_SESSION_40.md) -- the controller now
-        fails there, EARLIER than the 39th session's
-        PRECONTACT_TRACKING_NOT_ACHIEVED (which was itself measured
-        against a non-object-facing, and therefore not truly meaningful,
-        approach orientation).
-      - Root cause (Session 40 audit): the SAME category of steady-state
-        actuator/physical tracking error Session 39 found for position
-        also affects orientation-relevant DOFs (measured: ctrl-vs-actual
-        gaps up to 0.17rad on specific right-arm joints) -- not yet
-        resolved.
+    """Honest, currently-failing real SIZE_12 Gate A test.
+
+    The bare-G1 canonical builder currently stops at FOREARM_FORWARD_REACH:
+    settled palm error is about 10.16mm, just above the unchanged 10mm
+    tracking gate, with no collision.  Later alignment/contact gates are
+    therefore not entered.
     This test MUST NOT be weakened, deleted, or turned into a smoke
     assertion to make it pass -- it stays honestly failing until Gate A
     is actually achieved."""
@@ -417,8 +405,7 @@ def test_a_real_bimanual_gate_a_success_on_size_12():
           f"bilateral_streak={outcome.max_bilateral_stable_streak} "
           f"contact={outcome.per_side_group_contact} gate_a={outcome.gate_a}")
     assert outcome.gate_a is True, (
-        "REAL bimanual Gate A success on SIZE_12 not yet achieved (see this test's docstring "
-        "and PHASE4_GRASP_SESSION_36.md for the disclosed FINGERTIP_PRECONTACT tracking-gap blocker)"
+        "REAL bimanual Gate A success on SIZE_12 not yet achieved; see this test's docstring"
     )
 
 

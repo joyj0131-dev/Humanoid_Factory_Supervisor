@@ -36,10 +36,8 @@ def _stand_data(model):
 
 def _n_penetrating(data, model=None) -> int:
     """Real penetrating contacts, EXCLUDING the object resting on the
-    table -- a small (~0.3-0.5mm) object<->table settling penetration is
-    an expected, benign consequence of gravity + solver settling (see
-    docs/history/PHASE4_GRASP_SESSION_33.md/34.md, which found the exact
-    same magnitude for the Dex3 model), not a hand/arm self-collision."""
+    table -- a small object<->table settling penetration is an expected,
+    benign consequence of gravity + solver settling."""
     n = 0
     for i in range(data.ncon):
         c = data.contact[i]
@@ -62,15 +60,13 @@ def test_model_compiles_without_nan():
     print(f"    nq={model.nq} nv={model.nv} nu={model.nu} -- compiles, no NaN")
 
 
-def test_dex3_hand_bodies_are_gone_sharpa_bodies_are_present():
+def test_all_sharpa_fingertip_bodies_are_present():
     model, _ = _make_model()
     for side in ("left", "right"):
-        for dex3_body in (f"{side}_hand_thumb_0_link", f"{side}_hand_middle_0_link", f"{side}_hand_index_0_link"):
-            assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, dex3_body) < 0, f"{dex3_body} should be removed"
         for finger in ("thumb", "index", "middle", "ring", "pinky"):
             sharpa_body = f"{side}_{side}_{finger}_DP"
             assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, sharpa_body) >= 0, f"{sharpa_body} should exist"
-    print("    Dex3 finger bodies removed, all 10 Sharpa fingertip DP bodies present")
+    print("    all 10 Sharpa fingertip DP bodies present")
 
 
 def test_left_right_are_exact_mirrors_at_stand_pose():

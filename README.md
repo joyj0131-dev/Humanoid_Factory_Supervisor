@@ -5,8 +5,9 @@ MuJoCo에서 Unitree G1이 공장 자동화의 예외 상황을 복구하도록 
 dropped part, misalignment, jam 같은 예외에 whole-body로 개입한다.
 
 현재 개발 대상은 G1 + Sharpa Wave 양손의 fixed-base grasp다. Phase 4.5는
-아직 미완료이며, SIZE_12에서 Precontact Tracking Gate를 통과하지 못해
-Gate A(안정 파지) 이후의 hold/lift는 시작하지 않았다. 과거 Dex3 연구는
+아직 미완료이며, SIZE_12에서 Forward Reach Gate를 0.165mm 초과해
+Precontact에 도달하지 못했다. 따라서 Gate A(안정 파지) 이후의 hold/lift는
+시작하지 않았다. 과거 Dex3 연구는
 `phase4/dex3-grasp` 브랜치에 보존한다.
 
 ## 현재 실행
@@ -22,7 +23,7 @@ python3 scripts/test_sharpa_g1_integration.py
 공식 양손 grasp와 손 동작 demo:
 
 ```bash
-DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --hand-model sharpa --no-restart
+DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --no-restart
 DISPLAY=:0 python3 scripts/view_whole_body.py --sharpa-hand-demo --no-restart
 python3 scripts/test_sharpa_bimanual_grasp.py
 ```

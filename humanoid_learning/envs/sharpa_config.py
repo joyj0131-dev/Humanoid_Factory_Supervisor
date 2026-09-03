@@ -1,6 +1,4 @@
-"""Sharpa Wave hand joint/actuator naming and grasp-synergy config (Phase 4,
-35th session, Stage 4). Kept separate from whole_body_config.py (Dex3-only)
--- this module never imports or reuses Dex3 joint names/targets.
+"""Sharpa Wave hand joint naming and four-group grasp synergy.
 
 Naming: model_builder.attach_sharpa_hands() attaches each side's Sharpa
 spec with prefix=f"{side}_", and the source XML's own bodies/joints are
@@ -16,8 +14,7 @@ anthropomorphic hand kinematics since no hardware ground truth is
 available for this preshape choice (disclosed, not measured -- see
 FIVE_FINGER_PRESHAPE targets below):
   - "curl" joints flex/extend the finger to open/close on an object --
-    driven by that finger GROUP's own open<->close synergy scalar via
-    the existing, morphology-independent hand_synergy.synergy_to_targets.
+    driven by that finger GROUP's own open<->close synergy scalar.
   - "preshape" (abduction/adduction, "_AA" and thumb/pinky "_CMC_FE")
     joints position the finger lateral spread / thumb opposition angle
     ONCE during FIVE_FINGER_PRESHAPE and are then held fixed while curl
@@ -31,7 +28,7 @@ FINGERS = ("thumb", "index", "middle", "ring", "pinky")
 # Functional closing groups (Stage 4 principle: ring+pinky wrap the object
 # together to resist rotation, rather than each having independent control
 # this early) -- 4 groups per hand, fixed order used throughout this file
-# and sharpa_grasp_env.py/sharpa_grasp_expert.py.
+# and sharpa_grasp_env.py/the bimanual expert.
 GROUPS = ("thumb", "index", "middle", "wrap")
 GROUP_FINGERS = {"thumb": ("thumb",), "index": ("index",), "middle": ("middle",), "wrap": ("ring", "pinky")}
 

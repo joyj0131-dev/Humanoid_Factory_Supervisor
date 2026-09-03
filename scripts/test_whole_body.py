@@ -21,10 +21,8 @@ from humanoid_learning.envs import model_builder
 from humanoid_learning.envs import sharpa_config as sc
 from humanoid_learning.envs import task_config as tc
 from humanoid_learning.envs import whole_body_config as wbc
-from humanoid_learning.envs.humanoid_reach_env import BimanualReachEnv
 from humanoid_learning.envs.planar_debug_env import PlanarDebugEnv
 from humanoid_learning.envs.whole_body_env import ACTION_DIM, N_ARMS, N_LEGS, N_WAIST, WholeBodyEnv
-from humanoid_learning.expert.scripted_expert import ExpertConfig, ScriptedExpert
 
 ZERO_ACTION = np.zeros(ACTION_DIM, dtype=np.float32)
 

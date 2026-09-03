@@ -1,58 +1,13 @@
-"""Coupled bilateral waist-aware IK (Phase 4 Grasp Track, Coupled Bilateral
-Waist-Aware IK Validation session).
+"""Coupled bilateral waist-aware IK for the G1 + Sharpa controller.
 
-Root-cause finding this solver exists to address: the previous session's
-per-arm-only IK (each arm's Jacobian built from ONLY its own 7 joints)
-showed a 6cm-object APPROACH target converging cleanly in isolation
-(orientation error ~0.1 degree with the other arm frozen) but getting
-stuck at a persistent ~30-150 degree orientation error when both arms run
-together. Direct measurement found the waist (3 DoF, kp=500) drifting up
-to ~2.5 degrees from BOTH arms' reaction torque while each arm's IK
-computes a correction that assumes the waist is perfectly still --
-because neither arm's Jacobian includes the waist's own columns, the
-correction is spatially stale the instant it's applied if the shared base
-moved in the meantime.
+The solver optimizes waist yaw/roll/pitch and both seven-joint arms as one
+17-DoF task on scratch ``MjData``.  It uses bounded iterations,
+backtracking and adaptive damping.  Waist columns carry a soft weight so
+the solver prefers arm range before exhausting the shared waist while
+still accounting for bilateral coupling.
 
-This module solves ALL of {waist yaw/roll/pitch, left arm x7,
-right arm x7} = 17 DoF as ONE coupled task (12-row stacked: 3 pos + 3 ori
-per hand) via ``solve()``: a bounded multi-iteration solve (backtracking
-line search + adaptive damping bump on rejection) on a caller-provided
-SCRATCH MjData (never the live sim) -- purely kinematic (mj_forward only).
-This is what the A/B/D causal experiment used to establish that a coupled
-solve (D) out-performs both the uncoupled baseline (A) and a locked-waist
-diagnostic (B), and it is what the live grasp_expert.py controller calls
-once per state entry (and again on each bounded "resolve", see below) to
-get a joint target, tracked into the env via a separate smooth joint-space
-trajectory (grasp_expert.py's ``_MinJerkJointTrajectory``).
-
-The waist columns are weighted DOWN in the DLS solve (``joint_weight``,
-default 6x for the waist) rather than left uniform: because the waist's
-Jacobian columns are shared across BOTH 6-row hand blocks in the stacked
-12-row task, a plain (unweighted) pseudo-inverse found it numerically
-"cheaper" to lean on the waist for error reduction than either 7-DOF arm,
-driving waist_pitch (real range only +-0.52 rad) straight into its hard
-limit for marginal benefit and getting stuck there -- a local minimum an
-arms-mostly solve does not hit for the same target. This is a SOFT
-preference, not a hard lock: the weighted solve still uses the waist for
-the genuine coupling correction the causal experiment validated, just
-prefers the arms' much larger range first.
-
-A one-shot kinematic ``solve()`` is only as good as the assumption that
-the physical arm actually REACHES its joint target exactly. It does not:
-MuJoCo's compliant kp=120 position actuators have a real steady-state
-droop under the arm's own gravity load (measured up to ~0.04m/7 degrees
-at this controller's typical reach). Naively re-running ``solve()`` again
-from the drooped pose does NOT fix this -- ``solve()`` only ever answers
-"what joint config satisfies this Cartesian target kinematically", which
-a repeat solve answers with essentially the SAME joint target every time,
-never one that deliberately overshoots to compensate for droop. The fix
-grasp_expert.py's resolve logic uses instead is a JOINT-SPACE overshoot:
-once a trajectory settles short of the target, it measures the actual
-joint-space shortfall (target_q - actual_q) and commands a NEW trajectory
-to (target_q + shortfall) -- if droop is roughly constant for a small
-joint-space shift near the same posture (a reasonable local assumption),
-the actuator's own droop on this inflated command cancels the shortfall
-and the physical arm lands close to the original target.
+This is purely kinematic; actuator tracking and gravity-load error are
+measured and handled by the environment/controller, not hidden here.
 """
 
 from __future__ import annotations
@@ -345,4 +300,3 @@ class CoupledBilateralIK:
             failure_reason=failure_reason,
             error_history=error_history,
         )
-

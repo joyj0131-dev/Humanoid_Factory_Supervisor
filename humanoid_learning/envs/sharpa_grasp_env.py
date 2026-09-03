@@ -1,22 +1,8 @@
-"""Sharpa Wave fixed-base grasp environment (Phase 4, 35th session, Stage 4).
-
-A SEPARATE env from FixedBaseGraspEnv (Dex3) -- not a subclass, not a
-hand-model branch inside it. FixedBaseGraspEnv's action/observation
-contract, hand_synergy group tables, and force-safety bookkeeping are all
-keyed to Dex3's 3-finger-group body-name convention
-("left_hand_thumb"/"left_hand_index"/"left_hand_middle" prefixes); Sharpa
-has 5 fingers, a different body-name prefix ("left_left_<finger>"), and a
-4-group (thumb/index/middle/wrap) closing scheme (see sharpa_config.py) --
-forcing that through FixedBaseGraspEnv's existing per-Dex3-group code
-would either silently rely on Dex3 names (breaking) or need enough
-conditionals to obscure both paths. Keeping them separate means
-FixedBaseGraspEnv is provably unaffected (verified: test_env/test_expert/
-test_whole_body/test_grasp all still pass byte-for-byte) and this file
-can be read on its own.
+"""Canonical fixed-base G1 + Sharpa grasp environment.
 
 Action (25-dim, Box(-1,1)):
-    [0:3)   waist        -- same convention as FixedBaseGraspEnv
-    [3:17)  arms         -- same convention as FixedBaseGraspEnv
+    [0:3)   waist
+    [3:17)  arms
     [17:21) left hand groups  -- CURL-only synergy delta, order
                             (thumb, index, middle, wrap), matching
                             sharpa_config.GROUPS
@@ -24,9 +10,7 @@ Action (25-dim, Box(-1,1)):
 
 Preshape (spread/thumb-opposition) joints are NOT part of the action --
 they are a "set once, then held" concern (see sharpa_config.py's role
-split), written directly via set_preshape(), the same "write once, never
-reset-to-stand every tick" convention FixedBaseGraspEnv already uses for
-its own thumb1_ctrl_override.
+split), written directly via set_preshape().
 """
 
 from __future__ import annotations
@@ -185,11 +169,8 @@ class SharpaGraspEnv(gym.Env):
         assert key_id >= 0
         n_robot_qpos = model.nq - 7
         self._stand_qpos = model.key_qpos[key_id][:n_robot_qpos].copy()
-        # The stand keyframe's key_ctrl only covers the ORIGINAL (Dex3)
-        # model's actuators -- Sharpa's actuators didn't exist when the
-        # keyframe was authored, so this model's ctrl0 (all zero) is used
-        # for the hand actuators instead; only arm/waist/leg ctrl come
-        # from the keyframe.
+        # The bare-G1 stand keyframe has no hand controls; reset() assigns
+        # the Sharpa open targets explicitly.
         self._stand_ctrl_arms_waist = model.key_ctrl[key_id][: len(model.key_ctrl[key_id])].copy()
 
         obj_jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, tc.OBJECT_JOINT)
@@ -248,16 +229,13 @@ class SharpaGraspEnv(gym.Env):
         ctrl directly toward sharpa_config.PRESHAPE_TARGETS, scaled by
         ``fraction`` (0=neutral/open, 1=full preshape target) -- called
         by the expert once per FIVE_FINGER_PRESHAPE state entry, then
-        never touched again (same "write once, persists" convention as
-        FixedBaseGraspEnv's thumb1_ctrl_override)."""
+        never touched again."""
         self.data.ctrl[self._preshape_act_ids[side]] = fraction * self._preshape_targets[side]
 
     # ------------------------------------------------------------------
     def _group_contact_force(self, side: str, group: str) -> tuple[float, float]:
         """Returns (peak_single_contact_N, net_group_force_N) between
-        this finger GROUP's real bodies and the object -- both recorded
-        (Stage 4 requirement), unlike FixedBaseGraspEnv which returns
-        only one depending on a config flag."""
+        this finger group's real bodies and the object."""
         model, data = self.model, self.data
         obj_body = self._object_body_id
         prefixes = tuple(sc.sharpa_body(side, f, "") for f in sc.GROUP_FINGERS[group])
@@ -399,9 +377,7 @@ class SharpaGraspEnv(gym.Env):
 
         # Physics-substep force safety, generalized to Sharpa's 4 groups x
         # 2 hands (Stage 4 requirement: substep-granularity net GROUP
-        # force, not a once-per-tick check -- same reasoning as
-        # FixedBaseGraspEnv's Dex3 version, written fresh here since the
-        # body-name prefixes and group set differ).
+        # force, not a once-per-tick check).
         limit = self.config.finger_force_safety_limit
         warn = limit * self.config.finger_force_warning_ratio
         self.last_safety_events = []

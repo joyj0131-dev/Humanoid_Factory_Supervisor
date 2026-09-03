@@ -1,9 +1,4 @@
-"""sharpa_bimanual: the Phase 4 OFFICIAL Sharpa Wave grasp controller
-(36th session -- corrective milestone after an independent audit found
-the 35th session's sharpa_grasp_expert.py grasped with a SINGLE hand
-only, which is NOT the user-approved bimanual target; that controller is
-kept, relabeled SharpaSingleHandGraspExpert, as an explicit exploratory
-diagnostic -- see its module docstring).
+"""Official bimanual Sharpa Wave grasp controller.
 
 Both hands grasp the SAME object from opposite lateral (Y) sides --
 mirrored, not one hand crossing the body midline to reproduce a
@@ -11,7 +6,7 @@ single-hand grasp. CoupledBilateralIK solves BOTH palm targets in one
 call at every approach state (it always did; the single-hand version
 just fed one side a "stay put" target instead of a real one).
 
-Root-cause geometry finding this session (small, bounded grid searches,
+Root-cause geometry finding (small, bounded grid searches,
 never a large random sweep):
   - Reaching the object's own Y=+-0.06 face directly self-collides
     (torso<->shoulder AND, at 12cm object width, the two hands' own
@@ -34,25 +29,16 @@ never a large random sweep):
     asked to fight its own collision-free position solution for an
     independently-invented orientation.
 
-Gate A definition (Section 6, modeled directly on the EXISTING, approved
-Dex3 bilateral-tripod definition in grasp_expert.py -- see
-BimanualSidePinchExpert's `_bilateral_tripod_streak`/`max_bilateral_tripod_streak`,
-`>=30` consecutive ticks, and `object_displacement_limit=0.03`):
+Gate A definition (the project's approved bilateral stability contract):
   - Per side: thumb touching AND (index OR middle touching) AND wrap
     touching AND opposition (thumb's contact-force direction opposes
     the index/middle combined force direction: dot product < 0) AND NOT
     this side self-colliding with the OTHER hand.
   - Bilateral: BOTH sides simultaneously satisfy the above, SAME tick.
-  - Streak: consecutive ticks bilateral-satisfied, reset to 0 otherwise
-    (exactly BimanualSidePinchExpert's own pattern).
+  - Streak: consecutive ticks bilateral-satisfied, reset to 0 otherwise.
   - Gate A = max_bilateral_streak >= 30 AND object xy displacement
-    <= 0.03m (Dex3's own object_displacement_limit, confirmed identical
-    value in grasp_expert.py:254) AND object peak angular velocity
-    <= 2.0 rad/s (DISCLOSED: no coded Dex3 angular-velocity gate exists
-    to inherit -- grep of grasp_expert.py/test_grasp.py found none, only
-    the qualitative PROJECT_CONTEXT.md requirement to consider it; 2.0
-    rad/s is this session's own, deliberately conservative, choice, not
-    a relaxation of an existing number) AND no forbidden penetration
+  <= 0.03m AND object peak angular velocity <= 2.0 rad/s (a disclosed,
+    deliberately conservative project threshold) AND no forbidden penetration
     beyond the same numerical-tolerance band already established for
     Sharpa (1mm) AND the terminal state is not FAILURE.
 """
@@ -70,7 +56,7 @@ from humanoid_learning.envs import task_config as tc
 from humanoid_learning.envs import whole_body_config as wbc
 from humanoid_learning.expert import pose_ik
 from humanoid_learning.expert.coupled_ik import CoupledBilateralIK
-from humanoid_learning.expert.grasp_expert import sim_time_to_steps
+from humanoid_learning.expert.timing import sim_time_to_steps
 
 
 def _object_facing_R(side: str, palm_pos: np.ndarray, obj_pos: np.ndarray) -> np.ndarray:
@@ -137,10 +123,9 @@ def _slerp_R(R_a: np.ndarray, R_b: np.ndarray, frac: float) -> np.ndarray:
 SIDES = ("left", "right")
 Y_SIGN = {"left": 1.0, "right": -1.0}
 REQUIRED_GROUPS = ("thumb", "index", "middle", "wrap")  # topology: thumb + (index or middle) + wrap, checked below
-# Not copied from Dex3 (object_displacement_limit IS, see module docstring):
-OBJECT_XY_DISPLACEMENT_LIMIT = 0.03  # matches grasp_expert.GraspExpertConfig.object_displacement_limit exactly
-OBJECT_PEAK_ANGULAR_VELOCITY_LIMIT = 2.0  # rad/s -- disclosed, no Dex3-coded precedent exists (see module docstring)
-BILATERAL_STREAK_REQUIRED = 30  # matches Dex3's approved max_bilateral_tripod_streak >= 30
+OBJECT_XY_DISPLACEMENT_LIMIT = 0.03
+OBJECT_PEAK_ANGULAR_VELOCITY_LIMIT = 2.0
+BILATERAL_STREAK_REQUIRED = 30
 
 
 class BimanualGraspState(Enum):
@@ -215,9 +200,7 @@ class BimanualGraspConfig:
     # fingertips graze the table during transit (verified this session --
     # `table<->*_DP` contacts caused the wrist to visibly stick, unable to
     # reach its IK target through the resulting friction lock). 0.22 is
-    # SharpaSingleHandGraspExpert's own already-proven table-clearance
-    # margin (sharpa_grasp_expert.py's FOREARM_APPROACH/WRIST_ALIGN), reused
-    # directly rather than re-deriving it.
+    # measured table-clearance margin.
     approach_height_m: float = 0.22
     approach_y_offset_m: float = 0.15
     # [Session 41] FOREARM_DESCEND target height -- between approach_
@@ -242,7 +225,7 @@ class BimanualGraspConfig:
     object_peak_angular_velocity_limit: float = OBJECT_PEAK_ANGULAR_VELOCITY_LIMIT
     bilateral_streak_required: int = BILATERAL_STREAK_REQUIRED
     proximal_penetration_tolerance_m: float = 0.001  # same 1mm numerical band as sharpa_config's tolerances
-    hand_hand_force_limit_n: float = 8.0  # matches Dex3's own established hand-hand safety concern order of magnitude
+    hand_hand_force_limit_n: float = 8.0
     ik_pos_tol: float = 0.01
     max_steps_per_state: int = 400
     wrist_orientation_stability_tol_deg: float = 5.0  # max angular drift over the last 30 ticks to call WRIST_ALIGN settled
@@ -253,8 +236,7 @@ class BimanualGraspConfig:
     # settles several cm short, a steady-state compliant-actuator (arm_kp
     # =120) gravity/load droop under the Sharpa hands' own weight, not a
     # kinematic or rate-limit error. A Cartesian-target-inflation resolve
-    # (grasp_expert.py's own proven `_coupled_maybe_resolve` recipe for
-    # the Dex3 track) was tried here and causally measured to make the
+    # A Cartesian re-solve recipe was tried here and causally measured to make the
     # gap WORSE at this already-extreme precontact reach (see the same
     # history doc) -- not used. The actual fix is
     # SharpaGraspEnv's config-gated arm_gravity_compensation (see
@@ -441,18 +423,12 @@ class SharpaBimanualGraspExpert:
         self._arm_ik_target[7:] = result.right_q.copy()
 
     def _arm_action_toward_target(self) -> np.ndarray:
-        # [This session's finding, verified against BOTH the bimanual AND
-        # the pre-existing single-hand controller -- not a bimanual-only
-        # bug] targeting a FIXED/independently-chosen wrist orientation
+        # Targeting a fixed/independently-chosen wrist orientation
         # (e.g. np.eye(3) at any nonzero weight, or a "locked" orientation
         # captured elsewhere) reliably drives wrist_pitch (very low
         # armature=0.01, zero dof_damping -- see grasp_config.py/
         # model_builder.py, both protected/unmodified) into a real,
-        # reproducible divergence to its own hard joint limit -- confirmed
-        # identical in SharpaSingleHandGraspExpert (qpos ends ~1.7rad from
-        # ctrl, pinned against a genuine wrist_roll_link<->wrist_yaw_link
-        # self-collision), which never checked IK convergence after
-        # FOREARM_APPROACH and so never surfaced it. Neither slowing the
+        # reproducible divergence to its own hard joint limit. Neither slowing the
         # ctrl ramp rate (tried: ineffective, only delays the divergence)
         # nor trimming the IK's joint-limit margin (tried: ineffective)
         # fixed this -- the actual, verified fix is at the IK CALL SITES
@@ -521,12 +497,10 @@ class SharpaBimanualGraspExpert:
         return force_sum
 
     def _side_stable(self, side: str) -> bool:
-        """Section 6/Dex3-analog topology check for ONE side: thumb
+        """Topology check for one side: thumb
         touching AND (index or middle) touching AND wrap touching AND
-        thumb's force genuinely OPPOSES the index/middle combined force
-        (dot product < 0 -- ruling out both pressing from the same side,
-        the exact Dex3 `_opposing_normal_score` failure mode this
-        mirrors) AND this side is not in a hand-hand collision."""
+        thumb's force genuinely opposes the index/middle combined force
+        (dot product < 0) and this side is not in a hand-hand collision."""
         env = self.env
         thumb_peak, _ = env._group_contact_force(side, "thumb")
         index_peak, _ = env._group_contact_force(side, "index")
@@ -945,14 +919,13 @@ class SharpaBimanualGraspExpert:
                 # rate-limited chase has nothing left to converge to at
                 # this point (it reaches the IK-solved joint target
                 # exactly). Two independent Cartesian-target-inflation
-                # resolve variants (Dex3's own _coupled_maybe_resolve
-                # recipe, both with and without a posture-hold rest_q)
+                # resolve variants (with and without a posture-hold rest_q)
                 # were causally tested here and BOTH measured WORSE
                 # (gap grew from ~6.9cm to 10-25cm, joint norm to
                 # >1rad) -- this state's redundant 17-DOF solve, at this
                 # already-extreme precontact reach, does not have the
-                # locally-linear droop-vs-target relationship the Dex3
-                # resolve assumes; extrapolating the Cartesian target
+                # locally-linear droop-vs-target relationship required by
+                # that compensation; extrapolating the Cartesian target
                 # drives the IK into a qualitatively different, LESS
                 # favorable arm configuration instead of compensating.
                 # That IK-side compensation avenue is therefore not
