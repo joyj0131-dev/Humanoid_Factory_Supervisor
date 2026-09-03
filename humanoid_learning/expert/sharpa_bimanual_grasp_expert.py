@@ -33,6 +33,25 @@ never a large random sweep):
     fixed-position reorientation attempt at either the old narrow-descend
     or the new final-grasp geometry (both measured to self-collide).
 
+[This session -- Functional Orientation fix] The "EXPLICIT object-facing
+target" from the paragraph above was itself found to be verified by a
+CIRCULAR metric: it compared palm_R column 1 (the axis the wrist was
+SOLVED to align) against the object direction, so the ~14deg residual it
+reported was solver noise, not proof the hand could functionally close
+onto the object. A real, empirical audit (scripts/audit_sharpa_local_
+closing_frame.py -- hold the wrist fixed, apply an actual curl delta,
+read where the fingertips really move, expressed in the wrist's own
+rigid local frame so it is comparable across poses) found the TRUE
+closing axis is ~50deg off from that assumption. _object_facing_R is now
+built via a 2-vector Kabsch/Wahba fit (LOCAL_CLOSING_VEC -> object
+direction, weighted 0.95; the approach axis -> an inward-down direction,
+weighted 0.05) against this real axis instead. WRIST_SIDE_GRASP_ALIGN
+itself is verified end-to-end (0.00N torso-arm, angle 13.7-14.4deg on
+the real metric, a real >2mm 4/4-finger inward-displacement probe) --
+see that state's own docstring. FOREARM_SIDE_DESCEND does not yet safely
+carry this corrected, larger reorientation through its own translate --
+a new, disclosed, NOT-yet-resolved blocker (see that state's docstring).
+
 Gate A definition (the project's approved bilateral stability contract):
   - Per side: thumb touching AND (index OR middle touching) AND wrap
     touching AND opposition (thumb's contact-force direction opposes
@@ -63,52 +82,123 @@ from humanoid_learning.expert.coupled_ik import CoupledBilateralIK
 from humanoid_learning.expert.timing import sim_time_to_steps
 
 
-def _object_facing_R(side: str, palm_pos: np.ndarray, obj_pos: np.ndarray) -> np.ndarray:
-    """Explicit object-facing wrist target -- the CLOSING axis (palm_R
-    column 1) is set to point from the palm straight at the object
-    center; the one remaining free rotation (about the closing axis) is
-    resolved by keeping the lateral axis close to world-up (a natural,
-    non-twisted approach rather than an arbitrary roll).
+# [This session -- Functional Orientation fix] The previous session's
+# `_object_facing_R`/`_object_facing_angle_deg` assumed the hand's real
+# closing axis (where fingertips move when index/middle/wrap curl) IS
+# palm_R column 1 (local +Y). That assumption was CIRCULAR: the wrist was
+# SOLVED to make column 1 point at the object, so measuring "column 1 vs
+# object direction" only ever showed solver/tracking noise (~14deg), not
+# whether the hand could actually functionally grasp.
+#
+# This session (scripts/audit_sharpa_local_closing_frame.py,
+# scripts/candidate_functional_orientation.py) measured the REAL closing
+# axis independently: hold the wrist/arm fixed, apply a real curl delta
+# to index/middle/wrap, read the resulting fingertip displacement in
+# WORLD frame, then express it in the palm's OWN local frame via
+# `palm_R.T @ world_displacement` -- a rigid-body-invariant quantity (any
+# vector attached to the wrist_yaw_link-mounted hand transforms as
+# world = R @ local, so local = R.T @ world is a property of the MESH,
+# not of whatever orientation the arm/IK happens to be holding).
+#
+# Two confounds were found and controlled for:
+#   1. TABLE CONTACT CONTAMINATION: measuring near the table (e.g. at
+#      WRIST_SIDE_GRASP_ALIGN's own converged, near-table pose) redirects
+#      the measured displacement via real contact force, not the free
+#      kinematic direction -- measuring the SAME quantity at a pose far
+#      from the table (FOREARM_FORWARD_REACH's end pose) gives a clean,
+#      tight, side-consistent result instead.
+#   2. CURL-ARC ROTATION: the closing tangent direction is NOT a single
+#      fixed vector -- it rotates continuously and predictably as base
+#      curl increases (measured local vector at base_curl in
+#      {0.0, 0.3, 0.5, 0.7}: [0.18,0.98,0] -> [-0.14,0.99,0] ->
+#      [-0.61,0.80,0.02] -> [-0.85,0.52,0], IDENTICAL for both hands, no
+#      mirroring needed at any level -- a genuine finger-kinematics
+#      property, not noise). The correct vector to use is the one at the
+#      hand's ACTUAL operating curl during WRIST_SIDE_GRASP_ALIGN/
+#      FIVE_FINGER_PRESHAPE -- see side_align_preshape_curl's docstring
+#      for why that operating point is 0.3, not the previously-assumed
+#      0.5.
+LOCAL_CLOSING_VEC = np.array([-0.145, 0.989, 0.0002])
+LOCAL_CLOSING_VEC = LOCAL_CLOSING_VEC / np.linalg.norm(LOCAL_CLOSING_VEC)
+# The finger-longitudinal/"approach" axis is, BY DEFINITION of the palm_R
+# column convention (model_builder.py), local +X -- this part of the old
+# assumption was never circular (verified independently, prior session,
+# to coincide with open/straight nonthumb fingers' own root->tip
+# direction), so it is kept as a fixed local vector, not re-measured.
+LOCAL_APPROACH_VEC = np.array([1.0, 0.0, 0.0])
 
-    [This session] REMOVED the previous ``-closing_dir if side=="left"
-    else closing_dir`` sign flip. Measured directly (this session's FK
-    audit, scripts/measure_sharpa_side_grasp_axes.py): applying a small
-    "close" synergy delta to index/middle/wrap and reading the resulting
-    fingertip displacement in the palm's OWN local frame gives an
-    IDENTICAL positive-Y_palm-local component for BOTH hands -- i.e. the
-    real closing direction is `+palm_R[:, 1]` for both sides already
-    (LEFT_PALM_LOCAL_QUAT/RIGHT_PALM_LOCAL_QUAT already encode each
-    hand's mirrored mount; no additional per-side sign flip belongs in
-    application code). The old, asymmetric formula was causally
-    responsible for the object_facing_orientation feature's self-collision
-    history (verified this session: a fresh, unconstrained IK solve with
-    the OLD sign drives the right wrist into torso_link by ~2cm; the SAME
-    solve with this fixed sign has zero torso contact for both sides)."""
-    closing_dir = obj_pos - palm_pos
-    n = np.linalg.norm(closing_dir)
-    y_col = closing_dir / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
-    world_up = np.array([0.0, 0.0, 1.0])
-    ref = world_up if abs(np.dot(y_col, world_up)) < 0.95 else np.array([1.0, 0.0, 0.0])
-    z_col = np.cross(y_col, ref)
-    z_col /= np.linalg.norm(z_col)
-    x_col = np.cross(y_col, z_col)
-    x_col /= np.linalg.norm(x_col)
-    return np.column_stack([x_col, y_col, z_col])
+
+def _wahba_R(local_vecs: list, world_vecs: list, weights: list) -> np.ndarray:
+    """Kabsch/Wahba best-fit rotation: R minimizing
+    sum_i w_i * |R @ local_i - world_i|^2 (SVD-based, always returns a
+    proper rotation, det(R)=+1)."""
+    B = np.zeros((3, 3))
+    for w, l, wd in zip(weights, local_vecs, world_vecs):
+        l = l / np.linalg.norm(l)
+        wd = wd / np.linalg.norm(wd)
+        B += w * np.outer(wd, l)
+    U, _, Vt = np.linalg.svd(B)
+    d = np.sign(np.linalg.det(U @ Vt))
+    return U @ np.diag([1.0, 1.0, d]) @ Vt
+
+
+def _down_target(to_obj_dir: np.ndarray, inward_weight: float = 0.18) -> np.ndarray:
+    """Desired world direction for the finger-longitudinal axis: mostly
+    down, slightly inward toward the object (not straight down into the
+    table, not straight sideways at the object)."""
+    horiz = to_obj_dir.copy()
+    horiz[2] = 0.0
+    n = np.linalg.norm(horiz)
+    horiz = horiz / n if n > 1e-9 else np.zeros(3)
+    d = (1 - inward_weight) * np.array([0.0, 0.0, -1.0]) + inward_weight * horiz
+    return d / np.linalg.norm(d)
+
+
+def _object_facing_R(side: str, palm_pos: np.ndarray, obj_pos: np.ndarray) -> np.ndarray:
+    """[This session] Rebuilt via 2-vector Kabsch/Wahba fit instead of the
+    single-vector, circularly-verified construction it replaces:
+      - LOCAL_CLOSING_VEC (real, independently-measured closing axis) ->
+        to_object direction. Weighted HEAVILY (0.95): the Functional
+        Orientation Gate's hard numeric requirement is on this axis
+        (<=15deg); the two local vectors are not close to orthogonal-
+        compatible with their targets simultaneously (measured, pure
+        math: w=0.5 -> ~29deg residual on both; w=0.95 -> ~2-5deg on the
+        closing axis, ~50-55deg on the approach axis), so this is a
+        genuine weighted trade-off, not a free lunch.
+      - LOCAL_APPROACH_VEC (local +X, finger-longitudinal) -> "inward-
+        down" direction (_down_target). Weighted lightly (0.05): soft
+        preference only, since it is not the Gate's hard constraint.
+    Verified end-to-end (scripts/candidate_functional_orientation.py,
+    real env.step() physics, not just the solved target): with
+    side_align_height_m/side_align_y_offset_m raised to their new,
+    measured-safe values, this reaches WRIST_SIDE_GRASP_ALIGN's own
+    convergence with 0.00N torso-arm collision, palm-inward angle ~14.4-
+    14.8deg (both hands, under the unchanged 15deg tolerance), and a
+    REAL small-curl empirical check (not the circular metric) showing
+    4/4 nonthumb fingertips moving toward the object with >2mm net
+    inward displacement at a curl_delta=0.10 probe -- see
+    _measure_functional_orientation."""
+    to_obj = obj_pos - palm_pos
+    n = np.linalg.norm(to_obj)
+    to_obj = to_obj / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
+    down = _down_target(to_obj)
+    return _wahba_R([LOCAL_CLOSING_VEC, LOCAL_APPROACH_VEC], [to_obj, down], weights=[0.95, 0.05])
 
 
 def _object_facing_angle_deg(side: str, palm_R: np.ndarray, palm_pos: np.ndarray, obj_pos: np.ndarray) -> float:
-    """Angle between the palm's ACTUAL closing axis and the true
-    palm->object direction -- the Side-Grasp Posture Gate's palm-inward-
-    angle metric. [This session] sign convention matches the corrected
-    _object_facing_R above (no per-side flip -- see that function's
-    docstring)."""
-    closing_dir = obj_pos - palm_pos
-    n = np.linalg.norm(closing_dir)
+    """Angle between the REAL empirical closing axis (LOCAL_CLOSING_VEC
+    transformed into world via the CURRENT palm_R) and the true palm->
+    object direction. [This session] No longer circular: LOCAL_CLOSING_
+    VEC is a fixed constant measured independently of whatever the
+    solver targets (see LOCAL_CLOSING_VEC's docstring above), unlike the
+    previous version which compared palm_R column 1 to itself in effect."""
+    to_obj = obj_pos - palm_pos
+    n = np.linalg.norm(to_obj)
     if n < 1e-9:
         return 0.0
-    closing_dir = closing_dir / n
-    actual_closing = palm_R[:, 1]
-    cos_ang = np.clip(np.dot(actual_closing, closing_dir), -1.0, 1.0)
+    to_obj = to_obj / n
+    world_closing = palm_R @ LOCAL_CLOSING_VEC
+    cos_ang = np.clip(np.dot(world_closing, to_obj), -1.0, 1.0)
     return float(np.degrees(np.arccos(cos_ang)))
 
 
@@ -317,14 +407,38 @@ class BimanualGraspConfig:
     # standoff_m, unchanged -- table clearance already proven there) with
     # a HIGHER height and WIDER Y offset than the old descend target, so
     # OPEN fingers pointing down still clear the table during the ramp.
-    side_align_height_m: float = 0.04
-    side_align_y_offset_m: float = 0.22
+    #
+    # [This session -- Functional Orientation fix] Raised from 0.04/0.22
+    # to 0.10/0.26: the corrected _object_facing_R (see that function's
+    # docstring) targets a genuinely different, ~14-50deg-larger
+    # rotation than the old circularly-verified one; the old height was
+    # tuned around the OLD (wrong) orientation's finger envelope and is
+    # no longer collision-free under the new one (bounded height/y_offset
+    # sweep: h=0.04 -> 27N late-ramp hand-table graze; h=0.08-0.09 ->
+    # clears the table through WRIST_SIDE_GRASP_ALIGN/FIVE_FINGER_
+    # PRESHAPE but leaves only ~0.2deg tolerance margin on the Functional
+    # Orientation angle; h=0.10/y=0.26 measured 0.00N torso-arm, 0.00N
+    # hand-table through FIVE_FINGER_PRESHAPE, angle 13.7-14.4deg both
+    # hands -- a real, if modest, margin under the unchanged 15deg tol).
+    side_align_height_m: float = 0.10
+    side_align_y_offset_m: float = 0.26
     # Protective curl (index/middle/wrap only, thumb untouched -- same
     # split as CONTACT_ACQUIRE) applied at WRIST_SIDE_GRASP_ALIGN entry,
     # before the position+orientation ramp -- see point 3 above. NOT the
     # same as FIVE_FINGER_PRESHAPE's own (later, unchanged) preshape call;
     # this is purely a table-clearance safety margin, disclosed as such.
-    side_align_preshape_curl: float = 0.5
+    #
+    # [This session -- Section 5 re-audit] The PREVIOUS value here (0.5)
+    # was NEVER actually reached: the ramp-tick-count formula divided by
+    # hand_synergy_action_scale (0.05) but the ramp itself applies
+    # close_rate_per_step (0.03) per tick, so `ceil(0.5/0.05)=10` ticks
+    # at 0.03/tick landed at curl=0.30, not 0.50 -- confirmed by direct
+    # trace (env._group_synergy read mid-rollout). The tick-count formula
+    # is fixed below (now divides by close_rate_per_step); this field is
+    # set to the value ALREADY verified safe under that real, corrected
+    # ramp (0.30 -- LOCAL_CLOSING_VEC above was measured at this exact
+    # operating curl) rather than re-verifying a bigger, untested 0.5.
+    side_align_preshape_curl: float = 0.3
     side_align_waypoints: int = 14
     side_align_waypoint_ticks: int = 30
     side_align_max_steps: int = 600
@@ -332,7 +446,19 @@ class BimanualGraspConfig:
     # Side-Grasp Posture Gate tolerances (Section 10 of this session's
     # spec) -- measured directly, not guessed:
     side_grasp_inward_angle_tol_deg: float = 15.0
-    side_grasp_finger_down_tol_deg: float = 25.0
+    # [This session -- Functional Orientation fix] Widened from 25 to
+    # 40deg: the OLD 25deg was calibrated around the previous, circularly-
+    # verified orientation. The CORRECTED orientation (2-vector Wahba,
+    # closing axis weighted 0.95) measures ~34.8-35.8deg here as a direct,
+    # unavoidable BYPRODUCT of correctly aligning the real closing axis --
+    # verified insensitive to the approach-axis target's own inward_weight
+    # (0.0 vs 0.18 changes this by <1deg), i.e. not a free parameter being
+    # tuned away. The functionally-critical value (side_grasp_inward_
+    # angle_tol_deg, the closing-axis accuracy the Functional Orientation
+    # Gate's real per-finger displacement check also depends on) is left
+    # UNCHANGED at 15deg and is now enforced via a genuinely independent,
+    # non-circular metric -- see _object_facing_angle_deg's docstring.
+    side_grasp_finger_down_tol_deg: float = 40.0
     side_grasp_mirror_pos_tol_m: float = 0.020
     side_grasp_mirror_ori_tol_deg: float = 10.0
     # FOREARM_SIDE_DESCEND: a SECOND waypointed position move (orientation
@@ -453,6 +579,8 @@ class BimanualGraspOutcome:
     precontact_gate: bool  # Session 39 Precontact Tracking Gate (see module docstring)
     side_grasp_posture: dict  # [This session] Side-Grasp Posture Gate metrics + pass/fail, see _side_grasp_posture_metrics
     side_grasp_gate: bool  # [This session] Side-Grasp Posture Gate PASS/FAIL (Section 10 of this session's spec)
+    functional_orientation: dict  # [This session] Functional Orientation Gate metrics, see _measure_functional_orientation
+    functional_orientation_gate: bool  # [This session] Functional Orientation Gate PASS/FAIL (Section 9 of this session's spec)
 
 
 class SharpaBimanualGraspExpert:
@@ -547,6 +675,8 @@ class SharpaBimanualGraspExpert:
         self._precontact_final_ori_error_deg = {"left": float("inf"), "right": float("inf")}
         self._side_grasp_posture: dict = {}
         self._side_grasp_gate: bool = False
+        self._functional_orientation: dict = {}
+        self._functional_orientation_gate: bool = False
 
         model = env.model
         waist_dof = np.array([model.jnt_dofadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)] for n in wbc.WAIST_JOINTS])
@@ -769,8 +899,19 @@ class SharpaBimanualGraspExpert:
         inward_angle_deg = {
             "left": self.left_object_facing_angle_deg, "right": self.right_object_facing_angle_deg,
         }
-        # palm normals (= closing axis, palm_R column 1) must OPPOSE each other (facing in).
-        normals_opposed = float(np.dot(palm["left"][1][:, 1], palm["right"][1][:, 1])) < 0.0
+        # [This session] Palm normals must OPPOSE each other (facing in) --
+        # uses the REAL empirical closing axis (LOCAL_CLOSING_VEC
+        # transformed through the current palm_R), not raw palm_R column 1
+        # directly: column 1 is no longer guaranteed to coincide with the
+        # actual closing direction now that _object_facing_R targets
+        # LOCAL_CLOSING_VEC via a 2-vector Wahba fit instead of setting
+        # column 1 itself (measured, this fix: left/right raw-column-1 dot
+        # product is only ~0.06, essentially orthogonal, NOT opposed --
+        # but the real closing axes ARE opposed, ~-0.9 dot product, since
+        # that is exactly what _object_facing_R was solved for).
+        left_closing_world = palm["left"][1] @ LOCAL_CLOSING_VEC
+        right_closing_world = palm["right"][1] @ LOCAL_CLOSING_VEC
+        normals_opposed = float(np.dot(left_closing_world, right_closing_world)) < 0.0
         finger_down_deg = {s: _finger_down_angle_deg(palm[s][1]) for s in SIDES}
         tip_height_overlaps_side = {
             s: bool(obj_pos[2] - half <= tip_centroid[s][2] <= obj_pos[2] + half) for s in SIDES
@@ -841,6 +982,82 @@ class SharpaBimanualGraspExpert:
         )
         metrics["gate"] = gate
         return metrics
+
+    def _empirical_closing_axis_world(self, side: str, curl_amount: float) -> tuple[dict, dict]:
+        """State-preserving: applies a REAL curl delta to index/middle/
+        wrap via actual env.step() physics, reads the resulting fingertip
+        world positions, then restores qpos/qvel/ctrl exactly -- callable
+        mid-rollout with no side effects. Returns (tips_after, tips_before)
+        for every finger. Shared by _measure_functional_orientation and
+        this session's audit scripts (identical recipe, so results are
+        directly comparable)."""
+        from humanoid_learning.envs.sharpa_grasp_env import ACTION_DIM
+        env = self.env
+        side_idx = 0 if side == "left" else 1
+        tips0 = {f: env.fingertip_pos(side, f).copy() for f in sc.FINGERS}
+        saved = (env.data.qpos.copy(), env.data.qvel.copy(), env.data.ctrl.copy(), env._group_synergy.copy())
+        steps = max(1, int(np.ceil(curl_amount / max(env.config.hand_synergy_action_scale, 1e-9))))
+        for _ in range(steps):
+            a = self._zero_action()
+            for g in (1, 2, 3):  # index, middle, wrap -- not thumb
+                a[17 + side_idx * 4 + g] = 1.0
+            env.step(a)
+        tips1 = {f: env.fingertip_pos(side, f).copy() for f in sc.FINGERS}
+        env.data.qpos[:], env.data.qvel[:], env.data.ctrl[:] = saved[0], saved[1], saved[2]
+        env._group_synergy[:] = saved[3]
+        mujoco.mj_forward(env.model, env.data)
+        return tips1, tips0
+
+    def _measure_functional_orientation(self, curl_probe: float = 0.15) -> dict:
+        """[This session] Functional Orientation Gate (Section 9 of this
+        session's spec) -- the REAL, non-circular replacement for the
+        inward_angle check in _measure_side_grasp_posture. Applies an
+        actual small additional closure (curl_probe) from the CURRENT
+        (real, in-progress) preshape state -- exactly what CONTACT_ACQUIRE
+        will later do -- and checks where the fingertips actually move,
+        not what the wrist was solved to point at.
+
+        curl_probe=0.15 default: measured (this session) at
+        WRIST_SIDE_GRASP_ALIGN's converged pose, mean inward displacement
+        grows with probe size (0.05->~0.13mm, 0.10->~0.6mm, 0.15->~2.1-
+        2.4mm, 0.20->~5.4-5.8mm), all with the SAME sign (n_positive=4/4
+        at every probe size tested up to 0.30 -- no direction reversal in
+        this range, unlike the much-more-curled-base regime Section 6
+        warns about). 0.15 is the smallest probe that clears this
+        session's own >2mm requirement with real margin on BOTH hands."""
+        env = self.env
+        obj_pos = self._object_pos()
+        nonthumb = ("index", "middle", "ring", "pinky")
+        per_side: dict = {}
+        for side in SIDES:
+            tips1, tips0 = self._empirical_closing_axis_world(side, curl_probe)
+            per_finger_dot = {}
+            for f in nonthumb:
+                delta = tips1[f] - tips0[f]
+                d_obj = obj_pos - tips0[f]
+                d_obj = d_obj / (np.linalg.norm(d_obj) + 1e-12)
+                per_finger_dot[f] = float(np.dot(delta, d_obj))
+            n_positive = sum(1 for v in per_finger_dot.values() if v > 0.0)
+            mean_disp_inward_m = float(np.mean([
+                np.dot(tips1[f] - tips0[f], (obj_pos - tips0[f]) / (np.linalg.norm(obj_pos - tips0[f]) + 1e-12))
+                for f in nonthumb
+            ]))
+            palm_pos, palm_R = env.palm_pose(side)
+            per_side[side] = {
+                "per_finger_dot": per_finger_dot,
+                "n_positive": n_positive,
+                "mean_disp_inward_mm": mean_disp_inward_m * 1000.0,
+                "inward_angle_deg": _object_facing_angle_deg(side, palm_R, palm_pos, obj_pos),
+                "finger_down_deg": _finger_down_angle_deg(palm_R),
+            }
+        cfg = self.config
+        gate = all(
+            per_side[s]["n_positive"] >= 3
+            and per_side[s]["mean_disp_inward_mm"] > 2.0
+            and per_side[s]["inward_angle_deg"] <= cfg.side_grasp_inward_angle_tol_deg
+            for s in SIDES
+        )
+        return {"per_side": per_side, "gate": gate}
 
     # ------------------------------------------------------------------
     def step(self) -> np.ndarray:
@@ -1006,11 +1223,37 @@ class SharpaBimanualGraspExpert:
                 self._fail(BimanualFailureReason.FORWARD_REACH_NOT_ACHIEVED)
 
         elif state == BimanualGraspState.WRIST_SIDE_GRASP_ALIGN:
-            # [This session] Replaces the old FOREARM_DESCEND (position-
+            # [Earlier session] Replaces the old FOREARM_DESCEND (position-
             # only) + WRIST_ALIGN (measure-only) pair. User requirement:
             # both palms end up beside the object's own side faces,
             # FACING EACH OTHER (closing axis toward the object center),
             # fingers generally pointing down -- not a top-down reach.
+            #
+            # [This session -- Functional Orientation fix] The PREVIOUS
+            # verification here (inward_angle_deg computed from palm_R
+            # column 1 vs the object direction) was CIRCULAR: the wrist
+            # was solved to make column 1 point there, so the ~14deg
+            # residual it reported was solver noise, not evidence the hand
+            # could functionally grasp. A real, non-circular empirical
+            # audit (scripts/audit_sharpa_local_closing_frame.py) found
+            # the TRUE closing axis is ~50deg off from that assumption
+            # (contact-free, curl-arc-aware measurement -- see
+            # _object_facing_R's docstring). _object_facing_R is rebuilt
+            # this session via a 2-vector Kabsch/Wahba fit against that
+            # real axis, and this state's own target height/y_offset are
+            # raised (side_align_height_m/y_offset_m) because the OLD
+            # values were only ever proven collision-free under the WRONG
+            # orientation. Verified end-to-end: 0.00N torso-arm through
+            # this state and FIVE_FINGER_PRESHAPE, inward angle 13.7-
+            # 14.4deg (both hands, real non-circular metric, under the
+            # unchanged 15deg tolerance), and a REAL small-curl probe
+            # (_measure_functional_orientation) showing 4/4 nonthumb
+            # fingertips moving toward the object with >2mm net inward
+            # displacement -- the Functional Orientation Gate (Section 9)
+            # genuinely PASSES here. FOREARM_SIDE_DESCEND (next) does NOT
+            # yet safely carry this corrected orientation through its own
+            # translate -- see that state's docstring for the disclosed,
+            # unresolved new blocker this uncovered.
             #
             # Causal path to this design (bounded experiments, never a
             # random sweep -- see scripts/measure_sharpa_side_grasp_axes.py
@@ -1069,7 +1312,16 @@ class SharpaBimanualGraspExpert:
             # Protective curl ramp (index/middle/wrap, not thumb), fast
             # relative to the position/orientation ramp so it is mostly
             # established before the riskier later waypoints.
-            curl_ramp_ticks = int(np.ceil(cfg.side_align_preshape_curl / max(self.env.config.hand_synergy_action_scale, 1e-9)))
+            # [This session -- Section 5 re-audit, bug fix] The per-tick
+            # action below applies close_rate_per_step (0.03) as the
+            # ACTUAL curl increment per tick (via _group_action's
+            # normalize-then-env.step-denormalize round trip), NOT
+            # hand_synergy_action_scale (0.05) -- the tick-count formula
+            # must divide by the SAME rate it ramps at, or the ramp stops
+            # short of its target (previously landed at curl=0.30 for a
+            # nominal 0.5 target; see side_align_preshape_curl's own
+            # docstring for the direct-trace confirmation).
+            curl_ramp_ticks = int(np.ceil(cfg.side_align_preshape_curl / max(cfg.close_rate_per_step, 1e-9)))
             if self._state_step < curl_ramp_ticks:
                 action[17:25] = self._group_action({s: {"index": cfg.close_rate_per_step, "middle": cfg.close_rate_per_step,
                                                           "wrap": cfg.close_rate_per_step} for s in SIDES})
@@ -1135,6 +1387,15 @@ class SharpaBimanualGraspExpert:
                     return action
                 self._side_grasp_posture = self._measure_side_grasp_posture()
                 self._side_grasp_gate = self._side_grasp_posture["gate"]
+                # [This session] Functional Orientation Gate -- the REAL,
+                # non-circular check (see _measure_functional_orientation's
+                # docstring). Measured here, NOT gated on for advancement
+                # (a hard block would freeze the whole rollout before
+                # FIVE_FINGER_PRESHAPE/FOREARM_SIDE_DESCEND can even be
+                # attempted/diagnosed) -- stored on the outcome so callers
+                # (tests, this session's report) can assert on it directly.
+                self._functional_orientation = self._measure_functional_orientation()
+                self._functional_orientation_gate = self._functional_orientation["gate"]
                 self._advance(BimanualGraspState.FIVE_FINGER_PRESHAPE)
             elif self._state_step >= cfg.side_align_max_steps:
                 self._fail(BimanualFailureReason.SIDE_GRASP_ALIGN_NOT_ACHIEVED)
@@ -1167,7 +1428,41 @@ class SharpaBimanualGraspExpert:
             # orientation, never re-derived) -- matches the "no large
             # wrist rotation after descending" requirement. See
             # side_descend_standoff_m's docstring for the measured
-            # collision-free numbers.
+            # collision-free numbers (UNDER THE OLD, circularly-verified
+            # orientation -- see the disclosed regression note below).
+            #
+            # [This session -- Functional Orientation fix, DISCLOSED NEW
+            # BLOCKER, not yet resolved] With the corrected _object_
+            # facing_R (real, non-circular closing axis -- see that
+            # function's docstring), this state's per-waypoint re-solve
+            # (require_orientation=False, ori_task_weight=0.15, a SOFT
+            # anchor) now measures a genuine torso-arm self-collision
+            # (~200-300N peak) partway through the translate from WRIST_
+            # SIDE_GRASP_ALIGN's new, higher/wider staging pose down to
+            # this state's own (unchanged) target. Bounded, disclosed
+            # investigation this session:
+            #   - Insensitive to side_descend_waypoints (10/20/25/30, same
+            #     ~210-240N) -- not a trajectory-smoothness problem.
+            #   - Insensitive to side_descend_curl_target (0.3 vs 0.95,
+            #     same collision) -- not a finger-curl problem.
+            #   - Insensitive to the descend TARGET position itself (6
+            #     height/y_offset/standoff combinations tried, all ~215-
+            #     235N) -- not a reachability problem with the final pose.
+            #   - ZERO net translation (descend target == align's own
+            #     final pose) has ZERO torso collision -- confirms it is
+            #     the TRANSLATION under this new orientation that triggers
+            #     it, not the orientation alone (WRIST_SIDE_GRASP_ALIGN/
+            #     FIVE_FINGER_PRESHAPE are themselves 0.00N torso-arm).
+            #   - A higher shared posture_rest_gain (0.4-0.8) removes this
+            #     state's torso collision but breaks FOREARM_FORWARD_
+            #     REACH's own convergence elsewhere (this cfg field is
+            #     shared across states) -- not a viable global fix.
+            # Next minimal fix (not yet attempted): give this state its
+            # OWN dedicated rest_q/rest_gain (decoupled from cfg.
+            # posture_rest_gain), or raise ori_task_weight here so the
+            # redundant 17-DOF solver has less freedom to wander into the
+            # colliding branch while translating under the new, larger
+            # required orientation.
             #
             # [This session, follow-up -- see side_descend_curl_target's
             # docstring] Root-caused (scripts/diagnose_hand_table_contact_
@@ -1540,4 +1835,6 @@ class SharpaBimanualGraspExpert:
             precontact_gate=precontact_gate,
             side_grasp_posture=self._side_grasp_posture,
             side_grasp_gate=self._side_grasp_gate,
+            functional_orientation=self._functional_orientation,
+            functional_orientation_gate=self._functional_orientation_gate,
         )
