@@ -22,13 +22,18 @@ Images (not committed -- see .gitignore):
     results/side_grasp_pose/after_align_top.png
     results/side_grasp_pose/after_preshape_front.png
     results/side_grasp_pose/after_preshape_top.png
-    results/side_grasp_pose/after_descend_blocked_front.png
-    results/side_grasp_pose/after_descend_blocked_top.png
+    results/side_grasp_pose/after_side_descend_front.png
+    results/side_grasp_pose/after_side_descend_top.png
+    results/side_grasp_pose/after_precontact_blocked_front.png
+    results/side_grasp_pose/after_precontact_blocked_top.png
 
-The last pair is honestly labeled "blocked", not "precontact" --
-FINGERTIP_PRECONTACT is not yet reached this session (see
-test_forward_reach_gate_now_passes_and_advances_to_next_blocker's
-HAND_TABLE_COLLISION assertion).
+[This session's follow-up] FOREARM_SIDE_DESCEND now converges (curl
+retraction fix) and FINGERTIP_PRECONTACT is now actually reached (rest_q
+fix) -- the last pair is captured there, honestly labeled "blocked" (not
+"success"): the rollout still fails at FINGERTIP_PRECONTACT with
+PRECONTACT_TRACKING_NOT_ACHIEVED (a separate, disclosed, not-yet-fixed
+tracking residual), so this is the final held pose on failure, not a
+completed grasp approach.
 
 Usage:
     MUJOCO_GL=egl PYTHONPYCACHEPREFIX=/tmp/phase45_pycache python3 scripts/capture_side_grasp_screenshots.py
@@ -107,11 +112,13 @@ def main() -> None:
             maybe_capture("after_align", True)
         if prev_state == BimanualGraspState.FIVE_FINGER_PRESHAPE and expert.state == BimanualGraspState.FOREARM_SIDE_DESCEND:
             maybe_capture("after_preshape", True)
+        if prev_state == BimanualGraspState.FOREARM_SIDE_DESCEND and expert.state == BimanualGraspState.FINGERTIP_PRECONTACT:
+            maybe_capture("after_side_descend", True)
         if expert.state == BimanualGraspState.FAILURE:
             break
 
     # Final pose, whatever it is (honestly labeled "blocked" -- see module docstring).
-    maybe_capture("after_descend_blocked", True)
+    maybe_capture("after_precontact_blocked", True)
 
     print(f"\nfinal state={expert.state.name} reason={expert.failure_reason}")
     print(f"captured: {sorted(captured)}")

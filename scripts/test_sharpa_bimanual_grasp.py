@@ -37,14 +37,42 @@ no top-footprint crossing, left/right mirror position error <0.1mm,
 mirror orientation error <0.04deg, elbow well below shoulder, zero
 torso-arm/hand-hand/hand-table forbidden collision, 15-tick streak.
 
-The rollout currently fails LATER, in FOREARM_SIDE_DESCEND, with
-HAND_TABLE_COLLISION -- a real, repeated (not single-tick) hand<->table
-force up to ~18N measured this session (scripts/diagnose_side_grasp_
-swept_path.py) as the fingers, already partially curled, keep dipping
-into the table on the final approach waypoints. A bounded (curl fraction,
-height) candidate search did not clear it without cost elsewhere. This is
-the current, disclosed next blocker -- a separate, independent problem
-from the Side-Grasp Posture Gate, which is achieved.
+[This session's follow-up] Root-caused (scripts/diagnose_hand_table_
+contact_geometry.py, substep-level) FOREARM_SIDE_DESCEND's ~18.21N
+hand-table force to essentially all non-thumb fingertips sustaining
+table contact at the curl level (0.5) inherited from WRIST_SIDE_GRASP_
+ALIGN -- NOT sensitive to standoff/y_offset (measured identical across a
+bounded sweep, ruling out palm XY position). Curling further during this
+state (side_descend_curl_target=0.95, position/orientation UNCHANGED)
+retracts the fingertips clear: 18.21N -> 2.96N, with palm inward/finger-
+down angle both improving into their Gate ranges as a side effect. The
+tighter curl's extra actuator load needed a slightly finer waypoint
+schedule (side_descend_waypoints 8->10) to clear the resulting ~10.7mm
+steady-state tracking residual under the unchanged 10mm ik_pos_tol.
+
+Reaching FOREARM_SIDE_DESCEND's real target then exposed a SEPARATE,
+previously-latent bug in FINGERTIP_PRECONTACT (never exercised before
+this session -- earlier failures always happened first): its own
+_solve_both call was missing rest_q/rest_gain entirely, silently
+defaulting to the STALE stand-pose rest_q instead of the clearance-
+posture bias every other state in this file uses -- causing the
+redundant 17-DOF solver to pick a torso-colliding branch (measured
+83.17N torso-arm, 11.83N hand-table) for FINGERTIP_PRECONTACT's own
+small final inward move. Fixed by passing rest_q=self._clearance_target
+(matching the established convention exactly); both forces drop to
+0.00N, and explicit torso-arm/hand-table fail-fast checks were added to
+FINGERTIP_PRECONTACT's own gate (previously only checked hand-hand).
+
+The rollout NOW reaches FINGERTIP_PRECONTACT for real and fails there,
+honestly, with PRECONTACT_TRACKING_NOT_ACHIEVED (a pre-existing,
+already-documented category of steady-state actuator-tracking residual
+at this extreme reach -- see that state's own docstring) -- the current,
+disclosed next blocker, separate from the Side-Grasp Posture Gate (still
+achieved) and separate from ARM_LATERAL_CLEARANCE's own still-unresolved
+~27N transient thumb-table graze / Wrist Transition Gate miss (3 bounded
+candidates tried this session -- wrist_pitch offset, slower trajectory,
+thumb pre-curl -- none cleared it without a worse trade-off; reverted,
+not applied; see PROJECT_CONTEXT.md).
 test_a_real_bimanual_gate_a_success_on_size_12 below documents the
 overall Gate A outcome HONESTLY as a failing test and must never be
 weakened, deleted, or converted into a smoke assertion to make it pass.
@@ -248,12 +276,12 @@ def test_forward_reach_gate_now_passes_and_advances_to_next_blocker():
     # Full rollout: still honestly fails later, at a separate gate.
     env2 = make_env()
     expert2 = SharpaBimanualGraspExpert(env2)
-    outcome = expert2.run(max_total_steps=1200)
+    outcome = expert2.run(max_total_steps=2000)
     print(f"    full rollout: state={outcome.state.name} failure_reason={outcome.failure_reason} "
           f"side_grasp_gate={outcome.side_grasp_gate}")
     assert outcome.side_grasp_gate is True, "Side-Grasp Posture Gate should still pass en route to the current next blocker"
-    assert outcome.failure_reason == BimanualFailureReason.HAND_TABLE_COLLISION, (
-        "expected the CURRENT next independent blocker (FOREARM_SIDE_DESCEND hand-table collision); "
+    assert outcome.failure_reason == BimanualFailureReason.PRECONTACT_TRACKING_NOT_ACHIEVED, (
+        "expected the CURRENT next independent blocker (FINGERTIP_PRECONTACT tracking); "
         "if this changed, the docstring/PROJECT_CONTEXT next-blocker note is now stale"
     )
 
@@ -320,12 +348,9 @@ def test_side_grasp_state_order_matches_spec():
 
 def test_side_grasp_swept_path_has_no_forbidden_collision_before_side_descend():
     """[This session] Endpoint-only checks are not sufficient (Section 8):
-    verify torso-arm/hand-hand/hand-table forbidden-collision force stays
-    at or under the shared safety limit at EVERY tick through
-    FIVE_FINGER_PRESHAPE (the current honest blocker is inside FOREARM_
-    SIDE_DESCEND itself, see module docstring -- this test covers the
-    swept path UP TO that point, which the Side-Grasp Posture Gate
-    already certifies clean)."""
+    verify torso-arm/hand-hand forbidden-collision force stays at or
+    under the shared safety limit at EVERY tick through FIVE_FINGER_
+    PRESHAPE, which the Side-Grasp Posture Gate already certifies clean."""
     env = make_env()
     env.reset(seed=0)
     expert = SharpaBimanualGraspExpert(env)
@@ -349,6 +374,38 @@ def test_side_grasp_swept_path_has_no_forbidden_collision_before_side_descend():
     print(f"    swept max_torso_arm={max_torso_arm:.2f}N swept max_hand_hand={max_hand_hand:.2f}N (limit={limit}N)")
     assert max_torso_arm <= limit
     assert max_hand_hand <= limit
+
+
+def test_side_descend_and_precontact_hand_table_force_within_limit():
+    """[This session's follow-up] Locks in the FOREARM_SIDE_DESCEND fix
+    (curl retraction, see that state's docstring): swept hand-table force
+    stays within the shared 8N limit (measured ~2.96N, a genuine small
+    residual, not exactly 0N but real progress from the pre-fix ~18.21N),
+    and FINGERTIP_PRECONTACT -- now actually reached and exercised for
+    the first time this session -- has ZERO torso-arm and hand-table
+    force (the rest_q fix, see that state's docstring for the pre-fix
+    83.17N/11.83N this uncovered)."""
+    env = make_env()
+    env.reset(seed=0)
+    expert = SharpaBimanualGraspExpert(env)
+    limit = expert.config.hand_hand_force_limit_n
+    max_table_descend = max_table_precontact = max_torso_precontact = 0.0
+    for _ in range(1800):
+        if expert.state in (BimanualGraspState.SUCCESS, BimanualGraspState.FAILURE):
+            break
+        prev_state = expert.state
+        action = expert.step()
+        env.step(action)
+        if prev_state == BimanualGraspState.FOREARM_SIDE_DESCEND:
+            max_table_descend = max(max_table_descend, env._hand_table_contact_force())
+        if prev_state == BimanualGraspState.FINGERTIP_PRECONTACT:
+            max_table_precontact = max(max_table_precontact, env._hand_table_contact_force())
+            max_torso_precontact = max(max_torso_precontact, env._torso_arm_collision_force())
+    print(f"    max_table_descend={max_table_descend:.2f}N max_table_precontact={max_table_precontact:.2f}N "
+          f"max_torso_precontact={max_torso_precontact:.2f}N (limit={limit}N)")
+    assert max_table_descend <= limit
+    assert max_table_precontact == 0.0
+    assert max_torso_precontact == 0.0
 
 
 def test_ever_contacted_alone_does_not_satisfy_gate_a():
@@ -446,10 +503,10 @@ def test_observation_includes_both_hands_and_object_orientation_velocity():
 def test_deterministic_repeat():
     env1 = make_env()
     expert1 = SharpaBimanualGraspExpert(env1)
-    outcome1 = expert1.run(max_total_steps=1200)
+    outcome1 = expert1.run(max_total_steps=2000)
     env2 = make_env()
     expert2 = SharpaBimanualGraspExpert(env2)
-    outcome2 = expert2.run(max_total_steps=1200)
+    outcome2 = expert2.run(max_total_steps=2000)
     assert outcome1.state == outcome2.state
     assert outcome1.step_count == outcome2.step_count
     assert outcome1.per_side_group_contact == outcome2.per_side_group_contact
@@ -459,7 +516,7 @@ def test_deterministic_repeat():
 def test_full_bimanual_rollout_runs_to_a_terminal_state_without_crashing():
     env = make_env()
     expert = SharpaBimanualGraspExpert(env)
-    outcome = expert.run(max_total_steps=1200)
+    outcome = expert.run(max_total_steps=2000)
     assert outcome.state in (BimanualGraspState.SUCCESS, BimanualGraspState.FAILURE)
     print(f"    rollout reached terminal state {outcome.state.name} "
           f"(failure_reason={outcome.failure_reason}) after {outcome.step_count} steps")
@@ -511,10 +568,11 @@ def test_a_real_bimanual_gate_a_success_on_size_12():
     [This session] FOREARM_FORWARD_REACH's own settled-position residual
     is fixed and the Side-Grasp Posture Gate now genuinely passes (see
     test_side_grasp_posture_gate_passes) -- the bare-G1 canonical builder
-    advances through WRIST_SIDE_GRASP_ALIGN -> FIVE_FINGER_PRESHAPE ->
-    FOREARM_SIDE_DESCEND and stops there instead, deterministically
-    failing with HAND_TABLE_COLLISION. Later contact/force gates are
-    therefore still not entered.
+    now advances all the way through WRIST_SIDE_GRASP_ALIGN -> FIVE_
+    FINGER_PRESHAPE -> FOREARM_SIDE_DESCEND -> FINGERTIP_PRECONTACT and
+    stops there instead, deterministically failing with PRECONTACT_
+    TRACKING_NOT_ACHIEVED. CONTACT_ACQUIRE and later force/closure gates
+    are therefore still not entered.
     This test MUST NOT be weakened, deleted, or turned into a smoke
     assertion to make it pass -- it stays honestly failing until Gate A
     is actually achieved."""

@@ -338,13 +338,38 @@ class BimanualGraspConfig:
     # FOREARM_SIDE_DESCEND: a SECOND waypointed position move (orientation
     # held via a small soft anchor, NOT re-derived -- it is already
     # correct from WRIST_SIDE_GRASP_ALIGN) from the align pose down/in
-    # toward the final pre-contact approach. Measured collision-free
-    # (0.00N torso-arm/hand-hand/hand-table) at these values, holding the
-    # ALIGN orientation.
+    # toward the final pre-contact approach. [Corrected this session's
+    # follow-up: the PREVIOUS "measured collision-free at these values"
+    # claim was measured only in a single, simplified test that never
+    # exercised the FULL end-to-end rollout -- the real, full rollout
+    # measures a genuine ~18.21N sustained hand-table force at these same
+    # position values with the curl level inherited from WRIST_SIDE_
+    # GRASP_ALIGN (0.5). Position (standoff/height/y_offset) is UNCHANGED
+    # from that finding -- varying it did not move the residual force at
+    # all (see side_descend_curl_target's docstring); the actual fix is
+    # curl, not position.] torso-arm/hand-hand stay 0.00N throughout.
     side_descend_standoff_m: float = 0.12
     side_descend_height_m: float = 0.03
     side_descend_y_offset_m: float = 0.15
-    side_descend_waypoints: int = 8
+    # [This session] Curls index/middle/wrap further than WRIST_SIDE_
+    # GRASP_ALIGN's protective 0.5 (see that field's docstring) -- see
+    # FOREARM_SIDE_DESCEND's own docstring for the causal finding
+    # (essentially all non-thumb fingertips sustain table contact at
+    # curl=0.5 and this state's target height; retracting them via curl
+    # clears it, 18.21N -> 2.96N, with palm inward/finger-down angle BOTH
+    # improving as a side effect). 0.95, not 1.0: measured identical
+    # (2.96N either way) -- kept at 0.95 for a small margin under the
+    # group synergy action space's own [0,1] ceiling.
+    side_descend_curl_target: float = 0.95
+    # [This session] 8@30 (budget 240, tail 160) converged to a genuine
+    # steady-state ~10.71mm residual (measured: unchanged after +300
+    # extra settle ticks -- not a timing artifact) at the curled (0.95)
+    # load, just over ik_pos_tol -- reducing standoff (a smaller reach)
+    # measured WORSE (12.6-12.9mm), ruling that lever out. 10@30 (budget
+    # 300, tail 100 -- SMALLER per-waypoint steps, same total ramp
+    # duration ballpark) converges under 10mm and reaches FINGERTIP_
+    # PRECONTACT; 12@26 also worked but with less tail margin.
+    side_descend_waypoints: int = 10
     side_descend_waypoint_ticks: int = 30
     side_descend_stable_streak_required: int = 15
     precontact_standoff_m: float = 0.08
@@ -1143,6 +1168,31 @@ class SharpaBimanualGraspExpert:
             # wrist rotation after descending" requirement. See
             # side_descend_standoff_m's docstring for the measured
             # collision-free numbers.
+            #
+            # [This session, follow-up -- see side_descend_curl_target's
+            # docstring] Root-caused (scripts/diagnose_hand_table_contact_
+            # geometry.py, substep-level) the ~18N hand-table force
+            # previously measured here: essentially ALL non-thumb
+            # fingertips (index/middle/ring/pinky *_DP), sustained for
+            # ~95% of this state's ticks -- a real geometric overlap
+            # between the curl=0.5 fingers (inherited from
+            # WRIST_SIDE_GRASP_ALIGN's protective preshape) and the table
+            # at this state's target height, NOT a transient impact and
+            # NOT sensitive to standoff/y_offset (measured: identical
+            # force across standoff in {0.12..0.15}, y_offset in
+            # {0.15..0.18} -- ruling out palm XY position as the cause).
+            # Curling FURTHER during this state (toward
+            # side_descend_curl_target, holding wrist orientation and
+            # palm height/standoff/y_offset UNCHANGED) retracts the
+            # fingertips clear: measured 18.21N -> 2.96N (curl 0.5->0.95),
+            # with palm inward angle and finger-down angle BOTH improving
+            # into their Gate ranges as a side effect (fingers curled
+            # tighter naturally sit closer to the palm's own orientation
+            # cone). The remaining ~2.96N is NOT further reducible by
+            # more curl (0.95 vs 1.0 identical) or more settle time
+            # (measured unchanged after +100 extra ticks) -- a genuine,
+            # small, disclosed residual, safely under the shared 8N
+            # forbidden-collision limit but not exactly the ideal 0N.
             if self._state_step == 0:
                 self._descend_stable_streak = 0
                 self._side_descend_start = {s: self.env.palm_pose(s)[0].copy() for s in SIDES}
@@ -1164,22 +1214,18 @@ class SharpaBimanualGraspExpert:
                 self._apply_ik_result(result)
             action[0:3] = self._waist_action_toward_target()
             action[3:17] = self._arm_action_toward_target()
+            curl_now = self.env._group_synergy.copy()
+            curl_target = np.array([0.0, cfg.side_descend_curl_target, cfg.side_descend_curl_target,
+                                     cfg.side_descend_curl_target] * 2)
+            curl_scale = self.env.config.hand_synergy_action_scale
+            curl_delta = np.clip(curl_target - curl_now, -curl_scale, curl_scale)
+            action[17:25] = curl_delta / max(curl_scale, 1e-9)
             left_pos = self.env.palm_pose("left")[0]
             right_pos = self.env.palm_pose("right")[0]
             pos_err = max(float(np.linalg.norm(self._side_descend_final["left"] - left_pos)),
                           float(np.linalg.norm(self._side_descend_final["right"] - right_pos)))
             hand_table_force = self.env._hand_table_contact_force()
             self.max_hand_table_force_n = max(self.max_hand_table_force_n, hand_table_force)
-            # [This session] Measured (scripts/diagnose_side_grasp_swept_path.py)
-            # a REAL, repeated (not single-tick-transient) hand<->table
-            # force up to ~18N during this state's later waypoints, well
-            # over the 8N limit -- honestly fail-fast on it (matching
-            # WRIST_SIDE_GRASP_ALIGN's own treatment) instead of letting
-            # it get silently absorbed into a generic timeout. A bounded
-            # (curl fraction, height) candidate search did not clear it
-            # without cost elsewhere (higher curl reintroduced a table hit
-            # earlier, during WRIST_SIDE_GRASP_ALIGN itself) -- disclosed
-            # as the current next blocker, not force-fixed here.
             if hand_table_force > cfg.hand_hand_force_limit_n:
                 self._fail(BimanualFailureReason.HAND_TABLE_COLLISION)
                 return action
@@ -1234,7 +1280,21 @@ class SharpaBimanualGraspExpert:
                 }
                 lR = self.env.palm_pose("left")[1].copy()
                 rR = self.env.palm_pose("right")[1].copy()
-                result = self._solve_both(targets, {"left": lR, "right": rR}, require_orientation=False, ori_task_weight=0.05)
+                # [This session] FIX: this call was missing rest_q/rest_gain
+                # entirely, silently defaulting to _solve_both's fallback
+                # (the STALE stand-pose self._rest_q) instead of the
+                # clearance posture every OTHER state in this file biases
+                # toward. Never exercised before this session (this state
+                # was never reached -- FOREARM_SIDE_DESCEND always failed
+                # first). Measured (this session): with the stale rest_q,
+                # the redundant 17-DOF solver picks a torso-colliding
+                # branch for this final small inward move (peak 83.17N
+                # torso-arm force, also correlating with an 11.83N hand-
+                # table force) -- passing rest_q=self._clearance_target
+                # (matching WRIST_SIDE_GRASP_ALIGN/FOREARM_SIDE_DESCEND's
+                # own convention exactly) drops BOTH to 0.00N.
+                result = self._solve_both(targets, {"left": lR, "right": rR}, require_orientation=False,
+                                           ori_task_weight=0.05, rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain)
                 self._apply_ik_result(result)
             action[0:3] = self._waist_action_toward_target()
             action[3:17] = self._arm_action_toward_target()
@@ -1280,7 +1340,21 @@ class SharpaBimanualGraspExpert:
                 self._precontact_final_pos_error = {"left": left_pos_err, "right": right_pos_err}
                 self._precontact_final_ori_error_deg = {"left": left_ori_err, "right": right_ori_err}
 
+                # [This session] torso-arm/hand-table were NOT checked here
+                # at all before this session (this state was never
+                # reached) -- added alongside the rest_q fix above as a
+                # real safety net, matching every earlier state's own
+                # no_collision convention, not just relying on the rest_q
+                # bias never being defeated.
                 no_hand_hand = self.env._hand_hand_contact_force() <= cfg.hand_hand_force_limit_n
+                no_torso_arm = self.env._torso_arm_collision_force() <= cfg.hand_hand_force_limit_n
+                no_hand_table = self.env._hand_table_contact_force() <= cfg.hand_hand_force_limit_n
+                if not no_torso_arm:
+                    self._fail(BimanualFailureReason.SELF_COLLISION_TORSO_ARM)
+                    return action
+                if not no_hand_table:
+                    self._fail(BimanualFailureReason.HAND_TABLE_COLLISION)
+                    return action
                 stable_now = (
                     left_pos_err <= cfg.ik_pos_tol and right_pos_err <= cfg.ik_pos_tol
                     and left_ori_err <= cfg.precontact_ori_tol_deg and right_ori_err <= cfg.precontact_ori_tol_deg

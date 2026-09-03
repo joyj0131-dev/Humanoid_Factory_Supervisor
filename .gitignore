@@ -49,6 +49,7 @@ results/precontact_gap/
 results/forward_reach_gap/
 results/side_grasp_swept_path/
 results/side_grasp_pose/
+results/hand_table_contact_geometry/
 results/session41_visual_before/
 results/session41_visual_after/
 results/session42_before/
