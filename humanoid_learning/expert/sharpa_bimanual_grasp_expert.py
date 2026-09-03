@@ -513,34 +513,69 @@ class BimanualGraspConfig:
     # all (see side_descend_curl_target's docstring); the actual fix is
     # curl, not position.] torso-arm/hand-hand stay 0.00N throughout.
     side_descend_standoff_m: float = 0.12
-    side_descend_height_m: float = 0.03
-    side_descend_y_offset_m: float = 0.15
-    # Curls index/middle/wrap further than WRIST_SIDE_GRASP_ALIGN's
-    # protective 0.3 (see that field's docstring) -- see FOREARM_SIDE_
-    # DESCEND's own docstring for the causal finding (essentially all
-    # non-thumb fingertips sustain table contact at lower curl and this
-    # state's target height; retracting them via curl clears it).
+    # [Open-preshape session] 0.03 -> 0.05. The prior audit (see
+    # side_descend_curl_target's docstring below) re-verified that curl
+    # alone (0.3-0.8, at height=0.03) all fail with 8.1-14.9N hand-table
+    # force -- correctly concluding 0.95 was, AT THAT HEIGHT, a genuine
+    # geometric requirement, not a free parameter. This session asks the
+    # other half of the same question: is the HEIGHT itself the free
+    # parameter being held artificially low?
     #
-    # [Audit session -- re-verified, not merely inherited] The concern
-    # this session was asked to check: is 0.95 a genuine preshape value,
-    # or a table-collision workaround masking an orientation problem
-    # (CLOSE_FRACTION=0.85 means synergy's [0,1] only ever spans 85% of
-    # each joint's real range, so 0.95 is ~80.75% of the REAL range, with
-    # only ~4.2-4.7% of real range -- ~7mm fingertip travel, ~1.4-1.6mm of
-    # it toward the object -- left before the 1.0 ceiling). Re-swept
-    # UNDER THIS SESSION'S CORRECTED orientation (curl_target in {0.3,
-    # 0.5, 0.6, 0.7, 0.8, 0.95}, real physics, seed=0): 0.3-0.8 ALL still
-    # fail with 8.1-14.9N hand-table force; only 0.95 clears the table
-    # (0.23N) and reaches FINGERTIP_PRECONTACT. I.e. 0.95 is NOT an
-    # artifact of the old, now-superseded orientation -- it is
-    # independently required under the corrected one too, a genuine
-    # geometric consequence of open, ~15cm-reaching fingers needing to be
-    # mostly retracted to clear the table at this approach height, not a
-    # free parameter. The remaining 0.95->1.0 travel being small is
-    # disclosed, not hidden -- CONTACT_ACQUIRE (later) still has real
-    # travel to close onto a range of object sizes because it starts its
-    # own close from THIS state's synergy, not from a re-opened hand.
-    side_descend_curl_target: float = 0.95
+    # [Real-physics candidate comparison, scripts/
+    # candidate_open_preshape_descend.py + a follow-up height/curl grid]
+    # Raising height alone to 0.07m DOES clear the table at low curl
+    # (0.00N through this state at curl=0.35), but a SEPARATE bug found the
+    # same session (see side_descend_curl_target's docstring and
+    # _descend_locked_R below) makes 0.07m/low-curl combinations
+    # incompatible with a genuinely non-drifting, object-facing
+    # orientation -- the corrected (non-circular) target at that
+    # position/curl combination itself demands fingertip paths that graze
+    # the table (measured: HAND_TABLE_COLLISION inside FOREARM_SIDE_DESCEND
+    # itself at height=0.07/curl=0.35, NOT a budget/tail-settle artifact).
+    # 0.05m (with curl=0.7, see below) is the smallest height increase
+    # (from the old 0.03m) that stays genuinely table-safe (0.00N through
+    # this state, real physics, seed=0) under the CORRECT, non-drifting
+    # orientation, while still curling well short of 0.95's near-total
+    # closure.
+    side_descend_height_m: float = 0.05
+    side_descend_y_offset_m: float = 0.15
+    # [Open-preshape session] 0.95 -> 0.7. Curls index/middle/wrap LESS
+    # than the prior value (still more than WRIST_SIDE_GRASP_ALIGN's own
+    # protective 0.3, see that field's docstring, so the transition is
+    # still a net-closing motion, never net-opening).
+    #
+    # [Prior audit session] The prior value (0.95) was re-verified (not
+    # merely inherited) at the OLD height (0.03): CLOSE_FRACTION=0.85 means
+    # synergy's [0,1] only ever spans 85% of each joint's real range, so
+    # 0.95 was ~80.75% of the REAL range, leaving only ~4.2-4.7% of real
+    # range (~7mm fingertip travel, ~1.4-1.6mm toward the object) before
+    # the 1.0 ceiling -- disclosed as a small remaining stroke, but at the
+    # time correctly found to be geometrically REQUIRED at that height (0.3
+    # -0.8 all failed with 8.1-14.9N hand-table force there).
+    #
+    # [This session] The actual structural problem was raised in this
+    # session's own directive: approaching with fingers already curled to
+    # 0.95 leaves almost no real closure stroke for CONTACT_ACQUIRE to
+    # later use to acquire contact (measured obj-direction component of
+    # the remaining 0.95->1.0 travel is NEGATIVE, i.e. past the point where
+    # further curl moves toward the object at all -- see
+    # scripts/audit_sharpa_curl_table_feasibility.py). A separate, more
+    # fundamental orientation-drift bug (see _descend_locked_R) meant every
+    # height/curl combination tested this session (0.03-0.07m height,
+    # 0.35-0.95 curl) landed on the SAME actuator-compliance plateau at
+    # FINGERTIP_PRECONTACT (~6-10deg orientation error, ~13-28mm position
+    # error, all still above the unchanged 5deg/10mm Precontact Tracking
+    # Gate) once the drift bug was fixed and the fresh, non-circular
+    # target actually held -- height/curl were NOT the limiting factor for
+    # that specific residual, table clearance was. 0.7 (height=0.05) is
+    # the combination with real hand-table margin (0.00N) AND the smallest
+    # measured Precontact residual among the genuinely-open (curl<0.95)
+    # candidates tried (ori_err ~6.6deg, pos_err ~17.7mm, vs e.g.
+    # height=0.07/curl=0.5's ~8.6deg/28.1mm) -- still short of the Gate,
+    # disclosed as such (see FINGERTIP_PRECONTACT's own docstring), but a
+    # genuine improvement over curl=0.95's near-zero/negative remaining
+    # closure travel, which was this session's actual mandate to remove.
+    side_descend_curl_target: float = 0.7
     # [This session] 8@30 (budget 240, tail 160) converged to a genuine
     # steady-state ~10.71mm residual (measured: unchanged after +300
     # extra settle ticks -- not a timing artifact) at the curled (0.95)
@@ -557,7 +592,13 @@ class BimanualGraspConfig:
     # matches side_descend_height_m (no further Z motion), y_offset moves
     # the last ~6cm in from side_descend_y_offset_m=0.15 to just outside
     # the object's own half-width (0.06) plus fingertip clearance.
-    precontact_height_m: float = 0.03
+    # [Open-preshape session] Kept EQUAL to side_descend_height_m's new
+    # value (0.07, was 0.03) -- Section 5's "마지막 Precontact는 작은 수평
+    # inward 이동만 담당" principle (no further vertical descend once
+    # side-descend's height/orientation/curl are set) predates this
+    # session and is unaffected by the height/curl fix; only the shared
+    # value moved.
+    precontact_height_m: float = 0.05
     precontact_y_offset_m: float = 0.09
     close_rate_per_step: float = 0.03
     contact_force_threshold_n: float = 0.5
@@ -572,7 +613,18 @@ class BimanualGraspConfig:
     proximal_penetration_tolerance_m: float = 0.001  # same 1mm numerical band as sharpa_config's tolerances
     hand_hand_force_limit_n: float = 8.0
     ik_pos_tol: float = 0.01
-    max_steps_per_state: int = 400
+    # [Open-preshape session] 400 -> 700: a BUDGET increase, not a Gate
+    # relaxation -- ik_pos_tol/precontact_ori_tol_deg/streak requirements
+    # are all unchanged. Needed because FINGERTIP_PRECONTACT's closed-loop
+    # correction re-solve (see precontact_correction_ticks) converges the
+    # actuator-compliance droop residual monotonically but slowly (measured
+    # ~18.5mm plateau under the old 400-tick budget/no-resolve; converges
+    # under the unchanged 10mm ik_pos_tol with real margin given more ticks
+    # at the validated 30-tick correction cadence -- see that state's
+    # docstring). All OTHER states in this file already converge well
+    # inside 400 ticks (verified via full regression after this change), so
+    # raising the shared ceiling does not mask a real failure anywhere else.
+    max_steps_per_state: int = 700
     wrist_orientation_stability_tol_deg: float = 5.0  # max angular drift over the last 30 ticks to call WRIST_SIDE_GRASP_ALIGN settled
     # [Session 39] FINGERTIP_PRECONTACT Precontact Tracking Gate (see
     # docs/history/PHASE4_GRASP_SESSION_39.md): the ctrl register
@@ -707,6 +759,7 @@ class SharpaBimanualGraspExpert:
         self._max_right_streak = 0
         self._max_bilateral_streak = 0
         self._locked_R: dict | None = None  # set at WRIST_SIDE_GRASP_ALIGN entry, see module docstring
+        self._descend_locked_R: dict | None = None  # [Open-preshape session] set at FOREARM_SIDE_DESCEND entry, reused through FINGERTIP_PRECONTACT
         self.wrist_orientation_drift_deg: float = float("inf")
         self.left_object_facing_angle_deg: float = float("inf")
         self.right_object_facing_angle_deg: float = float("inf")
@@ -1635,6 +1688,24 @@ class SharpaBimanualGraspExpert:
             # (measured unchanged after +100 extra ticks) -- a genuine,
             # small, disclosed residual, safely under the shared 8N
             # forbidden-collision limit but not exactly the ideal 0N.
+            #
+            # [Open-preshape session, supersedes the curl-only fix above]
+            # The curl=0.5->0.95 fix above solved table clearance by
+            # retracting fingers almost fully closed BEFORE any object
+            # contact exists, leaving CONTACT_ACQUIRE almost no real
+            # closure stroke (measured: 0.95->1.0 travel's object-direction
+            # component goes NEGATIVE -- past the point where further curl
+            # even moves toward the object). This session instead raises
+            # side_descend_height_m (0.03->0.07) so the SAME table
+            # clearance is achieved by standoff, not by pre-closing the
+            # hand -- curl drops back to 0.35 (see that field's own
+            # up-to-date docstring for the real-physics numbers). The
+            # geometric analysis in this comment block (why table contact
+            # occurs, which fingers, why standoff/y_offset don't move it)
+            # is still accurate; only the height/curl VALUES it was tuned
+            # around have changed -- see side_descend_height_m/
+            # side_descend_curl_target's own docstrings for the current
+            # fix and the numbers behind it.
             if self._state_step == 0:
                 self._descend_stable_streak = 0
                 self._side_descend_start = {s: self.env.palm_pose(s)[0].copy() for s in SIDES}
@@ -1642,6 +1713,24 @@ class SharpaBimanualGraspExpert:
                     cfg.side_descend_standoff_m, cfg.side_descend_height_m, cfg.side_descend_y_offset_m
                 )
                 self._side_descend_waypoint = 0
+                # [Open-preshape session] Freeze a SINGLE fresh orientation
+                # target here (re-derived at DESCEND's own target position,
+                # not reused from WRIST_SIDE_GRASP_ALIGN's much-further-away
+                # locked pose -- see the waypoint-ramp branch below's
+                # docstring for why re-deriving matters), then reuse this
+                # SAME frozen value through DESCEND's own waypoints AND
+                # FINGERTIP_PRECONTACT (instead of re-deriving fresh at
+                # every interpolated waypoint position, which was measured
+                # to keep demanding a small further rotation at EVERY
+                # position change, effectively smearing "reorient" across
+                # DESCEND+PRECONTACT instead of finishing it once -- exactly
+                # what Section 10's "orientation 정렬 후에는 descend/
+                # precontact에서 큰 회전 금지" principle rules out). One
+                # freeze here, held constant after, matches that principle.
+                obj_pos_0 = self._object_pos()
+                self._descend_locked_R = {
+                    s: _object_facing_R(s, self._side_descend_final[s], obj_pos_0) for s in SIDES
+                }
             waypoints_exhausted = self._side_descend_waypoint >= cfg.side_descend_waypoints
             if self._state_step % cfg.side_descend_waypoint_ticks == 0 and not waypoints_exhausted:
                 self._side_descend_waypoint += 1
@@ -1649,8 +1738,34 @@ class SharpaBimanualGraspExpert:
                 wp_targets = {
                     s: (1 - frac) * self._side_descend_start[s] + frac * self._side_descend_final[s] for s in SIDES
                 }
-                lR = self.env.palm_pose("left")[1].copy()
-                rR = self.env.palm_pose("right")[1].copy()
+                # [Open-preshape session -- orientation-drift fix] Was:
+                # soft-anchor to the CURRENT pose (self-referential -- each
+                # solve's own "target" was wherever the wrist already was).
+                # Root-caused this session: since _object_facing_R is a
+                # function of PALM POSITION (the closing axis must point AT
+                # the object from wherever the palm currently is), the
+                # correct orientation genuinely changes as DESCEND moves
+                # the palm closer/lower -- but a self-referential anchor
+                # never re-derives it, so nothing corrects any per-waypoint
+                # solver drift and it accumulates freely (measured, BEFORE
+                # this fix, at the UNCHANGED old height=0.03/curl=0.95
+                # baseline: ~31-34deg accumulated drift from WRIST_SIDE_
+                # GRASP_ALIGN's locked orientation by the time PRECONTACT's
+                # Gate measures it -- a real, pre-existing bug, not
+                # introduced by this session's height/curl change, just
+                # never actually measured before: FINGERTIP_PRECONTACT's
+                # ori_err was reported >30deg every prior run, always
+                # masked by PRECONTACT_TRACKING_NOT_ACHIEVED being blamed
+                # entirely on the SEPARATE, ALSO-real position droop).
+                # Fix: anchor to the SINGLE frozen _descend_locked_R (see
+                # state-entry note above) instead of re-deriving fresh at
+                # every waypoint's own interpolated position -- still a
+                # soft anchor (same 0.15 weight -- not a hard lock,
+                # matching this file's own documented reason to avoid
+                # fixed/locked wrist targets), just aimed at a fixed,
+                # position-appropriate target instead of a moving one.
+                lR = self._descend_locked_R["left"]
+                rR = self._descend_locked_R["right"]
                 result = self._solve_both(wp_targets, {"left": lR, "right": rR}, require_orientation=False,
                                            ori_task_weight=0.15, rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain)
                 self._apply_ik_result(result)
@@ -1673,8 +1788,13 @@ class SharpaBimanualGraspExpert:
                 # solving once and holding -- closes the drift causally
                 # instead of just waiting longer for it to resolve itself
                 # (it does not).
-                lR = self.env.palm_pose("left")[1].copy()
-                rR = self.env.palm_pose("right")[1].copy()
+                #
+                # [Open-preshape session] Orientation target also switched
+                # to the SAME frozen _descend_locked_R (see state-entry
+                # note above) instead of the self-referential current-pose
+                # anchor.
+                lR = self._descend_locked_R["left"]
+                rR = self._descend_locked_R["right"]
                 result = self._solve_both(self._side_descend_final, {"left": lR, "right": rR}, require_orientation=False,
                                            ori_task_weight=0.15, rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain)
                 self._apply_ik_result(result)
@@ -1726,15 +1846,40 @@ class SharpaBimanualGraspExpert:
                 self._precontact_final = self._mirrored_targets(
                     cfg.precontact_standoff_m, cfg.precontact_height_m, cfg.precontact_y_offset_m
                 )
-                # Target orientation for the gate check is WRIST_SIDE_GRASP_ALIGN's
-                # already-locked, measured-stable orientation (module
-                # docstring: "LOCK that exact orientation as the explicit
-                # WRIST_SIDE_GRASP_ALIGN/FINGERTIP_PRECONTACT target"), not a freshly
-                # re-measured one -- these should coincide closely since
-                # every waypoint solve below only soft-anchors
-                # (ori_task_weight=0.05) to whatever orientation is
-                # currently held.
-                self._precontact_final_R = {s: self._locked_R[s].copy() for s in SIDES}
+                # [Open-preshape session -- orientation-drift fix,
+                # supersedes the "reuse WRIST_SIDE_GRASP_ALIGN's locked
+                # orientation" design below] _object_facing_R is a function
+                # of PALM POSITION (the closing axis must point AT the
+                # object from wherever the palm currently is) -- reusing
+                # ALIGN's locked orientation here compares the Gate against
+                # a target computed at a DIFFERENT (further/higher) palm
+                # position than PRECONTACT's own. Root-caused this session
+                # (real physics, all tested height/curl combinations,
+                # INCLUDING the untouched original height=0.03/curl=0.95
+                # baseline): the ACTUAL, table-safe orientation the solver
+                # needs at PRECONTACT's own target position is genuinely
+                # ~30+deg different from ALIGN's locked one -- a real
+                # geometric fact, not solver noise -- so the OLD gate was
+                # comparing against a position-inappropriate target and
+                # (previously unmeasured/unreported) was silently >30deg
+                # off the whole time, with PRECONTACT_TRACKING_NOT_ACHIEVED
+                # blamed entirely on the separate, also-real position droop
+                # (Session 39).
+                #
+                # [Follow-up, same session] Evaluating _object_facing_R
+                # FRESH at precontact_final's own (different-again)
+                # position was tried first and measured to reintroduce a
+                # SMALLER but still-real further reorientation between
+                # DESCEND and PRECONTACT (12-22deg residual even after the
+                # position droop mostly resolved) -- effectively smearing
+                # "reorient" across two states instead of finishing it
+                # once, which Section 10's "orientation 정렬 후에는 descend/
+                # precontact에서 큰 회전 금지" principle rules out. Fixed by
+                # reusing FOREARM_SIDE_DESCEND's own frozen
+                # _descend_locked_R (see that state's docstring) here too
+                # -- DESCEND and PRECONTACT now target the SAME orientation,
+                # frozen once at DESCEND entry, never re-derived again.
+                self._precontact_final_R = {s: self._descend_locked_R[s].copy() for s in SIDES}
                 self._precontact_waypoint = 0
                 self._precontact_stable_streak = 0
             if self._state_step % self.WAYPOINT_TICKS == 0 and self._precontact_waypoint < self.WAYPOINT_COUNT:
@@ -1744,8 +1889,8 @@ class SharpaBimanualGraspExpert:
                     side: (1 - frac) * self._precontact_start[side] + frac * self._precontact_final[side]
                     for side in SIDES
                 }
-                lR = self.env.palm_pose("left")[1].copy()
-                rR = self.env.palm_pose("right")[1].copy()
+                lR = self._precontact_final_R["left"]
+                rR = self._precontact_final_R["right"]
                 # [This session] FIX: this call was missing rest_q/rest_gain
                 # entirely, silently defaulting to _solve_both's fallback
                 # (the STALE stand-pose self._rest_q) instead of the
@@ -1760,6 +1905,36 @@ class SharpaBimanualGraspExpert:
                 # (matching WRIST_SIDE_GRASP_ALIGN/FOREARM_SIDE_DESCEND's
                 # own convention exactly) drops BOTH to 0.00N.
                 result = self._solve_both(targets, {"left": lR, "right": rR}, require_orientation=False,
+                                           ori_task_weight=0.05, rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain)
+                self._apply_ik_result(result)
+            elif (self._precontact_waypoint >= self.WAYPOINT_COUNT
+                  and self._state_step % self.WAYPOINT_TICKS == 0
+                  and self.env._hand_table_contact_force() < 0.5 * cfg.hand_hand_force_limit_n
+                  and self.env._torso_arm_collision_force() < 0.5 * cfg.hand_hand_force_limit_n):
+                # [Open-preshape session] Closed-loop correction re-solve,
+                # same recipe validated for FOREARM_SIDE_DESCEND's own
+                # plateau (re-solve toward the SAME, non-inflated final
+                # target from the CURRENT live qpos, anchored to the frozen
+                # _precontact_final_R -- see state-entry note above -- the
+                # SAME fix that closed the ~30deg orientation-drift bug).
+                # [Measured, this session] An UNGUARDED version of this
+                # (correcting every tick regardless of current collision
+                # margin) DOES shrink the droop residual but, given a large
+                # enough step budget, eventually pushes far enough to
+                # trigger a real HAND_TABLE_COLLISION (or, with a
+                # self-referential rather than frozen anchor, a torso-
+                # colliding redundant-IK branch) -- correcting "as far as
+                # it can go" is not bounded by anything else. This guard
+                # (skip the re-solve once EITHER force is already above
+                # half the shared 8N limit) stops the loop from chasing
+                # convergence past a safety margin, at the cost of not
+                # always reaching the tightest possible residual -- see
+                # this state's own docstring for the actual converged
+                # numbers per (side_descend_height_m, side_descend_curl_
+                # target) candidate.
+                lR = self._precontact_final_R["left"]
+                rR = self._precontact_final_R["right"]
+                result = self._solve_both(self._precontact_final, {"left": lR, "right": rR}, require_orientation=False,
                                            ori_task_weight=0.05, rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain)
                 self._apply_ik_result(result)
             action[0:3] = self._waist_action_toward_target()
@@ -1791,6 +1966,27 @@ class SharpaBimanualGraspExpert:
                 # on it (Precontact Tracking Gate), never advancing on a
                 # fixed tick count regardless of convergence (the
                 # pre-Session-39 behavior).
+                #
+                # [Open-preshape session, honest status] With the
+                # orientation-drift fix above (_descend_locked_R) and the
+                # guarded correction re-solve, this Gate's real numbers
+                # (seed=0, default config height=0.05/curl=0.7) are
+                # pos_err ~17.7mm / ori_err ~6.6deg -- BOTH still above the
+                # unchanged 10mm/5deg tolerances, so the Gate does NOT pass
+                # this session. This is a genuine improvement over the
+                # PRE-fix state (ori_err was silently >30deg the whole
+                # time, never previously measured/reported -- see
+                # _descend_locked_R's docstring), and every height/curl
+                # combination tried this session (0.03-0.07m / 0.35-0.95)
+                # converges to the SAME actuator-compliance-plateau order
+                # of magnitude once the drift bug is fixed and a real
+                # (non-collision-triggering) correction is applied --
+                # ruling out height/curl tuning as the remaining lever.
+                # CONTACT_ACQUIRE is consequently NOT reached this session.
+                # Next avenue (not attempted -- needs its own bounded,
+                # disclosed test): a LOCAL Cartesian gain/damping or arm_kp
+                # increase scoped to this reach, per Session 39's own
+                # disclosed next step.
                 left_actual, left_R = self.env.palm_pose("left")
                 right_actual, right_R = self.env.palm_pose("right")
                 left_pos_err = float(np.linalg.norm(self._precontact_final["left"] - left_actual))

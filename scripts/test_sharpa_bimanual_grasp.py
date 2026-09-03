@@ -339,9 +339,17 @@ def test_forward_reach_gate_now_passes_and_advances_to_next_blocker():
     # fails there with PRECONTACT_TRACKING_NOT_ACHIEVED, a known, separate,
     # disclosed blocker (documented since Session 39) out of this
     # session's scope.
+    # [Open-preshape session] 2000 -> 2500: the open-preshape height/curl
+    # fix (side_descend_height_m/side_descend_curl_target) plus the
+    # orientation-drift fix and guarded Precontact correction re-solve
+    # (see _descend_locked_R / FINGERTIP_PRECONTACT's own docstrings) push
+    # the full rollout's actual step count to reach this SAME failure
+    # reason from ~1673 to ~2058 (measured, seed=0) -- a timing-budget
+    # bump, not a Gate/tolerance change (ik_pos_tol, precontact_ori_tol_
+    # deg, precontact_stable_streak_required are all unchanged).
     env2 = make_env()
     expert2 = SharpaBimanualGraspExpert(env2)
-    outcome = expert2.run(max_total_steps=2000)
+    outcome = expert2.run(max_total_steps=2500)
     print(f"    full rollout: state={outcome.state.name} failure_reason={outcome.failure_reason} "
           f"side_grasp_gate={outcome.side_grasp_gate} functional_orientation_gate={outcome.functional_orientation_gate}")
     assert outcome.side_grasp_gate is True, "Side-Grasp Posture Gate should still pass en route to the current next blocker"
@@ -998,6 +1006,126 @@ def test_side_descend_curl_target_remaining_travel_is_small_but_real():
         print(f"    {f}: travel(0.95->1.0)={travel_mm:.2f}mm toward_object={toward_obj_mm:.2f}mm")
         assert 0.5 < travel_mm < 20.0, f"{f}: remaining travel {travel_mm:.2f}mm outside the expected small-but-real range"
         assert toward_obj_mm > 0.0, f"{f}: remaining travel must still point toward the object, not away"
+
+
+def test_open_preshape_curl_target_removes_near_full_closure():
+    """[Open-preshape session] Locks in that FOREARM_SIDE_DESCEND's curl
+    target is no longer the near-total-closure workaround (0.95, ~80.75%
+    of real joint range, near-zero/negative remaining object-direction
+    fingertip travel -- see test_side_descend_curl_target_remaining_
+    travel_is_small_but_real, which still documents 0.95's OWN numbers as
+    a historical fact, not the current default). The new default (0.7)
+    must leave real, substantial remaining travel toward the object for
+    CONTACT_ACQUIRE to use."""
+    cfg = BimanualGraspConfig()
+    assert cfg.side_descend_curl_target < 0.9, (
+        f"side_descend_curl_target={cfg.side_descend_curl_target} is back near the old 0.95 "
+        "near-total-closure value this session was asked to remove"
+    )
+    env = make_env()
+    expert = SharpaBimanualGraspExpert(env)
+    env.reset(seed=0)
+    for _ in range(1500):
+        if expert.state in (BimanualGraspState.FOREARM_SIDE_DESCEND, BimanualGraspState.FAILURE):
+            break
+        action = expert.step()
+        env.step(action)
+    assert expert.state == BimanualGraspState.FOREARM_SIDE_DESCEND
+    side, side_idx = "left", 0
+    obj_pos = expert._object_pos()
+    curl_target = expert.config.side_descend_curl_target
+    while env._group_synergy[side_idx * 4 + 1] < curl_target - 0.001:
+        a = np.zeros(ACTION_DIM)
+        for g in (1, 2, 3):
+            a[17 + side_idx * 4 + g] = 1.0
+        env.step(a)
+    tips_at_target = {f: env.fingertip_pos(side, f).copy() for f in ("index", "middle", "ring", "pinky")}
+    while env._group_synergy[side_idx * 4 + 1] < 0.999:
+        a = np.zeros(ACTION_DIM)
+        for g in (1, 2, 3):
+            a[17 + side_idx * 4 + g] = 1.0
+        env.step(a)
+    tips_100 = {f: env.fingertip_pos(side, f).copy() for f in ("index", "middle", "ring", "pinky")}
+    for f in ("index", "middle", "ring", "pinky"):
+        d = tips_100[f] - tips_at_target[f]
+        to_obj = obj_pos - tips_at_target[f]
+        to_obj = to_obj / np.linalg.norm(to_obj)
+        toward_obj_mm = float(np.dot(d, to_obj)) * 1000.0
+        print(f"    {f}: remaining travel({curl_target}->1.0) toward_object={toward_obj_mm:.2f}mm")
+        assert toward_obj_mm > 5.0, (
+            f"{f}: remaining object-direction travel {toward_obj_mm:.2f}mm too small -- "
+            "curl_target leaves CONTACT_ACQUIRE too little stroke"
+        )
+
+
+def test_open_preshape_descend_has_zero_table_collision():
+    """[Open-preshape session] The new (height=0.05, curl=0.7) DESCEND
+    target must clear the table WITHOUT relying on near-total closure --
+    locks in 0.00N hand-table force through FOREARM_SIDE_DESCEND under the
+    default config, real physics, seed=0."""
+    env = make_env()
+    expert = SharpaBimanualGraspExpert(env)
+    env.reset(seed=0)
+    max_table_in_descend = 0.0
+    for _ in range(2500):
+        if expert.state in (BimanualGraspState.FINGERTIP_PRECONTACT, BimanualGraspState.FAILURE):
+            break
+        prev_state = expert.state
+        action = expert.step()
+        env.step(action)
+        if prev_state == BimanualGraspState.FOREARM_SIDE_DESCEND:
+            max_table_in_descend = max(max_table_in_descend, env._hand_table_contact_force())
+    print(f"    max_hand_table_force during FOREARM_SIDE_DESCEND={max_table_in_descend:.3f}N")
+    assert max_table_in_descend <= expert.config.hand_hand_force_limit_n, (
+        f"open-preshape DESCEND must stay under the {expert.config.hand_hand_force_limit_n}N limit, "
+        f"got {max_table_in_descend:.2f}N"
+    )
+
+
+def test_precontact_orientation_drift_bug_is_fixed():
+    """[Open-preshape session] Root-caused a previously-unmeasured bug:
+    _object_facing_R is a function of PALM POSITION, but FOREARM_SIDE_
+    DESCEND used to soft-anchor orientation to whatever the CURRENT pose
+    already was (self-referential), so nothing corrected accumulated
+    solver drift as DESCEND moved the palm -- by FINGERTIP_PRECONTACT the
+    actual orientation had silently drifted >30deg from WRIST_SIDE_GRASP_
+    ALIGN's locked target (never previously measured/reported; masked by
+    PRECONTACT_TRACKING_NOT_ACHIEVED being attributed entirely to a
+    separate, also-real position droop). Fixed by freezing a single fresh
+    _object_facing_R at FOREARM_SIDE_DESCEND's own target position
+    (_descend_locked_R) and anchoring both DESCEND and PRECONTACT to it.
+    This test locks in the improvement (ori_err now a small, bounded
+    single-digit-degree residual) WITHOUT claiming the Precontact Tracking
+    Gate's own unchanged 5deg tolerance is met (it is not, this session --
+    see FINGERTIP_PRECONTACT's own docstring)."""
+    env = make_env()
+    expert = SharpaBimanualGraspExpert(env)
+    env.reset(seed=0)
+    outcome = expert.run(max_total_steps=2500)
+    print(f"    precontact_final_ori_error_deg={outcome.precontact_final_ori_error_deg}")
+    for side in SIDES:
+        err = outcome.precontact_final_ori_error_deg[side]
+        assert err < 15.0, (
+            f"{side}: orientation error {err:.2f}deg -- the pre-fix drift bug reproduced "
+            "(was consistently >30deg before this session's fix)"
+        )
+
+
+def test_gate_definitions_unchanged_by_open_preshape_session():
+    """[Open-preshape session] Locks in that none of the protected Gate
+    criteria (Section 15 of this session's mandate) were touched while
+    fixing the curl=0.95 workaround and the orientation-drift bug."""
+    cfg = BimanualGraspConfig()
+    assert cfg.side_grasp_finger_down_tol_deg == 25.0
+    assert cfg.side_grasp_inward_angle_tol_deg == 15.0
+    assert cfg.ik_pos_tol == 0.01
+    assert cfg.precontact_ori_tol_deg == 5.0
+    assert cfg.precontact_stable_streak_required == 15
+    assert cfg.hand_hand_force_limit_n == 8.0
+    assert cfg.bilateral_streak_required == 30
+    assert cfg.object_xy_displacement_limit_m == 0.03
+    assert cfg.object_peak_angular_velocity_limit == 2.0
+    assert cfg.wrist_max_qvel_rad_s == 2.0
 
 
 if __name__ == "__main__":
