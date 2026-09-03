@@ -203,16 +203,47 @@ class BimanualGraspConfig:
     # measured table-clearance margin.
     approach_height_m: float = 0.22
     approach_y_offset_m: float = 0.15
-    # [Session 41] FOREARM_DESCEND target height -- between approach_
-    # height_m (0.22) and precontact_height_m (0.09): shoulder/elbow do
-    # the big vertical descent here so FINGERTIP_PRECONTACT's own
-    # waypoints (which follow WRIST_ALIGN) only need a few cm of final
-    # inward motion, matching the user's explicit requirement.
-    descend_height_m: float = 0.10
+    # [This session, user-directed geometry correction] FOREARM_DESCEND's
+    # target height used to stay well ABOVE the object (+0.10m above
+    # object center -- for a 12cm cube, still ~4cm above the TOP face),
+    # so shoulder/elbow visibly lowered the hand down onto/over the block
+    # instead of beside it. Live-viewer feedback: both palms must end up
+    # LEVEL with the object, approaching from the side, not descending
+    # onto the top. approach_height_m (0.22, well above the table) is
+    # unchanged -- that is a lateral-transit clearance height, not a
+    # grasp height (see its own docstring).
+    #
+    # height=0.0 (exactly the object's center Z) was tried first and
+    # measured (bounded sweep {0.0, 0.02, 0.04, 0.06}, holding the ctrl
+    # target fixed well past the state timeout to read the TRUE
+    # steady-state, same method as FOREARM_FORWARD_REACH's fix) to be
+    # physically infeasible here: it drives the forearm into genuine,
+    # growing torso<->arm contact resistance (steady-state ~4.2N and
+    # still rising, pos_err plateauing at ~20mm, not a timing artifact --
+    # more waypoint/settle ticks do not help).
+    #
+    # A second bounded sweep over {0.045..0.07} (same waypointed descend,
+    # now smoothed with a quintic fraction schedule -- see
+    # DESCEND_WAYPOINTS below) found the collision peak is NON-monotonic
+    # in height across that whole band (0.045->8.43N, 0.05->11.25N,
+    # 0.055->11.70N, 0.06->7.93N, 0.065->7.49N, 0.07->6.71N) -- a real,
+    # sensitive geometric graze near the final waypoint, not something
+    # trajectory-shape tuning alone reliably clears with margin at 0.06.
+    # 0.07 is the value in the sweep with the most comfortable safety
+    # margin under the unchanged 8N torso-arm limit (peak 6.71N) while
+    # still being a real, disclosed improvement over the pre-session
+    # 0.09/0.10 (level with the object's top face + 1cm, not 3-4cm above
+    # it) -- collision margin, not "closer to literally 0", was the
+    # deciding factor once the two pulled against each other.
+    descend_height_m: float = 0.07
     forward_reach_stable_streak_required: int = 15
     descend_stable_streak_required: int = 15
     precontact_standoff_m: float = 0.08
-    precontact_height_m: float = 0.09
+    # [This session] same correction/trade-off as descend_height_m -- kept
+    # equal to it (both level with the object's top face) so FINGERTIP_
+    # PRECONTACT's own waypoints only move inward (standoff/Y), never
+    # back up in Z.
+    precontact_height_m: float = 0.07
     precontact_y_offset_m: float = 0.10
     close_rate_per_step: float = 0.03
     contact_force_threshold_n: float = 0.5
@@ -318,6 +349,35 @@ class SharpaBimanualGraspExpert:
     # jump (see module docstring's wrist-instability finding).
     APPROACH_ORI_WAYPOINTS = 4
     FORWARD_REACH_WAYPOINTS = 6  # [Session 41] see FOREARM_FORWARD_REACH: the clearance->approach Y swing (~0.46m -> 0.15m) needs several small steps, not one, to avoid a waist_pitch hard-limit
+    # [This session] FOREARM_FORWARD_REACH's waypoint spacing was
+    # `max_steps_per_state // FORWARD_REACH_WAYPOINTS` (=66 at the
+    # official max_steps_per_state=400), i.e. spending the ENTIRE state
+    # budget on waypoint progression and leaving only 400-330=70 ticks
+    # after the 6th/final waypoint to physically settle -- unlike
+    # FINGERTIP_PRECONTACT's WAYPOINT_TICKS=60 fixed spacing (4 waypoints,
+    # last at tick 180, leaving a 220-tick tail), even though this state's
+    # docstring explicitly claims to reuse "the identical recipe already
+    # proven for FINGERTIP_PRECONTACT". Root-caused with
+    # scripts/diagnose_forward_reach_gap.py (see docs/history for this
+    # session): holding the SAME final ctrl target fixed past the official
+    # 400-tick timeout, actual physics palm error keeps monotonically
+    # decreasing (qvel monotonically -> 0, no oscillation) from ~10.16mm
+    # at the official cutoff down to a genuine steady-state ~9.7-9.8mm
+    # asymptote, crossing under the unchanged 10mm gate by roughly
+    # total_step ~110 ticks after the final waypoint fires (~583 vs the
+    # official ~473+70=543 cutoff). A fixed, smaller per-waypoint tick
+    # count (independent of max_steps_per_state, matching the
+    # FINGERTIP_PRECONTACT convention) fires the final waypoint earlier and
+    # leaves enough physical settle tail within the SAME unchanged
+    # max_steps_per_state/ik_pos_tol/streak-length budget -- a waypoint-
+    # schedule bookkeeping fix, not a Gate relaxation.
+    FORWARD_REACH_WAYPOINT_TICKS = 40
+    # [This session] FOREARM_DESCEND's default (non-object-facing) branch
+    # -- see that state's docstring for the causal finding (a single-shot
+    # solve no longer settles once descend_height_m dropped to 0.0).
+    # Waypointed the same way as FORWARD_REACH_WAYPOINT_TICKS.
+    DESCEND_WAYPOINTS = 4
+    DESCEND_WAYPOINT_TICKS = 40
     APPROACH_ORI_WEIGHT_START = 0.05
     APPROACH_ORI_WEIGHT_END = 1.0
 
@@ -683,7 +743,7 @@ class SharpaBimanualGraspExpert:
                     cfg.approach_standoff_m, cfg.approach_height_m, cfg.approach_y_offset_m
                 )
                 self._forward_reach_waypoint = 0
-            ticks_per_wp = cfg.max_steps_per_state // self.FORWARD_REACH_WAYPOINTS
+            ticks_per_wp = self.FORWARD_REACH_WAYPOINT_TICKS
             if self._state_step % ticks_per_wp == 0 and self._forward_reach_waypoint < self.FORWARD_REACH_WAYPOINTS:
                 self._forward_reach_waypoint += 1
                 frac = self._forward_reach_waypoint / self.FORWARD_REACH_WAYPOINTS
@@ -757,12 +817,47 @@ class SharpaBimanualGraspExpert:
                                                rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain)
                     self._apply_ik_result(result)
             else:
+                # [This session] descend_height_m moved from +0.10 to 0.0
+                # (user-directed geometry correction, see that field's
+                # docstring) roughly DOUBLED this branch's single-shot
+                # vertical Cartesian jump (0.22->0.10, i.e. 12cm, to
+                # 0.22->0.0, i.e. 22cm). Measured (same diagnostic method
+                # as FOREARM_FORWARD_REACH's fix) this single solve/single
+                # ctrl-chase no longer settles within max_steps_per_state:
+                # physical error plateaus around 17-18mm, a real
+                # actuator-tracking/large-jump limit, not merely a slow
+                # asymptote. Waypointing this same Cartesian move (the
+                # identical recipe FOREARM_FORWARD_REACH now uses, and
+                # already how this state's own object_facing_orientation
+                # branch above does its ramp) fixes it the same way.
                 if self._state_step == 0:
                     self._descend_stable_streak = 0
+                    self._descend_start = {s: self.env.palm_pose(s)[0].copy() for s in SIDES}
+                    self._descend_final = self._mirrored_targets(
+                        cfg.approach_standoff_m, cfg.descend_height_m, cfg.approach_y_offset_m
+                    )
+                    self._descend_waypoint = 0
+                if (self._state_step % self.DESCEND_WAYPOINT_TICKS == 0
+                        and self._descend_waypoint < self.DESCEND_WAYPOINTS):
+                    self._descend_waypoint += 1
+                    # [This session] measured a real, brief torso<->arm
+                    # contact impulse (peak ~10.8N, one tick, over the
+                    # 8N safety limit) right at the FINAL waypoint's
+                    # abrupt re-solve -- descend_height_m=0.06 brings the
+                    # forearm close enough to the torso that even a plain
+                    # linear 1/4-fraction jump grazes it. Quintic
+                    # min-jerk fraction spacing (same function already
+                    # used for ARM_LATERAL_CLEARANCE's analogous
+                    # thumb<->table impulse) makes the FIRST and LAST
+                    # waypoint steps smaller instead of uniform, directly
+                    # shrinking the final jump that caused the spike.
+                    frac = _quintic_scale(self._descend_waypoint / self.DESCEND_WAYPOINTS)
+                    wp_targets = {
+                        s: (1 - frac) * self._descend_start[s] + frac * self._descend_final[s] for s in SIDES
+                    }
                     lR = self.env.palm_pose("left")[1].copy()
                     rR = self.env.palm_pose("right")[1].copy()
-                    targets = self._mirrored_targets(cfg.approach_standoff_m, cfg.descend_height_m, cfg.approach_y_offset_m)
-                    result = self._solve_both(targets, {"left": lR, "right": rR}, require_orientation=False,
+                    result = self._solve_both(wp_targets, {"left": lR, "right": rR}, require_orientation=False,
                                                ori_task_weight=0.1, rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain)
                     self._apply_ik_result(result)
             action[0:3] = self._waist_action_toward_target()
@@ -773,7 +868,8 @@ class SharpaBimanualGraspExpert:
             pos_err = max(float(np.linalg.norm(targets["left"] - left_pos)), float(np.linalg.norm(targets["right"] - right_pos)))
             no_collision = (self.env._torso_arm_collision_force() <= cfg.hand_hand_force_limit_n
                              and self.env._hand_hand_contact_force() <= cfg.hand_hand_force_limit_n)
-            stable_now = pos_err <= cfg.ik_pos_tol and no_collision
+            waypoints_done = cfg.object_facing_orientation or self._descend_waypoint >= self.DESCEND_WAYPOINTS
+            stable_now = pos_err <= cfg.ik_pos_tol and no_collision and waypoints_done
             self._descend_stable_streak = self._descend_stable_streak + 1 if stable_now else 0
             if self._descend_stable_streak >= cfg.descend_stable_streak_required:
                 self._advance(BimanualGraspState.WRIST_ALIGN)

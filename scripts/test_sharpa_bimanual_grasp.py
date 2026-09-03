@@ -11,18 +11,35 @@ shot FOREARM_APPROACH no longer exist -- see
 sharpa_bimanual_grasp_expert.py's BimanualGraspState). ARM_LATERAL_
 CLEARANCE uses a DIRECT joint target (not Cartesian IK) chosen from a
 bounded 3-candidate FK+physics sweep -- 0 self-collisions, elbow well
-below shoulder -- fixing the former "unnatural" elbow-up posture. With
-the canonical bare-G1 base, the DEFAULT config
-(object_facing_orientation=False) currently stops at
-FOREARM_FORWARD_REACH with a deterministic 10.165mm settled position
-error against the unchanged 10mm gate and zero forbidden collision.
-This is the active blocker; the controller must not claim that it reached
-FINGERTIP_PRECONTACT. The opt-in
-object_facing_orientation=True path still fails (self-collision force
-reduced from ~113N to ~46N peak with the new posture -- improved but not
-fixed). test_a_real_bimanual_gate_a_success_on_size_12 below documents
-this HONESTLY as a failing test and must never be weakened, deleted, or
-converted into a smoke assertion to make it pass.
+below shoulder -- fixing the former "unnatural" elbow-up posture.
+
+[This session] FOREARM_FORWARD_REACH's own settled-position residual
+(previously a deterministic ~10.165mm, just above the unchanged 10mm
+gate) is FIXED: root-caused with scripts/diagnose_forward_reach_gap.py to
+a waypoint-schedule bookkeeping bug, not a physical limit -- the state's
+final(6th) waypoint fired so late (ticks_per_wp = max_steps_per_state //
+6 = 66, consuming the ENTIRE 400-tick state budget) that only 70 ticks
+remained to physically settle, while holding the SAME final ctrl target
+fixed past that cutoff shows the real physics residual keeps
+monotonically decreasing (no oscillation) to a genuine ~9.7-9.8mm
+steady state. FORWARD_REACH_WAYPOINT_TICKS=40 (a fixed per-waypoint tick
+count, matching FINGERTIP_PRECONTACT's WAYPOINT_TICKS convention instead
+of dividing max_steps_per_state) fires the final waypoint earlier and
+leaves enough tail within the SAME unchanged max_steps_per_state/
+ik_pos_tol/streak-length budget: settled error is now ~9.96mm, streak
+requirement (15) is met, zero forbidden collision, reproduced identically
+across 3 repeated seed=0 rollouts. The DEFAULT config
+(object_facing_orientation=False) now advances through FOREARM_DESCEND ->
+WRIST_ALIGN -> FIVE_FINGER_PRESHAPE -> FINGERTIP_PRECONTACT, and
+deterministically fails there with PRECONTACT_TRACKING_NOT_ACHIEVED at
+step 998 -- this is now the active blocker (a separate, independent gate;
+not fixed by this session, not conflated with Forward Reach's own PASS).
+The opt-in object_facing_orientation=True path still fails (self-collision
+force reduced from ~113N to ~46N peak with the new posture -- improved
+but not fixed). test_a_real_bimanual_gate_a_success_on_size_12 below
+documents the overall Gate A outcome HONESTLY as a failing test and must
+never be weakened, deleted, or converted into a smoke assertion to make
+it pass.
 """
 
 from __future__ import annotations
@@ -170,32 +187,107 @@ def test_arm_lateral_clearance_meets_natural_posture_gate():
     assert env._hand_hand_contact_force() <= expert.config.hand_hand_force_limit_n
 
 
-def test_bare_base_forward_reach_blocker_is_measured_without_collision():
-    """Characterize the current pre-WRIST_ALIGN blocker without weakening
-    its 1cm gate.  Removing inherited hand mass shifts the settled palm
-    error to just above the existing threshold; the failure must be a
-    deterministic tracking residual, not a hidden collision."""
+def test_descend_reaches_object_level_height_without_forbidden_collision():
+    """[This session, user-directed geometry correction] Live-viewer
+    feedback: the hand must come down BESIDE the object, level with it,
+    not descend onto its top. descend_height_m/precontact_height_m moved
+    from +0.10/+0.09 (3-4cm above the object's TOP face) to +0.07 (about
+    1cm above the top face -- height=0.0, exactly level with the
+    object's CENTER, was tried first and measured to be physically
+    infeasible: a real, growing torso<->arm contact resistance prevents
+    convergence, not a timing artifact). A bounded height sweep further
+    found the collision peak non-monotonic near the object's top face, so
+    0.07 was chosen for its comfortable safety margin (peak ~6.7N)
+    under the unchanged 8N torso-arm limit, not because it is the
+    smallest value tried. This test locks in that FOREARM_DESCEND now
+    actually reaches its target and WRIST_ALIGN, with real forbidden
+    collision forces measured (not assumed zero) safely under the
+    unchanged limit throughout the state."""
+    env = make_env()
+    env.reset(seed=0)
+    expert = SharpaBimanualGraspExpert(env)
+    max_torso_arm = 0.0
+    max_hand_hand = 0.0
+    reached_wrist_align = False
+    for _ in range(900):
+        if expert.state in (BimanualGraspState.SUCCESS, BimanualGraspState.FAILURE):
+            break
+        prev_state = expert.state
+        action = expert.step()
+        if prev_state == BimanualGraspState.FOREARM_DESCEND:
+            max_torso_arm = max(max_torso_arm, env._torso_arm_collision_force())
+            max_hand_hand = max(max_hand_hand, env._hand_hand_contact_force())
+        env.step(action)
+        if expert.state == BimanualGraspState.WRIST_ALIGN:
+            reached_wrist_align = True
+            break
+    print(f"    reached_wrist_align={reached_wrist_align} max_torso_arm_during_descend={max_torso_arm:.2f}N "
+          f"max_hand_hand_during_descend={max_hand_hand:.2f}N "
+          f"descend_height_m={expert.config.descend_height_m} precontact_height_m={expert.config.precontact_height_m}")
+    assert reached_wrist_align, "FOREARM_DESCEND must converge to its (now object-level) target"
+    assert max_torso_arm <= expert.config.hand_hand_force_limit_n
+    assert max_hand_hand <= expert.config.hand_hand_force_limit_n
+    assert expert.config.descend_height_m < 0.09, "descend target must be lower (more level with the object) than the pre-session +0.09/+0.10 above-the-block heights"
+
+
+def test_forward_reach_gate_now_passes_and_advances_to_next_blocker():
+    """[This session] FOREARM_FORWARD_REACH's settled-position residual
+    used to plateau at a deterministic ~10.165mm, just above the
+    unchanged 10mm gate, purely from a waypoint-schedule bookkeeping bug
+    (see module docstring / FORWARD_REACH_WAYPOINT_TICKS in
+    sharpa_bimanual_grasp_expert.py) -- the real physics residual was
+    already under 10mm given enough settle time, verified with
+    scripts/diagnose_forward_reach_gap.py. The fix does not touch
+    ik_pos_tol, forward_reach_stable_streak_required, max_steps_per_state,
+    or any collision/force safety limit -- only WHEN the final waypoint's
+    IK target is issued within the SAME state budget.
+
+    This test locks in that FOREARM_FORWARD_REACH's own Gate condition
+    (settled error <=ik_pos_tol, streak reached, zero forbidden collision)
+    is now genuinely met and the rollout advances past it -- while staying
+    honest that the rollout still fails LATER (a separate, independent,
+    not-yet-fixed gate: PRECONTACT_TRACKING_NOT_ACHIEVED). This must not
+    be read as Gate A success."""
     env = make_env()
     env.reset(seed=0)
     expert = SharpaBimanualGraspExpert(env)
     final_err = None
-    for _ in range(900):
+    max_streak_seen = 0
+    collision_during_forward_reach = False
+    reached_descend = False
+    for _ in range(1200):
+        prev_state = expert.state
         action = expert.step()
         obs, r, term, trunc, info = env.step(action)
-        if expert.state == BimanualGraspState.FOREARM_FORWARD_REACH and hasattr(expert, "_forward_reach_final"):
+        if prev_state == BimanualGraspState.FOREARM_FORWARD_REACH and hasattr(expert, "_forward_reach_final"):
             final_err = max(
                 float(np.linalg.norm(expert._forward_reach_final["left"] - env.palm_pose("left")[0])),
                 float(np.linalg.norm(expert._forward_reach_final["right"] - env.palm_pose("right")[0])),
             )
+            max_streak_seen = max(max_streak_seen, expert._forward_reach_stable_streak)
+            if env._torso_arm_collision_force() > 0.0 or env._hand_hand_contact_force() > 0.0:
+                collision_during_forward_reach = True
+        if expert.state == BimanualGraspState.FOREARM_DESCEND:
+            reached_descend = True
+            break
         if expert.state == BimanualGraspState.FAILURE:
             break
-    print(f"    forward_reach_final_error={final_err*1000:.3f}mm, "
-          f"torso_arm_force={env._torso_arm_collision_force():.3f}N, "
-          f"hand_hand_force={env._hand_hand_contact_force():.3f}N")
-    assert expert.failure_reason == BimanualFailureReason.FORWARD_REACH_NOT_ACHIEVED
-    assert final_err is not None and expert.config.ik_pos_tol < final_err < 0.011
-    assert env._torso_arm_collision_force() == 0.0
-    assert env._hand_hand_contact_force() == 0.0
+    print(f"    forward_reach_final_error={final_err*1000:.3f}mm, max_streak={max_streak_seen}, "
+          f"collision_during_state={collision_during_forward_reach}, reached_descend={reached_descend}")
+    assert reached_descend, "FOREARM_FORWARD_REACH must now advance to FOREARM_DESCEND, not time out"
+    assert final_err is not None and final_err <= expert.config.ik_pos_tol
+    assert max_streak_seen >= expert.config.forward_reach_stable_streak_required
+    assert not collision_during_forward_reach
+
+    # Full rollout: still honestly fails later, at a separate gate.
+    env2 = make_env()
+    expert2 = SharpaBimanualGraspExpert(env2)
+    outcome = expert2.run(max_total_steps=1200)
+    print(f"    full rollout: state={outcome.state.name} failure_reason={outcome.failure_reason}")
+    assert outcome.failure_reason == BimanualFailureReason.PRECONTACT_TRACKING_NOT_ACHIEVED, (
+        "expected the CURRENT next independent blocker (precontact tracking); "
+        "if this changed, the docstring/PROJECT_CONTEXT next-blocker note is now stale"
+    )
 
 
 def test_object_facing_orientation_still_not_fully_safe():
@@ -391,10 +483,13 @@ def test_arm_gravity_compensation_reduces_precontact_tracking_error():
 def test_a_real_bimanual_gate_a_success_on_size_12():
     """Honest, currently-failing real SIZE_12 Gate A test.
 
-    The bare-G1 canonical builder currently stops at FOREARM_FORWARD_REACH:
-    settled palm error is about 10.16mm, just above the unchanged 10mm
-    tracking gate, with no collision.  Later alignment/contact gates are
-    therefore not entered.
+    [This session] FOREARM_FORWARD_REACH's own settled-position residual
+    is fixed (see test_forward_reach_gate_now_passes_and_advances_to_
+    next_blocker) -- the bare-G1 canonical builder now advances through
+    FOREARM_DESCEND -> WRIST_ALIGN -> FIVE_FINGER_PRESHAPE ->
+    FINGERTIP_PRECONTACT and stops there instead, deterministically
+    failing with PRECONTACT_TRACKING_NOT_ACHIEVED. Later contact/force
+    gates are therefore still not entered.
     This test MUST NOT be weakened, deleted, or turned into a smoke
     assertion to make it pass -- it stays honestly failing until Gate A
     is actually achieved."""

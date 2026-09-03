@@ -46,6 +46,7 @@ results/tripod_closure_geometry_audit.json
 results/manifold_grasp_multistart.json
 results/manifold_grasp_collision_aware_ab.json
 results/precontact_gap/
+results/forward_reach_gap/
 results/session41_visual_before/
 results/session41_visual_after/
 results/session42_before/
