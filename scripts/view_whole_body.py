@@ -216,14 +216,48 @@ def mode_grasp(
         # Gate status (spec Section 12) are printed to stdout periodically
         # instead of drawn in-scene.
         if show_hand_axes and tick % 60 == 0:
+            import humanoid_learning.envs.sharpa_config as sc
             torso = env._torso_arm_collision_force()
             table = env._hand_table_contact_force()
             wrist_dof = np.concatenate([env._arm_dof_adr[4:7], env._arm_dof_adr[11:14]])
             wrist_qvel = float(np.max(np.abs(env.data.qvel[wrist_dof])))
             fo = getattr(expert, "_functional_orientation", {}) or {}
-            print(f"  [hud] state={expert.state.name} torso_arm={torso:.2f}N hand_table={table:.2f}N "
-                  f"wrist_qvel={wrist_qvel:.2f}rad/s side_grasp_gate={expert._side_grasp_gate} "
-                  f"functional_orientation_gate={fo.get('gate')}")
+            obj_pos = expert._object_pos() if hasattr(expert, "_object_pos") else None
+            half = env.config.object_half_size
+            fingertip_table_clearance = {
+                s: float(min(env.fingertip_pos(s, f)[2] for f in sc.FINGERS)) for s in ("left", "right")
+            }
+            fingertip_obj_sep_mm = {}
+            if obj_pos is not None:
+                for s in ("left", "right"):
+                    tips = [env.fingertip_pos(s, f) for f in ("index", "middle", "ring", "pinky")]
+                    centroid = np.mean(tips, axis=0)
+                    fingertip_obj_sep_mm[s] = float(abs(centroid[1] - obj_pos[1]) - half) * 1000.0
+            contact_groups = {
+                s: [g for g, touched in expert._group_ever_contacted[s].items() if touched]
+                for s in ("left", "right")
+            }
+            gate_a_now = expert._bilateral_streak >= expert.config.bilateral_streak_required
+            # [Open-preshape session] Extended HUD per Section 12/17: added
+            # fingertip-table Z clearance, fingertip-to-object-face
+            # separation, contacted finger groups, Precontact tracking
+            # error (from the controller's own live measurement, not a
+            # separate re-derived one), FailureReason, and a live Gate A
+            # streak/pass readout, on top of the existing torso/table/
+            # qvel/Gate summary. Remaining inward closure travel is NOT
+            # recomputed every tick here (that requires a state-preserving
+            # extra env.step() probe, too expensive for a live viewer loop
+            # at 60-tick cadence) -- see scripts/audit_sharpa_curl_table_
+            # feasibility.py / candidate_open_preshape_descend.py for the
+            # authoritative offline measurement of that quantity.
+            print(f"  [hud] state={expert.state.name} reason={expert.failure_reason} "
+                  f"torso_arm={torso:.2f}N hand_table={table:.2f}N wrist_qvel={wrist_qvel:.2f}rad/s "
+                  f"fingertip_min_z={fingertip_table_clearance} fingertip_obj_sep_mm={fingertip_obj_sep_mm} "
+                  f"contact_groups={contact_groups} precontact_pos_err={expert._precontact_final_pos_error} "
+                  f"precontact_ori_err_deg={expert._precontact_final_ori_error_deg} "
+                  f"precontact_streak={expert._precontact_stable_streak}/{expert.config.precontact_stable_streak_required} "
+                  f"bilateral_streak={expert._bilateral_streak}/{expert.config.bilateral_streak_required} gate_a_now={gate_a_now} "
+                  f"side_grasp_gate={expert._side_grasp_gate} functional_orientation_gate={fo.get('gate')}")
 
     if show_hand_axes:
         with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
