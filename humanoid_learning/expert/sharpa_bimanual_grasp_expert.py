@@ -803,6 +803,18 @@ class BimanualGraspConfig:
     # measured nonthumb-fingertip-to-object-side-face separation (see
     # _precontact_separation_m) instead of a fixed Cartesian offset --
     # see FINGERTIP_PRECONTACT's own docstring for the full recipe.
+    # [Direct-closure experiment] When True, FOREARM_SIDE_DESCEND's own
+    # completion advances DIRECTLY to CONTACT_ACQUIRE instead of
+    # FINGERTIP_PRECONTACT -- arm/waist ctrl targets are left exactly as
+    # DESCEND set them (CONTACT_ACQUIRE never writes action[0:17], see
+    # that state's own code), so no further palm/wrist/arm motion toward
+    # the object happens beyond what the already-approved Horizontal-
+    # Wrap approach path (WRIST_SIDE_GRASP_ALIGN -> FIVE_FINGER_PRESHAPE
+    # -> FOREARM_SIDE_DESCEND) already produced. The FINGERTIP_PRECONTACT
+    # servo/recovery-ladder code is UNCHANGED and still used whenever
+    # this flag is False (the default) -- this is an alternate entry
+    # path, not a replacement.
+    skip_precontact_servo: bool = False
     precontact_target_separation_m: float = 0.004
     precontact_separation_ok_margin_m: float = 0.002  # "close enough" band: target +/- this
     precontact_servo_step_m: float = 0.010  # max per-tick inward Cartesian step
@@ -2247,7 +2259,10 @@ class SharpaBimanualGraspExpert:
             stable_now = pos_err <= cfg.ik_pos_tol and no_collision and waypoints_done
             self._descend_stable_streak = self._descend_stable_streak + 1 if stable_now else 0
             if self._descend_stable_streak >= cfg.side_descend_stable_streak_required:
-                self._advance(BimanualGraspState.FINGERTIP_PRECONTACT)
+                if cfg.skip_precontact_servo:
+                    self._advance(BimanualGraspState.CONTACT_ACQUIRE)
+                else:
+                    self._advance(BimanualGraspState.FINGERTIP_PRECONTACT)
             elif self._state_step >= cfg.max_steps_per_state:
                 self._fail(BimanualFailureReason.SIDE_DESCEND_NOT_ACHIEVED)
 

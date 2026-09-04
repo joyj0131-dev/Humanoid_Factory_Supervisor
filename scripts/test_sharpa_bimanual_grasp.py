@@ -1431,6 +1431,53 @@ def test_wrap_direction_bug_fix_reduces_fingertip_object_offset():
     assert new_offset_y * 1000 < 100.0, "wrap-direction fix should keep the fingertip-palm Y offset measurably under the old ~110mm"
 
 
+def test_direct_closure_from_descend_pose_confirms_swept_path_does_not_reach_object():
+    """[Direct-closure experiment, honest disclosure] User-directed test:
+    from FOREARM_SIDE_DESCEND's own converged Horizontal-Wrap pose, with
+    arm/wrist ctrl targets left EXACTLY as DESCEND set them (no
+    FINGERTIP_PRECONTACT servo, no further palm motion --
+    skip_precontact_servo=True advances DESCEND -> CONTACT_ACQUIRE
+    directly), does the real finger-closure swept path actually
+    intersect the object? Measured directly, real physics: it does NOT
+    -- nonthumb fingertip-to-object-face separation at this pose is
+    ~189mm (both hands), while the real remaining closure travel from
+    the DESCEND-exit curl (0.0) to full close (1.0) is only ~54-57mm per
+    finger (see test_open_preshape_curl_target_removes_near_full_closure)
+    -- a ~130mm+ shortfall regardless of closure ORDER (thumb-first was
+    also tried and produced 0.0N peak force across 500 ticks; thumb tip
+    itself starts 152mm from the object center and its own curl moves it
+    slightly AWAY at full closure, not toward). This locks in that
+    result: zero contact force, zero object displacement, CONTACT_ACQUIRE
+    times out. This is a real, disclosed finding, not a bug in
+    CONTACT_ACQUIRE's own closing logic (which is unchanged and already
+    covered by other tests) -- it is a direct consequence of skipping
+    the inward approach entirely, exactly as this experiment's own
+    directive required."""
+    import humanoid_learning.envs.sharpa_config as sc
+
+    env = make_env()
+    env.reset(seed=0)
+    ecfg = BimanualGraspConfig(skip_precontact_servo=True)
+    expert = SharpaBimanualGraspExpert(env, ecfg)
+    outcome = expert.run(max_total_steps=3000)
+    print(f"    state={outcome.state.name} reason={outcome.failure_reason} "
+          f"per_side_group_contact={outcome.per_side_group_contact} "
+          f"max_peak_force={outcome.per_side_group_peak_force} "
+          f"object_xy_displacement={outcome.object_xy_displacement}")
+    assert outcome.state == BimanualGraspState.FAILURE
+    assert outcome.failure_reason == BimanualFailureReason.TIMEOUT, (
+        "expected CONTACT_ACQUIRE to time out (no group ever registers contact) -- "
+        "if this changed, the swept path now reaches the object and this test's own "
+        "conclusion (and the accompanying report) is stale"
+    )
+    for side in SIDES:
+        for group in sc.GROUPS:
+            assert outcome.per_side_group_peak_force[side][group] == 0.0, (
+                f"{side}/{group}: expected 0.0N (no reach), got real contact -- investigate before trusting this result"
+            )
+    assert outcome.object_xy_displacement == 0.0
+
+
 if __name__ == "__main__":
     tests = [obj for name, obj in list(globals().items()) if name.startswith("test_")]
     passed, failed = 0, 0
