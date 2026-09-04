@@ -707,7 +707,7 @@ class BimanualGraspConfig:
     # (0.02) reaches 38mm but with real torso-arm force (10.3N); wider
     # (0.06-0.10) stays safer (0.00-8N) but leaves 74-89mm, too far for
     # curl alone.
-    side_descend_standoff_m: float = 0.02
+    side_descend_standoff_m: float = 0.06
     # [Open-preshape session] 0.03 -> 0.05. The prior audit (see
     # side_descend_curl_target's docstring below) re-verified that curl
     # alone (0.3-0.8, at height=0.03) all fail with 8.1-14.9N hand-table
@@ -736,7 +736,7 @@ class BimanualGraspConfig:
     # side_descend_standoff_m's fix above -- see that field's own
     # docstring for the real-physics grid this pair was chosen from.
     side_descend_height_m: float = 0.01
-    side_descend_y_offset_m: float = 0.045
+    side_descend_y_offset_m: float = 0.10
     # [Open-preshape session] 0.95 -> 0.7. Curls index/middle/wrap LESS
     # than the prior value (still more than WRIST_SIDE_GRASP_ALIGN's own
     # protective 0.3, see that field's docstring, so the transition is
@@ -1057,18 +1057,30 @@ class SharpaBimanualGraspExpert:
     # A higher joint_weight is a SOFT COST (weighted damped pseudo-
     # inverse), not a hard lock, so shoulder motion is still available
     # if genuinely needed, just discouraged relative to elbow/wrist.
+    # [User correction, this session] The prior weighting only penalized
+    # shoulder_roll/yaw, leaving WRIST at the same default cost as every
+    # other joint -- the redundant solver kept solving the final reach by
+    # translating the whole arm (shoulder/elbow) toward the torso instead
+    # of BENDING AT THE WRIST, which has 3 real DOF (roll/pitch/yaw)
+    # positioned right at the base of the hand and therefore the
+    # CHEAPEST way (shortest lever, no torso proximity risk at all) to
+    # sweep the fingertip through a large arc. Layout matches
+    # CoupledBilateralIK's own 17-dim waist(3)+left_arm(7)+right_arm(7)
+    # ordering (task_config.py's LEFT/RIGHT_ARM_JOINTS: pitch,roll,yaw,
+    # elbow,wrist_roll,wrist_pitch,wrist_yaw) -- shoulder pitch/roll/yaw
+    # = 3,4,5 / 10,11,12; elbow = 6/13; wrist roll/pitch/yaw = 7,8,9 /
+    # 14,15,16. Wrist is now CHEAP (favored), shoulder EXPENSIVE
+    # (strongly discouraged), elbow moderately discouraged -- a soft
+    # cost (weighted damped pseudo-inverse), not a hard lock, so shoulder
+    # motion remains available if genuinely required.
     PRECONTACT_JOINT_WEIGHT = np.ones(17)
-    PRECONTACT_JOINT_WEIGHT[[4, 5, 11, 12]] = 6.0
-    # [Direct-grasp session] Same shoulder-penalty idea, extended with a
-    # cheaper WAIST cost (indices 0/1/2, default class-wide joint_weight
-    # penalizes waist 6x -- see CoupledBilateralIK's own waist_weight
-    # default) -- used for FOREARM_SIDE_DESCEND's own final approach
-    # once orientation is no longer frozen (see side_descend_standoff_m's
-    # docstring): letting waist assist more cheaply than shoulder gives
-    # the redundant solver a genuinely different, less torso-colliding
-    # branch to reach the same Cartesian target.
+    PRECONTACT_JOINT_WEIGHT[[3, 4, 5, 10, 11, 12]] = 8.0
+    PRECONTACT_JOINT_WEIGHT[[6, 13]] = 3.0
+    PRECONTACT_JOINT_WEIGHT[[7, 8, 9, 14, 15, 16]] = 0.15
     DESCEND_JOINT_WEIGHT = np.ones(17)
-    DESCEND_JOINT_WEIGHT[[4, 5, 11, 12]] = 6.0
+    DESCEND_JOINT_WEIGHT[[3, 4, 5, 10, 11, 12]] = 8.0
+    DESCEND_JOINT_WEIGHT[[6, 13]] = 3.0
+    DESCEND_JOINT_WEIGHT[[7, 8, 9, 14, 15, 16]] = 0.15
 
     def __init__(self, env, config: BimanualGraspConfig | None = None):
         self.env = env
@@ -2266,6 +2278,32 @@ class SharpaBimanualGraspExpert:
             )
             self._apply_ik_result(result)
             self._descend_locked_R = dict(self._side_descend_wp_target_R)  # kept for FINGERTIP_PRECONTACT's own use when skip_precontact_servo=False
+            # [User-directed fix, this session] "손목에도 관절이 있으니까
+            # 안으로 굽혀라" -- direct FK sweep (holding the rest of the
+            # arm fixed at a SAFE, 0-collision waypoint) found wrist_YAW
+            # alone sweeps the real fingertip separation from ~108mm to
+            # ~16mm with a single ~29deg rotation and ZERO added torso-arm
+            # force, since it does not move the shoulder/upper-arm at
+            # all. The redundant IK solve was NOT spontaneously finding
+            # this on its own even with wrist weighted cheap (DESCEND_
+            # JOINT_WEIGHT) -- trimmed in directly here instead: once the
+            # position waypoint schedule is done, bend each side's
+            # wrist_yaw further inward, a little every tick, capped and
+            # monitored for real collision (back off if it appears).
+            if waypoints_exhausted:
+                if not hasattr(self, "_descend_wrist_yaw_trim"):
+                    self._descend_wrist_yaw_trim = {"left": 0.0, "right": 0.0}
+                torso_now = self.env._torso_arm_collision_force()
+                guard = cfg.precontact_collision_guard_frac * cfg.hand_hand_force_limit_n
+                wrist_yaw_sign = {"left": -1.0, "right": 1.0}
+                for side in SIDES:
+                    sep_now = self._precontact_separation_m(side)
+                    if torso_now > guard:
+                        self._descend_wrist_yaw_trim[side] = max(self._descend_wrist_yaw_trim[side] - 0.02, 0.0)
+                    elif sep_now > 0.005:
+                        self._descend_wrist_yaw_trim[side] = min(self._descend_wrist_yaw_trim[side] + 0.01, 0.9)
+                self._arm_ik_target[6] += wrist_yaw_sign["left"] * self._descend_wrist_yaw_trim["left"]
+                self._arm_ik_target[13] += wrist_yaw_sign["right"] * self._descend_wrist_yaw_trim["right"]
             action[0:3] = self._waist_action_toward_target()
             action[3:17] = self._arm_action_toward_target()
             self._update_wrap_wrist_qvel_peak()
