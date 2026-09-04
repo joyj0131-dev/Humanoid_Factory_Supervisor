@@ -2301,7 +2301,7 @@ class SharpaBimanualGraspExpert:
                     if torso_now > guard:
                         self._descend_wrist_yaw_trim[side] = max(self._descend_wrist_yaw_trim[side] - 0.02, 0.0)
                     elif sep_now > 0.005:
-                        self._descend_wrist_yaw_trim[side] = min(self._descend_wrist_yaw_trim[side] + 0.01, 0.9)
+                        self._descend_wrist_yaw_trim[side] = min(self._descend_wrist_yaw_trim[side] + 0.01, 1.15)
                 self._arm_ik_target[6] += wrist_yaw_sign["left"] * self._descend_wrist_yaw_trim["left"]
                 self._arm_ik_target[13] += wrist_yaw_sign["right"] * self._descend_wrist_yaw_trim["right"]
             action[0:3] = self._waist_action_toward_target()
