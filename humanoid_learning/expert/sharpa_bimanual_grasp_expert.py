@@ -1315,6 +1315,17 @@ class SharpaBimanualGraspExpert:
             force_sum += -force_on_geom2 if b1 == obj_body else force_on_geom2
         return force_sum
 
+    def _side_reach_ready(self, side: str) -> bool:
+        """CONTACT_ACQUIRE's real readiness bar for one side: wrap (the
+        physically closest group) touching is NOT enough on its own --
+        Gate A's topology needs wrap AND (index or middle) too, and
+        real physics showed the palm freezing on wrap-only contact left
+        index/middle permanently ~20mm short even at full curl (syn=1.0).
+        So keep approaching until wrap AND at least one of index/middle
+        have registered real contact."""
+        g = self._group_ever_contacted[side]
+        return g["wrap"] and (g["index"] or g["middle"])
+
     def _side_stable(self, side: str) -> bool:
         """Topology check for one side: thumb
         touching AND (index or middle) touching AND wrap touching AND
@@ -2540,6 +2551,18 @@ class SharpaBimanualGraspExpert:
             # the other side keeps closing (Section 4 requirement 7/8).
             if self._state_step == 0:
                 self._contact_acquire_recovery_until = {"left": 0, "right": 0}
+                # [Retreat-report session] Anchor the servo target to the
+                # ENTRY pose + a cumulative intended offset, not to
+                # "current palm_pos" every tick -- re-deriving the target
+                # from the live (possibly slightly-off-converged) pose
+                # every tick let per-tick IK residual bias compound over
+                # the now much-longer CONTACT_ACQUIRE run (up to
+                # contact_acquire_max_steps) into tens of mm of real,
+                # measured drift in X/Z that had nothing to do with the
+                # intended pure-lateral nudge -- exactly the kind of
+                # unintended backward drift the user reported seeing.
+                self._contact_acquire_anchor = {s: self.env.palm_pose(s)[0].copy() for s in SIDES}
+                self._contact_acquire_offset = {"left": 0.0, "right": 0.0}
                 if self._initial_obj_xy is None:
                     # [Direct-grasp session] Object displacement was NOT
                     # tracked at all before CONTACT_ACQUIRE (only from
@@ -2557,14 +2580,17 @@ class SharpaBimanualGraspExpert:
                         deltas[side][group] = cfg.close_rate_per_step
             action[17:25] = self._group_action(deltas)
 
-            # [Direct-grasp session] "한 손이 먼저 닿으면 유지하고 반대 손을
-            # 접근한다": a side with NO real contact yet keeps taking small
-            # inward steps (same recipe as FOREARM_SIDE_DESCEND's own
-            # servo -- object-facing orientation held fixed at the frozen
+            # [Retreat-report session] Freezing a side on its FIRST group
+            # contact (any of index/middle/wrap) was measured to strand
+            # index/middle ~20mm short forever, because wrap (physically
+            # closest) always touches first and used to stop the approach
+            # right there. Now a side keeps taking small inward steps
+            # (same recipe as FOREARM_SIDE_DESCEND's own servo --
+            # object-facing orientation held fixed at the frozen
             # _descend_locked_R, PRECONTACT_JOINT_WEIGHT discouraging
-            # shoulder tuck, graduated collision recovery); a side that
-            # ALREADY has contact holds its CURRENT position (target =
-            # current palm_pos) so the contact it made is not disturbed.
+            # shoulder tuck, graduated collision recovery) until
+            # _side_reach_ready (wrap AND index-or-middle); only then does
+            # it hold its CURRENT position so the contact is not disturbed.
             torso_force_now = self.env._torso_arm_collision_force()
             table_forces_now = self.env._hand_table_forces_categorized()
             hand_hand_now = self.env._hand_hand_contact_force()
@@ -2580,14 +2606,25 @@ class SharpaBimanualGraspExpert:
             R = {}
             need_solve = False
             for side in SIDES:
-                side_has_contact = any(self._group_ever_contacted[side][g] for g in ("index", "middle", "wrap"))
+                side_has_contact = self._side_reach_ready(side)
                 palm_pos, _ = self.env.palm_pose(side)
                 if side_has_contact:
                     targets[side] = palm_pos
                 else:
                     need_solve = True
+                    # A group that already touched (typically wrap) can
+                    # still be pushed harder as the approach continues
+                    # toward index/middle -- guard on ITS force too, not
+                    # just torso/table collision, so this gentle push
+                    # never turns into a real over-force event.
+                    contacted_peak = max(
+                        (self.env._group_contact_force(side, g)[0]
+                         for g in ("index", "middle", "wrap") if self._group_ever_contacted[side][g]),
+                        default=0.0,
+                    )
+                    side_collision_now = collision_now or contacted_peak > guard
                     in_recovery = self._total_step < self._contact_acquire_recovery_until[side]
-                    if collision_now and not in_recovery:
+                    if side_collision_now and not in_recovery:
                         self._contact_acquire_recovery_until[side] = self._total_step + cfg.precontact_recovery_ticks
                         in_recovery = True
                     if in_recovery:
@@ -2603,8 +2640,16 @@ class SharpaBimanualGraspExpert:
                         # contact registers (real object displacement
                         # observed, ~90mm in one run) instead of helping.
                         step = cfg.precontact_servo_step_m * 0.05
+                    # Cap at the full lateral gap DESCEND started from --
+                    # letting the commanded offset keep growing past what
+                    # the arm can physically track (measured: real pose
+                    # plateaus while offset keeps climbing) just widens
+                    # the target/actual mismatch for no benefit.
+                    self._contact_acquire_offset[side] = float(np.clip(
+                        self._contact_acquire_offset[side] + step, 0.0, cfg.side_descend_y_offset_m,
+                    ))
                     inward_dir = np.array([0.0, -Y_SIGN[side], 0.0])
-                    targets[side] = palm_pos + inward_dir * step
+                    targets[side] = self._contact_acquire_anchor[side] + inward_dir * self._contact_acquire_offset[side]
                 R[side] = self._descend_locked_R[side]
             if need_solve:
                 result = self._solve_both(
@@ -2616,9 +2661,7 @@ class SharpaBimanualGraspExpert:
                 action[0:3] = self._waist_action_toward_target()
                 action[3:17] = self._arm_action_toward_target()
 
-            both_have_some_contact = all(
-                any(self._group_ever_contacted[side][g] for g in ("index", "middle", "wrap")) for side in SIDES
-            )
+            both_have_some_contact = all(self._side_reach_ready(side) for side in SIDES)
             if both_have_some_contact:
                 self._advance(BimanualGraspState.THUMB_OPPOSE)
             elif self._state_step >= cfg.contact_acquire_max_steps:
