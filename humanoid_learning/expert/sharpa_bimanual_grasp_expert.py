@@ -627,6 +627,23 @@ class BimanualGraspConfig:
     # inward angle 12.6-12.7deg both hands (a real ~2.3deg margin under
     # the unchanged 15deg tolerance -- see _object_facing_R's docstring
     # for the full weight-pair sweep this was chosen from).
+    # [Level-approach session] Tried -0.02 (paired with side_descend_
+    # height_m=-0.04) to directly match the gripper's Z-center to the
+    # object's Z-center, per the user's explicit instruction -- and it
+    # DID get all four non-thumb fingertips inside the object's Z band
+    # for the first time this whole multi-session effort. But the
+    # existing test suite caught a real regression this session's own
+    # manual diagnostics missed: FOREARM_SIDE_DESCEND's torso-arm force
+    # rose to 23.36N, breaking test_side_descend_reaches_precontact_
+    # with_zero_torso_collision's already-established <=8N bar (this
+    # state was previously verified at 0.00N). That is a real Gate
+    # regression, not just a soft guard tripping -- reverted. The Z-
+    # alignment fix and the torso-force cost are coupled under the new
+    # hard-orientation DESCEND design (see that state's docstring); they
+    # need a genuinely different lever (e.g. a gentler height rampspread
+    # across more of the approach, or loosening DESCEND_JOINT_WEIGHT's
+    # shoulder cost specifically for the Z axis) to both be satisfied at
+    # once, which this session did not reach. See PROJECT_CONTEXT.md.
     side_align_height_m: float = 0.10
     side_align_y_offset_m: float = 0.26
     # Protective curl (index/middle/wrap only, thumb untouched -- same
@@ -736,15 +753,21 @@ class BimanualGraspConfig:
     # side_descend_standoff_m's fix above -- see that field's own
     # docstring for the real-physics grid this pair was chosen from.
     #
-    # [Level-approach session] Tried -0.02 together with a second
-    # (wrist_roll) trim, both FK-verified to help fingertip Z-alignment
-    # and Y-separation individually -- but the FULL rollout revealed a
-    # real, serious regression: the object got pushed a measured 47mm
-    # (past the 30mm Gate A displacement limit) by CONTACT_ACQUIRE's own
-    # curl-delta logic reacting to marginal/oscillating contact at this
-    # geometry. Reverted to the last known-SAFE value; see
-    # PROJECT_CONTEXT.md for the full writeup and the curl-delta runaway
-    # hypothesis this session did not get to finish verifying.
+    # [Level-approach session] Two attempts, both reverted after the test
+    # suite caught real regressions the manual diagnostics missed:
+    # -0.02 paired with a wrist_roll trim (compensating for the old per-
+    # waypoint orientation re-derivation) pushed the object 47mm. Later,
+    # under the new hard-orientation DESCEND design (see that state's
+    # docstring -- orientation held fixed at WRIST_SIDE_GRASP_ALIGN's
+    # _locked_R, never re-derived), (-0.02, -0.04) for (align, descend)
+    # DID get all four fingertips inside the object's Z band for the
+    # first time this session, but raised DESCEND's own torso-arm force
+    # to 23.36N, breaking test_side_descend_reaches_precontact_with_
+    # zero_torso_collision's already-established <=8N bar. Reverted to
+    # the last test-suite-clean value. The Z-alignment fix and this
+    # torso-force cost are coupled under the current design; solving both
+    # together needs a different lever than a flat height offset (see
+    # side_align_height_m's docstring) -- not found this session.
     side_descend_height_m: float = 0.01
     side_descend_y_offset_m: float = 0.10
     # [Open-preshape session] 0.95 -> 0.7. Curls index/middle/wrap LESS
@@ -2262,27 +2285,27 @@ class SharpaBimanualGraspExpert:
                 self._side_descend_wp_target_pos = {s: self._side_descend_start[s].copy() for s in SIDES}
             ticks_per_wp = cfg.side_descend_waypoint_ticks
             tick_in_wp = self._state_step % ticks_per_wp
+            # [Level-approach session] "먼저 손을 물체와 수평으로 맞춘
+            # 다음, 자세는 그대로 둔 채 위치로만 다가간다" -- orientation
+            # is NO LONGER re-derived per waypoint here. WRIST_SIDE_GRASP_
+            # ALIGN already measures and gates on a real (non-circular)
+            # object-facing angle (self._locked_R, previously computed
+            # there but never read by anything -- a real, verified dead
+            # value). Re-deriving fresh per waypoint as this state got
+            # closer to the object was measured to let the facing angle
+            # DRIFT WORSE (11deg at ALIGN's own exit -> 28deg by
+            # CONTACT_ACQUIRE), because the same 3-constraint Wahba
+            # compromise (closing/wrap/ulnar) lands somewhere different
+            # at every new position. Holding _locked_R fixed and only
+            # solving position removes that drift by construction.
             if tick_in_wp == 0 and self._side_descend_waypoint < cfg.side_descend_waypoints:
                 self._side_descend_waypoint += 1
                 frac = _quintic_scale(self._side_descend_waypoint / cfg.side_descend_waypoints)
-                obj_pos = self._object_pos()
                 self._side_descend_wp_start_R = {s: self.env.palm_pose(s)[1].copy() for s in SIDES}
                 for s in SIDES:
                     target_pos = (1 - frac) * self._side_descend_start[s] + frac * self._side_descend_final[s]
                     self._side_descend_wp_target_pos[s] = target_pos
-                    # [Direct-grasp session] Continuity reference is the
-                    # PREVIOUS WAYPOINT'S OWN TARGET R (clean, already
-                    # computed), not the live/settling palm_R -- using the
-                    # live pose here was measured to let solver-branch
-                    # noise from a not-yet-settled actuator feed back into
-                    # the wrap-direction handedness choice near the end of
-                    # the ramp, causing separation to visibly REGRESS
-                    # (worsen) over the final few waypoints instead of
-                    # monotonically improving.
-                    cur_approach = self._side_descend_wp_target_R[s][:, 0]
-                    self._side_descend_wp_target_R[s] = _object_facing_R(
-                        s, target_pos, obj_pos, current_approach_world=cur_approach
-                    )
+                    self._side_descend_wp_target_R[s] = self._locked_R[s]
             # [Direct-grasp session, bug fix] Once all waypoints are
             # spent, tick_in_wp keeps cycling 0..ticks_per_wp-1 (state_
             # step keeps advancing), which was RESETTING sub_frac back
@@ -2300,38 +2323,33 @@ class SharpaBimanualGraspExpert:
                 s: _slerp_R(self._side_descend_wp_start_R[s], self._side_descend_wp_target_R[s], sub_frac)
                 for s in SIDES
             }
+            # [Level-approach session] Hard orientation requirement (was
+            # soft, ori_task_weight=0.3) -- soft let the solver trade
+            # orientation accuracy for position accuracy tick to tick
+            # (cheap-wrist DESCEND_JOINT_WEIGHT made that trade attractive
+            # for the DLS cost function), measured to still drift the
+            # facing angle 11deg -> 19-22deg even with R_now held at the
+            # same locked target throughout. This is the actual
+            # translate-only guarantee: position error can now only be
+            # reduced by DOF combinations that do not disturb the
+            # required orientation.
             result = self._solve_both(
-                self._side_descend_wp_target_pos, R_now, require_orientation=False, ori_task_weight=0.3,
+                self._side_descend_wp_target_pos, R_now, require_orientation=True, ori_task_weight=1.0,
                 rest_q=self._current_rest_q(), rest_gain=0.3, pos_tol=0.003, joint_weight=self.DESCEND_JOINT_WEIGHT,
             )
             self._apply_ik_result(result)
             self._descend_locked_R = dict(self._side_descend_wp_target_R)  # kept for FINGERTIP_PRECONTACT's own use when skip_precontact_servo=False
-            # [User-directed fix, this session] "손목에도 관절이 있으니까
-            # 안으로 굽혀라" -- direct FK sweep (holding the rest of the
-            # arm fixed at a SAFE, 0-collision waypoint) found wrist_YAW
-            # alone sweeps the real fingertip separation from ~108mm to
-            # ~16mm with a single ~29deg rotation and ZERO added torso-arm
-            # force, since it does not move the shoulder/upper-arm at
-            # all. The redundant IK solve was NOT spontaneously finding
-            # this on its own even with wrist weighted cheap (DESCEND_
-            # JOINT_WEIGHT) -- trimmed in directly here instead: once the
-            # position waypoint schedule is done, bend each side's
-            # wrist_yaw further inward, a little every tick, capped and
-            # monitored for real collision (back off if it appears).
-            if waypoints_exhausted:
-                if not hasattr(self, "_descend_wrist_yaw_trim"):
-                    self._descend_wrist_yaw_trim = {"left": 0.0, "right": 0.0}
-                torso_now = self.env._torso_arm_collision_force()
-                guard = cfg.precontact_collision_guard_frac * cfg.hand_hand_force_limit_n
-                wrist_yaw_sign = {"left": -1.0, "right": 1.0}
-                for side in SIDES:
-                    sep_now = self._precontact_separation_m(side)
-                    if torso_now > guard:
-                        self._descend_wrist_yaw_trim[side] = max(self._descend_wrist_yaw_trim[side] - 0.02, 0.0)
-                    elif sep_now > 0.005:
-                        self._descend_wrist_yaw_trim[side] = min(self._descend_wrist_yaw_trim[side] + 0.01, 1.15)
-                self._arm_ik_target[6] += wrist_yaw_sign["left"] * self._descend_wrist_yaw_trim["left"]
-                self._arm_ik_target[13] += wrist_yaw_sign["right"] * self._descend_wrist_yaw_trim["right"]
+            # [Level-approach session] The wrist_yaw trim that used to run
+            # here (bend the wrist further inward once waypoints are
+            # spent) directly CONTRADICTS this state's new "hold
+            # orientation fixed, translate only" design -- it was
+            # measured to still rotate the facing angle away from the
+            # locked ~11deg target (up to ~22-23deg) even with R_now held
+            # constant, since it writes raw joint deltas after the IK
+            # solve rather than going through the orientation target at
+            # all. Removed; position convergence now has to come from
+            # real translation (shoulder/elbow/waist), which is the
+            # point.
             action[0:3] = self._waist_action_toward_target()
             action[3:17] = self._arm_action_toward_target()
             self._update_wrap_wrist_qvel_peak()
