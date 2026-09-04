@@ -646,6 +646,18 @@ class BimanualGraspConfig:
     # once, which this session did not reach. See PROJECT_CONTEXT.md.
     side_align_height_m: float = 0.10
     side_align_y_offset_m: float = 0.26
+    # [Level-approach session] wrist_roll rotation (each side, mirrored
+    # sign -- see the lock-in site for the FK evidence) folded into the
+    # locked orientation to bring the open-finger Z-spread level with the
+    # object instead of stacked from well-above to well-below its
+    # center. 0.4 rad was the FK-verified sweet spot (0.0 baseline sweep
+    # of {0.2,0.4,0.6,0.8,1.0} each direction): at 0.4 all four non-thumb
+    # fingertips land inside the object's +-60mm Z band (index +43,
+    # middle +23, ring +3, pinky -21mm) at a torso-arm force of 0.00N
+    # across the ENTIRE tested range (0.2-1.0rad) -- a real, cheap wrist-
+    # only lever, unlike repositioning the palm itself (measured to cost
+    # 22-23N of torso-arm force for a comparable Z change).
+    side_align_wrist_roll_tilt_rad: float = 0.4
     # Protective curl (index/middle/wrap only, thumb untouched -- same
     # split as CONTACT_ACQUIRE) applied at WRIST_SIDE_GRASP_ALIGN entry,
     # before the position+orientation ramp -- see point 3 above. NOT the
@@ -2143,7 +2155,42 @@ class SharpaBimanualGraspExpert:
                 stable_now = False
             self._side_align_stable_streak = self._side_align_stable_streak + 1 if stable_now else 0
             if self._side_align_stable_streak >= cfg.side_align_stable_streak_required:
-                self._locked_R = {"left": lR, "right": rR}
+                # [Level-approach session] "ㅣㅁㅣ" -- when the fingers are
+                # straight, they should be level with the block, not
+                # stacked from way-above-center (index/thumb) to
+                # way-below (pinky). Real FK sweep (from this same safe
+                # pose) found rotating each side's wrist_roll shifts ALL
+                # FOUR non-thumb fingertips DOWN together at a CONSTANT
+                # 0.00N torso-arm force across the whole tested range
+                # (left: negative direction, right: positive -- mirrored,
+                # both verified, not assumed) -- unlike repositioning the
+                # palm (which this session tried first and hit a real 22-
+                # 23N torso-force wall), this is a pure wrist rotation, so
+                # it is as safe as the wrist_yaw lever this project has
+                # used since the "손목에도 관절이 있다" fix. wrist_roll
+                # rotates about the closing axis itself, so it should not
+                # disturb the object_facing_angle just verified above --
+                # applied via real FK on a scratch copy (never guessed)
+                # and folded into the LOCKED orientation itself so
+                # FOREARM_SIDE_DESCEND's hard orientation requirement
+                # carries it through with no separate runtime trim (a
+                # runtime trim was exactly the earlier wrist_yaw-trim bug
+                # this session already had to fix once).
+                side_align_wrist_roll_z_trim = {"left": -cfg.side_align_wrist_roll_tilt_rad,
+                                                 "right": cfg.side_align_wrist_roll_tilt_rad}
+                tilt_scratch = mujoco.MjData(self.env.model)
+                tilt_scratch.qpos[:] = self.env.data.qpos
+                for s in SIDES:
+                    j_id = mujoco.mj_name2id(self.env.model, mujoco.mjtObj.mjOBJ_JOINT, f"{s}_wrist_roll_joint")
+                    q_adr = self.env.model.jnt_qposadr[j_id]
+                    tilt_scratch.qpos[q_adr] += side_align_wrist_roll_z_trim[s]
+                mujoco.mj_forward(self.env.model, tilt_scratch)
+                tilted_R = {
+                    s: tilt_scratch.site_xmat[self.env._left_palm_site if s == "left" else self.env._right_palm_site]
+                    .reshape(3, 3).copy()
+                    for s in SIDES
+                }
+                self._locked_R = tilted_R
                 self.torso_arm_collision_force_n = self.env._torso_arm_collision_force()
                 if self.torso_arm_collision_force_n > cfg.hand_hand_force_limit_n:
                     self._fail(BimanualFailureReason.SELF_COLLISION_TORSO_ARM)
