@@ -927,6 +927,13 @@ class BimanualGraspConfig:
     precontact_servo_pos_tol_m: float = 0.0005
     close_rate_per_step: float = 0.03
     contact_force_threshold_n: float = 0.5
+    # [Full-palm-contact session] Ticks the palm's own contact force must
+    # stay above contact_force_threshold_n before CONTACT_ACQUIRE treats
+    # the palm as genuinely pressed and starts curling. Latching on a
+    # single tick let a one-frame graze (measured: 0.45N for ONE tick,
+    # 0.00N immediately after) pass as "palm contacted" and start curling
+    # before the palm was really resting against the object.
+    palm_press_stable_ticks: int = 15
     target_force_band_n: tuple[float, float] = (1.0, 6.0)
     force_settle_hold_steps: int = 10
     tabletop_hold_seconds: float = 2.0
@@ -2585,6 +2592,7 @@ class SharpaBimanualGraspExpert:
                 self._contact_acquire_offset = {"left": 0.0, "right": 0.0}
                 self._palm_press_offset = {"left": 0.0, "right": 0.0}
                 self._palm_ever_contacted = {"left": False, "right": False}
+                self._palm_contact_streak = {"left": 0, "right": 0}
                 if self._initial_obj_xy is None:
                     # [Direct-grasp session] Object displacement was NOT
                     # tracked at all before CONTACT_ACQUIRE (only from
@@ -2596,9 +2604,23 @@ class SharpaBimanualGraspExpert:
                     self._initial_obj_xy = self._object_pos()[:2].copy()
             self._track_stability()
 
+            # [Full-palm-contact session] A single tick above threshold is
+            # not "the palm is pressed" -- measured that the old
+            # one-touch latch caught a transient graze (0.45N for ONE
+            # tick, back to 0.00N immediately after, because pushing
+            # stopped the instant it fired) and started curling on that,
+            # which is exactly the "curls before the palm is really flush"
+            # the user saw. Now the palm-press push keeps going THROUGH
+            # first contact and only locks in once contact force has held
+            # for palm_press_stable_ticks consecutive ticks -- a real,
+            # sustained press, not a graze.
             for side in SIDES:
                 was_contacted = self._palm_ever_contacted[side]
                 if self.env._palm_contact_force(side) > cfg.contact_force_threshold_n:
+                    self._palm_contact_streak[side] += 1
+                else:
+                    self._palm_contact_streak[side] = 0
+                if self._palm_contact_streak[side] >= cfg.palm_press_stable_ticks:
                     self._palm_ever_contacted[side] = True
                 if self._palm_ever_contacted[side] and not was_contacted:
                     # Just pressed -- re-anchor the (now separate) lateral
@@ -2660,8 +2682,15 @@ class SharpaBimanualGraspExpert:
                     need_solve = True
                     anchor = self._contact_acquire_anchor[side]
                     direction = np.array([0.0, -Y_SIGN[side], 0.0])
+                    # Keep pressing THROUGH first contact (that's the
+                    # point -- see the streak comment above), but guard on
+                    # the palm's own force too so "keep pressing" never
+                    # turns into a real over-force event while the streak
+                    # completes.
+                    palm_f_now = self.env._palm_contact_force(side)
+                    side_collision_now = collision_now or palm_f_now > guard
                     in_recovery = self._total_step < self._contact_acquire_recovery_until[side]
-                    if collision_now and not in_recovery:
+                    if side_collision_now and not in_recovery:
                         self._contact_acquire_recovery_until[side] = self._total_step + cfg.precontact_recovery_ticks
                         in_recovery = True
                     if in_recovery:

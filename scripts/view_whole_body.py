@@ -35,13 +35,55 @@ def _pace(model, started: float) -> None:
         time.sleep(remaining)
 
 
-def _run_env(env, action_fn, sequence_steps: int | None = None) -> None:
+class _FrameTimer:
+    """[Palm-press session] Real, measured stutter diagnosis for
+    --fps-log: the viewer's own pacing (_pace) only sleeps when a tick's
+    real compute (action_fn + viewer.sync, i.e. physics/IK/rendering)
+    finishes UNDER the target_dt budget -- an expensive tick (heavy IK
+    solve, dense-contact physics, the periodic HUD block) just runs long
+    with no sleep, which is exactly what shows up as a stall/skip to a
+    human watching the viewer. This tracks per-tick compute time (not a
+    guess) and reports it periodically so "is it frame drop or is the
+    robot itself unstable" has a real answer instead of a visual one."""
+
+    def __init__(self, target_dt: float, report_every: int = 100) -> None:
+        self.target_dt = target_dt
+        self.report_every = report_every
+        self._compute = []
+        self._period = []
+        self._last_start = None
+
+    def tick(self, iter_start: float, compute_end: float) -> None:
+        self._compute.append(compute_end - iter_start)
+        if self._last_start is not None:
+            self._period.append(iter_start - self._last_start)
+        self._last_start = iter_start
+        if len(self._compute) >= self.report_every:
+            self._report()
+
+    def _report(self) -> None:
+        c = np.array(self._compute)
+        p = np.array(self._period) if self._period else c
+        mean_period = float(np.mean(p)) if len(p) else 0.0
+        fps = 1.0 / mean_period if mean_period > 0 else 0.0
+        stutter = int(np.sum(c > self.target_dt * 1.5))
+        print(f"  [fps] n={len(c)} compute_ms(mean/max)={c.mean()*1000:.2f}/{c.max()*1000:.2f} "
+              f"target_ms={self.target_dt*1000:.2f} stutter_ticks(compute>1.5x_target)={stutter}/{len(c)} "
+              f"measured_fps={fps:.1f}")
+        self._compute.clear()
+        self._period.clear()
+
+
+def _run_env(env, action_fn, sequence_steps: int | None = None, fps_log: bool = False) -> None:
+    timer = _FrameTimer(env.model.opt.timestep * 5) if fps_log else None
     with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
         tick = 0
         while viewer.is_running():
             started = time.time()
             action_fn(tick if sequence_steps is None else tick % sequence_steps)
             viewer.sync()
+            if timer is not None:
+                timer.tick(started, time.time())
             tick += 1
             _pace(env.model, started)
 
@@ -167,6 +209,7 @@ def mode_grasp(
     mount: str,
     visual_style: str,
     show_hand_axes: bool = False,
+    fps_log: bool = False,
 ) -> None:
     from humanoid_learning.envs.grasp_config import GraspEnvConfig
     from humanoid_learning.envs.sharpa_grasp_env import SharpaGraspEnv
@@ -271,16 +314,19 @@ def mode_grasp(
                   f"side_grasp_gate={expert._side_grasp_gate} functional_orientation_gate={fo.get('gate')}")
 
     if show_hand_axes:
+        timer = _FrameTimer(env.model.opt.timestep * 5) if fps_log else None
         with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
             tick = 0
             while viewer.is_running():
                 started = time.time()
                 step(tick, viewer=viewer)
                 viewer.sync()
+                if timer is not None:
+                    timer.tick(started, time.time())
                 tick += 1
                 _pace(env.model, started)
     else:
-        _run_env(env, step)
+        _run_env(env, step, fps_log=fps_log)
 
 
 def mode_hand_demo(no_restart: bool, visual_style: str) -> None:
@@ -327,6 +373,9 @@ def main() -> None:
     parser.add_argument("--show-hand-axes", action="store_true",
                          help="--grasp only: draw palm local XYZ/inside-normal/empirical-closing/to-object "
                               "debug markers and print a periodic state/force/Gate HUD to stdout. Default OFF.")
+    parser.add_argument("--fps-log", action="store_true",
+                         help="Print periodic real measured compute-time/FPS/stutter stats (see _FrameTimer) "
+                              "to distinguish real slow computation from a viewer/rendering artifact. Default OFF.")
     args = parser.parse_args()
 
     if args.stand:
@@ -337,7 +386,7 @@ def main() -> None:
         mode_planar()
     elif args.grasp:
         mode_grasp(args.object_pos_x, args.object_half_size, args.no_restart,
-                   args.sharpa_mount, args.sharpa_visual_style, args.show_hand_axes)
+                   args.sharpa_mount, args.sharpa_visual_style, args.show_hand_axes, args.fps_log)
     else:
         mode_hand_demo(args.no_restart, args.sharpa_visual_style)
 
