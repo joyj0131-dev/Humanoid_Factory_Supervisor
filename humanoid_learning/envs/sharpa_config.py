@@ -78,6 +78,20 @@ def preshape_suffixes(finger: str) -> list[str]:
 # and then VERIFIED empirically this session (scripts/test_sharpa_grasp.py)
 # to be self-collision-free and to place the thumb roughly opposing the
 # other 4 fingers for a 12cm object -- not assumed correct a priori.
+#
+# [Level-approach session] Tried CMC_FE 1.05 -> 1.8: an isolated FK sweep
+# from a live THUMB_OPPOSE pose showed the thumb tip landing inside the
+# object's Z band (+55 to +44mm at +0.7/+0.9), but applying it GLOBALLY
+# here changes the thumb's preshape from WRIST_SIDE_GRASP_ALIGN onward
+# (set_preshape(1.0) runs there, not just at FIVE_FINGER_PRESHAPE) and
+# the full rollout regressed badly -- ALL curl synergies stayed at 0.0
+# the entire episode and index's Y offset ballooned to 170-180mm (vs
+# ~62-74mm before), meaning the earlier states' own behavior was
+# disrupted (most likely a new self-collision from the much-more-folded
+# thumb cascading through WRIST_SIDE_GRASP_ALIGN/FOREARM_SIDE_DESCEND).
+# Reverted. A real fix needs to apply extra thumb reach locally (e.g.
+# only from THUMB_OPPOSE onward) rather than as this shared, always-on
+# preshape target -- not done this session.
 PRESHAPE_TARGETS: dict[str, dict[str, float]] = {
     "thumb": {"CMC_FE": 1.05, "CMC_AA": 0.0, "MCP_AA": 0.0},
     "index": {"MCP_AA": 0.0},
