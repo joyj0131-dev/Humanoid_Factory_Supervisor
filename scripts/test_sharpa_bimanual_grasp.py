@@ -331,37 +331,31 @@ def test_forward_reach_gate_now_passes_and_advances_to_next_blocker():
     assert not collision_during_forward_reach
 
     # Full rollout: still honestly fails later, at a separate gate.
-    # [Audit session] Both the Side-Grasp Posture Gate AND the (rebuilt)
-    # Functional Orientation Gate pass en route -- see
-    # test_side_grasp_posture_gate_passes / test_functional_orientation_
-    # gate_passes. FOREARM_SIDE_DESCEND's torso-arm collision (a prior
-    # commit's improper Gate relaxation's undisclosed side effect) is
-    # fixed -- the rollout now reaches FINGERTIP_PRECONTACT again and
-    # fails there with PRECONTACT_TRACKING_NOT_ACHIEVED, a known, separate,
-    # disclosed blocker (documented since Session 39) out of this
-    # session's scope.
-    # [Horizontal-Wrap session] The full rollout now advances one state
-    # FURTHER than before (into FINGERTIP_PRECONTACT itself, not just up
-    # to it) and fails with SELF_COLLISION_TORSO_ARM inside PRECONTACT's
-    # own closed-loop correction re-solve -- see test_a_real_bimanual_
-    # gate_a_success_on_size_12's updated docstring for the causal read
-    # (precontact_y_offset_m etc. tuned for the OLD orientation, needs
-    # its own re-tuning pass, out of this session's scope).
+    # [Fingertip-contact session] Both the Horizontal-Wrap Posture Gate
+    # AND the Functional Orientation Gate (including thumb opposition,
+    # fixed this session -- see test_thumb_opposition_subgate_passes_at_
+    # real_pose) now genuinely pass en route. FINGERTIP_PRECONTACT was
+    # rebuilt as a closed-loop inward servo (see that state's own
+    # docstring) and now safely advances the palm from ~207mm down to
+    # roughly 130-140mm real fingertip-object separation without any
+    # forbidden collision, but a genuine kinematic constraint (both
+    # shoulders cannot bring the hand within ~15cm of the robot's own
+    # sagittal midline at this orientation without brushing the torso --
+    # confirmed via multiple independent bounded experiments, see
+    # test_a_real_bimanual_gate_a_success_on_size_12's docstring) still
+    # keeps the real separation well above the 4mm target within the
+    # dedicated precontact_max_steps budget, so the rollout still
+    # honestly times out with PRECONTACT_TRACKING_NOT_ACHIEVED.
     env2 = make_env()
     expert2 = SharpaBimanualGraspExpert(env2)
-    outcome = expert2.run(max_total_steps=2500)
+    outcome = expert2.run(max_total_steps=5000)
     print(f"    full rollout: state={outcome.state.name} failure_reason={outcome.failure_reason} "
           f"side_grasp_gate={outcome.side_grasp_gate} functional_orientation_gate={outcome.functional_orientation_gate}")
     assert outcome.side_grasp_gate is True, "Horizontal-Wrap Posture Gate should still pass en route to the current next blocker"
-    # [Horizontal-Wrap session, honest disclosure] functional_orientation_
-    # gate is currently False solely because of the disclosed thumb-
-    # preshape gap (test_thumb_opposition_subgate_currently_fails_under_
-    # new_orientation) -- NOT reasserted True here, see that test.
-    assert outcome.functional_orientation_gate is False
-    assert outcome.failure_reason == BimanualFailureReason.SELF_COLLISION_TORSO_ARM, (
-        "expected the CURRENT next independent blocker (FINGERTIP_PRECONTACT's own approach geometry, "
-        "tuned for the OLD orientation); if this changed, the docstring/PROJECT_CONTEXT "
-        "next-blocker note is now stale"
+    assert outcome.functional_orientation_gate is True, "Functional Orientation Gate (incl. thumb opposition) should pass en route"
+    assert outcome.failure_reason == BimanualFailureReason.PRECONTACT_TRACKING_NOT_ACHIEVED, (
+        "expected the CURRENT next independent blocker (FINGERTIP_PRECONTACT's own kinematic-reach "
+        "limit); if this changed, the docstring/PROJECT_CONTEXT next-blocker note is now stale"
     )
 
 
@@ -727,23 +721,35 @@ def test_arm_gravity_compensation_reduces_precontact_tracking_error():
 def test_a_real_bimanual_gate_a_success_on_size_12():
     """Honest, currently-failing real SIZE_12 Gate A test.
 
-    [Horizontal-Wrap session] The Horizontal-Wrap Posture Gate
-    (test_side_grasp_posture_gate_passes) now genuinely PASSES with real
-    margin on every axis (wrist joint-limit margins ~58-99deg, nowhere
-    near the old finger-down design's measured 0.0deg-margin wrist_roll
-    lockup) -- the rollout advances through WRIST_SIDE_GRASP_ALIGN ->
-    FIVE_FINGER_PRESHAPE -> FOREARM_SIDE_DESCEND -> FINGERTIP_PRECONTACT
-    (one state FURTHER than before this session's fix) and now fails
-    with SELF_COLLISION_TORSO_ARM inside FINGERTIP_PRECONTACT's own
-    closed-loop correction re-solve -- a NEW downstream finding: the
-    precontact approach geometry (precontact_y_offset_m etc.) was tuned
-    for the OLD finger-down orientation and needs its own re-tuning pass
-    under the new horizontal-wrap geometry (disclosed as this session's
-    single next blocker, out of scope here -- fixing the hand POSE target
-    was this session's mandate, not re-tuning the downstream approach).
-    This test MUST NOT be weakened, deleted, or turned into a smoke
-    assertion to make it pass -- it stays honestly failing until Gate A
-    is actually achieved."""
+    [Fingertip-contact session] The Horizontal-Wrap Posture Gate AND the
+    Functional Orientation Gate (incl. thumb opposition) both genuinely
+    PASS with real margin. FINGERTIP_PRECONTACT was rebuilt as a closed-
+    loop inward servo (real fingertip-to-object-face separation, small
+    per-tick steps, rest_q warm-started from the live qpos, a graduated
+    collision-recovery ladder -- see that state's own docstring) and
+    reliably brings the palm inward WITHOUT any dangerous collision
+    (verified: max_forbidden_hand_table/torso-arm force stays 0.00N
+    across full rollouts). A genuine, newly-diagnosed KINEMATIC
+    constraint remains, though: bringing either hand within roughly
+    150mm of the robot's own sagittal midline at this orientation makes
+    that shoulder graze the torso (measured directly, seed=0:
+    shoulder_yaw_link<->torso_link contact, ~1.7-3N sustained, not a
+    transient spike) -- a bounded set of real-physics experiments this
+    session (sweeping FOREARM_SIDE_DESCEND's own y_offset down to 0.08,
+    sweeping approach height up to 0.25, sweeping forward standoff up to
+    +0.15, and heavily incentivizing waist rotation in the IK's joint
+    cost) all reproduced the same wall or failed to relieve it -- this
+    is not a solver-branch artifact fixable by more IK tuning. A real
+    wrap-direction bug fix (see _horizontal_wrap_target's own docstring)
+    materially reduced how far the palm needs to travel (entry
+    separation 207mm -> 189mm, real end-of-budget separation ~163mm ->
+    ~130-140mm) and fixed the (separately real) thumb-opposition gap,
+    but did not eliminate the wall. The rollout now reaches FINGERTIP_
+    PRECONTACT (unchanged) and still ends in PRECONTACT_TRACKING_NOT_
+    ACHIEVED, honestly, with a much better real separation than before
+    this session and zero forbidden collision. This test MUST NOT be
+    weakened, deleted, or turned into a smoke assertion to make it pass
+    -- it stays honestly failing until Gate A is actually achieved."""
     env = make_env()
     expert = SharpaBimanualGraspExpert(env)
     outcome = expert.run(max_total_steps=8000)
@@ -782,20 +788,16 @@ def test_functional_orientation_gate_passes():
     reads where the fingertips really move (never trusting palm_R
     column 1).
 
-    [Horizontal-Wrap session, honest disclosure] The Thumb Opposition
-    Subgate is checked SEPARATELY below (see
-    test_thumb_opposition_subgate_currently_fails_under_new_orientation)
-    and is NOT asserted True here: under the new horizontal-wrap
-    orientation it measures a small, real, consistently-signed negative
-    residual (thumb_disp_toward_object_mm approx -0.02 to -0.4mm across
-    curl_probe in [0.05, 0.30], both hands) -- FIVE_FINGER_PRESHAPE's own
-    thumb-opposition preshape angle (sharpa_config.PRESHAPE_TARGETS,
-    unchanged this session) was tuned around the OLD, retracted
-    orientation and needs its own re-tuning pass, out of this session's
-    scope (Section 11: only Precontact/Contact-Acquisition tuning is
-    unblocked by a passing Horizontal-Wrap Posture Gate, not preshape-
-    angle retuning). Disclosed as this session's known limitation, not
-    hidden by weakening the subgate itself."""
+    [Fingertip-contact session] The Thumb Opposition Subgate now
+    genuinely passes too: the wrap-direction bug fix in
+    _horizontal_wrap_target (see that function's own docstring -- the
+    wrap axis used to be perpendicular to the standoff-contaminated full
+    horizontal to-object vector instead of the lateral-only component)
+    also fixed the small negative thumb_disp_toward_object_mm residual
+    the prior (Horizontal-Wrap) session measured and disclosed
+    (-0.02 to -0.4mm) -- it is now positive (~0.07mm, both hands,
+    consistently) at the same curl_probe. The combined Functional
+    Orientation Gate is asserted True below again."""
     env = make_env()
     expert = _run_to_align_end(env)
     result = expert._measure_functional_orientation()
@@ -817,14 +819,8 @@ def test_functional_orientation_gate_passes():
         assert r["mean_disp_inward_mm"] > 2.0, f"{side}: mean inward displacement not >2mm"
         assert r["inward_angle_deg"] <= expert.config.side_grasp_inward_angle_tol_deg
         assert r["finger_table_deg"] <= expert.config.side_grasp_finger_table_tol_deg
-    # [Honest, currently-failing] The combined gate stays False solely
-    # because of the disclosed thumb-preshape gap above -- see
-    # test_thumb_opposition_subgate_currently_fails_under_new_orientation.
-    assert result["gate"] is False, (
-        "combined Functional Orientation Gate is expected to still be False this session "
-        "(thumb-preshape retuning is out of scope) -- if this starts passing, tighten this "
-        "test back to asserting True and delete the companion honest-failure test"
-    )
+        assert t["opposed"], f"{side}: thumb must geometrically oppose the 4-finger group"
+    assert result["gate"] is True
 
 
 def test_old_orientation_construction_fails_functional_gate():
@@ -1055,21 +1051,18 @@ def test_thumb_opposition_subgate_is_load_bearing():
     assert forced_result["finger_closure_direction"]["gate"] is True, "finger-closure direction must still independently pass (isolating the thumb subgate as the cause)"
 
 
-def test_thumb_opposition_subgate_currently_fails_under_new_orientation():
-    """[Horizontal-Wrap session, honest disclosure] At the REAL,
-    converged WRIST_SIDE_GRASP_ALIGN pose under the new horizontal-wrap
-    orientation, the Thumb Opposition Subgate currently fails: applying
+def test_thumb_opposition_subgate_passes_at_real_pose():
+    """[Fingertip-contact session] At the REAL, converged WRIST_SIDE_
+    GRASP_ALIGN pose, the Thumb Opposition Subgate now genuinely passes:
     a real thumb-only curl probe moves the thumb toward the 4-finger
-    aperture (good, positive mm) but with a tiny, consistently-signed
-    NEGATIVE component toward the object (measured across curl_probe in
-    [0.05, 0.30]: -0.02mm to -0.4mm, growing with probe size but never
-    flipping sign). This is a real, small property of FIVE_FINGER_
-    PRESHAPE's own thumb-opposition preshape angle (sharpa_config.
-    PRESHAPE_TARGETS, tuned around the OLD orientation, unchanged this
-    session) -- NOT a bug in the subgate or in _object_facing_R, and NOT
-    something this test hides. Locks in the CURRENT, real measurement so
-    a future preshape retuning session has a concrete before/after
-    baseline, and so this does not silently regress further."""
+    aperture AND toward the object (both positive mm). A prior
+    (Horizontal-Wrap) session measured a small, consistently-signed
+    NEGATIVE toward-object component here (-0.02 to -0.4mm) and
+    disclosed it as a known gap; this session's _horizontal_wrap_target
+    fix (the wrap axis no longer mixes in the standoff/X component when
+    choosing the lateral wrap direction -- see that function's own
+    docstring) fixed it as a side effect, without touching FIVE_FINGER_
+    PRESHAPE's own preshape angle at all."""
     env = make_env()
     expert = _run_to_align_end(env)
     result = expert._measure_thumb_opposition(curl_probe=0.15)
@@ -1078,13 +1071,9 @@ def test_thumb_opposition_subgate_currently_fails_under_new_orientation():
         r = result["per_side"][side]
         assert r["aperture_dist_mm"] > 30.0, f"{side}: aperture must still be real/non-degenerate"
         assert r["thumb_disp_toward_aperture_mm"] > 0.0, f"{side}: thumb curl must still close toward the aperture"
-        assert r["thumb_disp_toward_object_mm"] < 0.0, (
-            f"{side}: expected the CURRENTLY-real small negative residual (~-0.02 to -0.4mm) -- "
-            "if this is now >=0, the thumb-preshape gap has been fixed: update this test AND "
-            "test_functional_orientation_gate_passes back to asserting the combined gate True"
-        )
-        assert r["thumb_disp_toward_object_mm"] > -1.0, f"{side}: residual grew unexpectedly large (>1mm), investigate"
-    assert result["gate"] is False
+        assert r["thumb_disp_toward_object_mm"] > 0.0, f"{side}: thumb curl must move toward the object"
+        assert r["opposed"], f"{side}: thumb opposition must hold at the real pose"
+    assert result["gate"] is True
 
 
 def test_side_descend_curl_target_remaining_travel_is_small_but_real():
@@ -1357,6 +1346,89 @@ def test_finger_table_and_ulnar_down_angle_helpers():
     # ~180deg (pointing up) for "right" instead of ~0deg for "left".
     assert abs(sbe_module._ulnar_down_angle_deg("right", R_ulnar_down) - 180.0) < 0.1
     print("    _finger_table_angle_deg/_ulnar_down_angle_deg verified against known synthetic orientations")
+
+
+def test_precontact_servo_makes_real_progress_without_forbidden_collision():
+    """[Fingertip-contact session, new] The closed-loop inward servo
+    (FINGERTIP_PRECONTACT) must reduce the REAL, measured fingertip-to-
+    object-face separation substantially from its entry value, using
+    real env.step() physics, while never exceeding the hard forbidden-
+    collision force (torso-arm/hand-table) at any point -- the low-
+    grade recovery-triggering contact stays well under the hard limit."""
+    env = make_env()
+    env.reset(seed=0)
+    expert = SharpaBimanualGraspExpert(env)
+    entry_sep = None
+    max_torso = 0.0
+    max_table_forbidden = 0.0
+    for _ in range(2000):
+        if expert.state == BimanualGraspState.FAILURE:
+            break
+        prev_state = expert.state
+        action = expert.step()
+        env.step(action)
+        if prev_state == BimanualGraspState.FINGERTIP_PRECONTACT:
+            if entry_sep is None:
+                entry_sep = expert._precontact_separation_m("left")
+            max_torso = max(max_torso, env._torso_arm_collision_force())
+            max_table_forbidden = max(max_table_forbidden, env._hand_table_forces_categorized()["forbidden"])
+            if expert._state_step >= 800:
+                break
+    assert entry_sep is not None, "must have reached FINGERTIP_PRECONTACT"
+    final_sep = expert._precontact_separation_m("left")
+    print(f"    entry_sep={entry_sep*1000:.1f}mm final_sep={final_sep*1000:.1f}mm (after 800 ticks) "
+          f"max_torso={max_torso:.2f}N max_table_forbidden={max_table_forbidden:.2f}N")
+    assert final_sep < entry_sep - 0.020, "servo must reduce real separation by at least 20mm within 800 ticks"
+    assert max_torso <= expert.config.precontact_hard_collision_force_n
+    assert max_table_forbidden <= expert.config.precontact_hard_collision_force_n
+
+
+def test_precontact_recovery_ladder_avoids_hard_fail_on_transient_spike():
+    """[Fingertip-contact session, new] A transient torso-arm contact
+    spike during the precontact servo (measured, real physics: this
+    reach genuinely grazes the torso at times) must trigger the
+    graduated recovery (backoff + temporary rest_gain boost), NOT an
+    immediate hard failure -- confirmed by running long enough to
+    observe at least one real recovery event while the state stays
+    alive (not FAILURE) throughout."""
+    env = make_env()
+    env.reset(seed=0)
+    expert = SharpaBimanualGraspExpert(env)
+    for _ in range(1600):
+        if expert.state == BimanualGraspState.FAILURE:
+            break
+        action = expert.step()
+        env.step(action)
+        if expert.state == BimanualGraspState.FINGERTIP_PRECONTACT and expert._state_step >= 300:
+            break
+    assert expert.state != BimanualGraspState.FAILURE, "must not hard-fail from a recoverable transient collision"
+    print(f"    recovery_count={expert._precontact_recovery_count} state={expert.state.name}")
+    assert sum(expert._precontact_recovery_count.values()) > 0, (
+        "expected at least one real recovery event to have been observed by this point in the reach"
+    )
+
+
+def test_wrap_direction_bug_fix_reduces_fingertip_object_offset():
+    """[Fingertip-contact session, new] Regression guard for the
+    _horizontal_wrap_target bug fix: the OLD wrap direction (perpendicular
+    to the full, standoff-contaminated horizontal to-object vector)
+    measurably put the fingertip FURTHER from the object in Y than the
+    palm itself (~110mm extra, real FK, seed=0). Confirms the CURRENT
+    (fixed) behavior keeps this extra Y offset much smaller, at the real,
+    live FINGERTIP_PRECONTACT entry pose."""
+    env = make_env()
+    env.reset(seed=0)
+    expert = SharpaBimanualGraspExpert(env)
+    for _ in range(1230):
+        if expert.state == BimanualGraspState.FINGERTIP_PRECONTACT:
+            break
+        action = expert.step()
+        env.step(action)
+    palm_pos, _ = env.palm_pose("left")
+    tip = expert._nonthumb_tip_centroid("left")
+    new_offset_y = abs(tip[1] - palm_pos[1])
+    print(f"    real fingertip-palm Y offset={new_offset_y*1000:.1f}mm (OLD, retracted wrap direction measured ~110mm here)")
+    assert new_offset_y * 1000 < 100.0, "wrap-direction fix should keep the fingertip-palm Y offset measurably under the old ~110mm"
 
 
 if __name__ == "__main__":
