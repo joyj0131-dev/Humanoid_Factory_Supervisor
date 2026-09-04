@@ -2866,6 +2866,34 @@ class SharpaBimanualGraspExpert:
                 self._fail(BimanualFailureReason.TIMEOUT)
 
         elif state == BimanualGraspState.THUMB_OPPOSE:
+            # [Level-approach session] FK-verified: the thumb tip sits
+            # 87-125mm above the object's Z center even at full curl --
+            # structurally out of reach regardless of arm position,
+            # because its preshape (CMC_FE) doesn't fold it far enough
+            # toward the palm. Raising CMC_FE's shared preshape TARGET
+            # was tried and reverted (see sharpa_config.py's own
+            # docstring) -- it applies from WRIST_SIDE_GRASP_ALIGN onward
+            # and cascaded into a bad self-collision there. This instead
+            # nudges CMC_FE directly, LOCAL to this state only (small,
+            # guarded steps, capped well inside the joint's real range up
+            # to 1.920 -- FK showed +0.7-0.9 over the 1.05 base brings the
+            # tip inside the object's Z band), so WRIST_SIDE_GRASP_ALIGN/
+            # FOREARM_SIDE_DESCEND's own already-verified behavior is
+            # untouched.
+            if self._state_step == 0:
+                self._thumb_extra_fe = {"left": 0.0, "right": 0.0}
+            hand_hand_now = self.env._hand_hand_contact_force()
+            guard = cfg.precontact_collision_guard_frac * cfg.hand_hand_force_limit_n
+            for side in SIDES:
+                if self._group_ever_contacted[side]["thumb"]:
+                    continue
+                if hand_hand_now > guard:
+                    self._thumb_extra_fe[side] = max(self._thumb_extra_fe[side] - 0.02, 0.0)
+                else:
+                    self._thumb_extra_fe[side] = min(self._thumb_extra_fe[side] + 0.01, 0.75)
+                aid = mujoco.mj_name2id(self.env.model, mujoco.mjtObj.mjOBJ_ACTUATOR,
+                                         sc.sharpa_actuator(side, "thumb", "CMC_FE"))
+                self.env.data.ctrl[aid] = sc.PRESHAPE_TARGETS["thumb"]["CMC_FE"] + self._thumb_extra_fe[side]
             deltas = {"left": {}, "right": {}}
             for side in SIDES:
                 for group in sc.GROUPS:
