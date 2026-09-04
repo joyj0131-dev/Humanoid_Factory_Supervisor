@@ -331,21 +331,19 @@ def test_forward_reach_gate_now_passes_and_advances_to_next_blocker():
     assert not collision_during_forward_reach
 
     # Full rollout: still honestly fails later, at a separate gate.
-    # [Fingertip-contact session] Both the Horizontal-Wrap Posture Gate
-    # AND the Functional Orientation Gate (including thumb opposition,
-    # fixed this session -- see test_thumb_opposition_subgate_passes_at_
-    # real_pose) now genuinely pass en route. FINGERTIP_PRECONTACT was
-    # rebuilt as a closed-loop inward servo (see that state's own
-    # docstring) and now safely advances the palm from ~207mm down to
-    # roughly 130-140mm real fingertip-object separation without any
-    # forbidden collision, but a genuine kinematic constraint (both
-    # shoulders cannot bring the hand within ~15cm of the robot's own
-    # sagittal midline at this orientation without brushing the torso --
-    # confirmed via multiple independent bounded experiments, see
-    # test_a_real_bimanual_gate_a_success_on_size_12's docstring) still
-    # keeps the real separation well above the 4mm target within the
-    # dedicated precontact_max_steps budget, so the rollout still
-    # honestly times out with PRECONTACT_TRACKING_NOT_ACHIEVED.
+    # [Direct-grasp session] Both the Horizontal-Wrap Posture Gate AND
+    # the Functional Orientation Gate (including thumb opposition, fixed
+    # in the fingertip-contact session -- see test_thumb_opposition_
+    # subgate_passes_at_real_pose) still genuinely pass en route.
+    # FINGERTIP_PRECONTACT's inward servo is now BYPASSED by default
+    # (skip_precontact_servo=True) -- FOREARM_SIDE_DESCEND was rebuilt to
+    # re-derive orientation fresh per waypoint and reach real fingertip-
+    # object separation down to the ~15-40mm range (was ~130-140mm),
+    # advancing straight into CONTACT_ACQUIRE, where a real contact was
+    # observed in bounded testing on at least one hand/side (see
+    # test_a_real_bimanual_gate_a_success_on_size_12's docstring) but not
+    # yet reliably on both sides within budget, so the rollout still
+    # honestly times out in CONTACT_ACQUIRE.
     env2 = make_env()
     expert2 = SharpaBimanualGraspExpert(env2)
     outcome = expert2.run(max_total_steps=5000)
@@ -353,9 +351,9 @@ def test_forward_reach_gate_now_passes_and_advances_to_next_blocker():
           f"side_grasp_gate={outcome.side_grasp_gate} functional_orientation_gate={outcome.functional_orientation_gate}")
     assert outcome.side_grasp_gate is True, "Horizontal-Wrap Posture Gate should still pass en route to the current next blocker"
     assert outcome.functional_orientation_gate is True, "Functional Orientation Gate (incl. thumb opposition) should pass en route"
-    assert outcome.failure_reason == BimanualFailureReason.PRECONTACT_TRACKING_NOT_ACHIEVED, (
-        "expected the CURRENT next independent blocker (FINGERTIP_PRECONTACT's own kinematic-reach "
-        "limit); if this changed, the docstring/PROJECT_CONTEXT next-blocker note is now stale"
+    assert outcome.failure_reason == BimanualFailureReason.TIMEOUT, (
+        "expected the CURRENT next independent blocker (CONTACT_ACQUIRE not yet reaching bilateral "
+        "contact within budget); if this changed, the docstring/PROJECT_CONTEXT next-blocker note is stale"
     )
 
 
@@ -721,35 +719,37 @@ def test_arm_gravity_compensation_reduces_precontact_tracking_error():
 def test_a_real_bimanual_gate_a_success_on_size_12():
     """Honest, currently-failing real SIZE_12 Gate A test.
 
-    [Fingertip-contact session] The Horizontal-Wrap Posture Gate AND the
-    Functional Orientation Gate (incl. thumb opposition) both genuinely
-    PASS with real margin. FINGERTIP_PRECONTACT was rebuilt as a closed-
-    loop inward servo (real fingertip-to-object-face separation, small
-    per-tick steps, rest_q warm-started from the live qpos, a graduated
-    collision-recovery ladder -- see that state's own docstring) and
-    reliably brings the palm inward WITHOUT any dangerous collision
-    (verified: max_forbidden_hand_table/torso-arm force stays 0.00N
-    across full rollouts). A genuine, newly-diagnosed KINEMATIC
-    constraint remains, though: bringing either hand within roughly
-    150mm of the robot's own sagittal midline at this orientation makes
-    that shoulder graze the torso (measured directly, seed=0:
-    shoulder_yaw_link<->torso_link contact, ~1.7-3N sustained, not a
-    transient spike) -- a bounded set of real-physics experiments this
-    session (sweeping FOREARM_SIDE_DESCEND's own y_offset down to 0.08,
-    sweeping approach height up to 0.25, sweeping forward standoff up to
-    +0.15, and heavily incentivizing waist rotation in the IK's joint
-    cost) all reproduced the same wall or failed to relieve it -- this
-    is not a solver-branch artifact fixable by more IK tuning. A real
-    wrap-direction bug fix (see _horizontal_wrap_target's own docstring)
-    materially reduced how far the palm needs to travel (entry
-    separation 207mm -> 189mm, real end-of-budget separation ~163mm ->
-    ~130-140mm) and fixed the (separately real) thumb-opposition gap,
-    but did not eliminate the wall. The rollout now reaches FINGERTIP_
-    PRECONTACT (unchanged) and still ends in PRECONTACT_TRACKING_NOT_
-    ACHIEVED, honestly, with a much better real separation than before
-    this session and zero forbidden collision. This test MUST NOT be
-    weakened, deleted, or turned into a smoke assertion to make it pass
-    -- it stays honestly failing until Gate A is actually achieved."""
+    [Direct-grasp session] FOREARM_SIDE_DESCEND was rebuilt to re-derive
+    orientation FRESH at every waypoint (never frozen), with a per-DOF
+    joint cost discouraging shoulder tuck (DESCEND_JOINT_WEIGHT), fixing
+    two real bugs found this session: (1) a sub_frac bookkeeping bug that
+    kept SLERPing the orientation back toward a stale start_R after the
+    waypoint schedule finished, causing real separation to visibly
+    regress in the final ticks; (2) the finger-closure measurement being
+    contaminated by leftover pre-curl when isolated test scripts didn't
+    also drive the curl-opening action DESCEND applies for real. Fixed,
+    this reaches real fingertip-object separation as low as ~15-40mm
+    (down from ~130-140mm earlier this session, and ~207mm before any of
+    this work) -- FINGERTIP_PRECONTACT's own servo is bypassed by default
+    now (skip_precontact_servo=True) since DESCEND alone gets close
+    enough. A REAL, sustained 2-finger-group contact (peak ~3-4N) was
+    observed on one hand in bounded testing, proving contact is
+    physically reachable from this pose -- but not yet reliably on BOTH
+    hands within budget (the two sides diverge non-symmetrically during
+    the redundant solve, a real, only partially understood asymmetry),
+    and a real large-curl finding emerged: the Sharpa hand's actual
+    synergy-driven closing kinematics (not the small-signal LOCAL_
+    CLOSING_VEC approximation) drift fingertips substantially UPWARD in Z
+    as curl approaches 1.0 in this orientation, which can carry them past
+    the object's own height band instead of onto its surface. The
+    rollout currently still ends in CONTACT_ACQUIRE's own TIMEOUT
+    (bilateral contact not reached), honestly, with dramatically better
+    real separation and zero uncontrolled object displacement (a real
+    ~90mm object-push bug from an earlier, too-aggressive version of
+    CONTACT_ACQUIRE's own reach-with-the-uncontacted-hand logic was found
+    and fixed by shrinking that step). This test MUST NOT be weakened,
+    deleted, or turned into a smoke assertion to make it pass -- it stays
+    honestly failing until Gate A is actually achieved."""
     env = make_env()
     expert = SharpaBimanualGraspExpert(env)
     outcome = expert.run(max_total_steps=8000)
