@@ -735,6 +735,19 @@ class BimanualGraspConfig:
     # [Direct-grasp session] 0.05 -> 0.01 / 0.15 -> 0.055, together with
     # side_descend_standoff_m's fix above -- see that field's own
     # docstring for the real-physics grid this pair was chosen from.
+    #
+    # [Palm-press session] Tried -0.02 (a per-fingertip Z sweep showed it
+    # brings index/middle/ring/pinky all inside the object's Z band with
+    # 0.00N table force at the DESCEND-exit instant) but reverted: run
+    # through the FULL real state machine, it broke FOREARM_SIDE_DESCEND's
+    # own wrist_yaw-trim convergence (CONTACT_ACQUIRE-entry separation
+    # regressed from ~20mm to ~65mm, then diverged further to ~120mm
+    # within 30 more ticks with zero contact for the whole episode,
+    # measured) -- height interacts with that trim mechanism in a way a
+    # single-instant Z check does not capture. Left at the prior verified
+    # value; the real fix this session is CONTACT_ACQUIRE's palm-press
+    # sub-phase below, not this field. Revisit height only with a full
+    # rollout re-verification, not a DESCEND-exit-only snapshot.
     side_descend_height_m: float = 0.01
     side_descend_y_offset_m: float = 0.10
     # [Open-preshape session] 0.95 -> 0.7. Curls index/middle/wrap LESS
@@ -2546,23 +2559,32 @@ class SharpaBimanualGraspExpert:
                 self._fail(BimanualFailureReason.PRECONTACT_TRACKING_NOT_ACHIEVED)
 
         elif state == BimanualGraspState.CONTACT_ACQUIRE:
-            # Both sides close INDEPENDENTLY/asynchronously: a side/group
-            # that has already registered contact stops advancing while
-            # the other side keeps closing (Section 4 requirement 7/8).
+            # [Palm-press session] "블록을 손바닥에 먼저 붙이고 손가락을
+            # 접어라": a side does NOT start curling until its own palm
+            # has registered real contact force against the object.
+            # Measured this session: closing fingers before the palm ever
+            # touches (previous design) relied entirely on wrist-rotation
+            # sweeping fingertips through a wide arc while the palm base
+            # body itself stayed 31-38mm away at 0.00N contact for the
+            # ENTIRE state -- rotating the wrist barely translates the
+            # palm plate, which sits close to that rotation axis. So this
+            # state now has two sub-phases per side: PALM-PRESS (drive the
+            # palm toward the object's real nearest surface point, no
+            # curling yet) until real palm contact registers, then the
+            # existing curl-toward-Gate-A behavior.
             if self._state_step == 0:
                 self._contact_acquire_recovery_until = {"left": 0, "right": 0}
-                # [Retreat-report session] Anchor the servo target to the
-                # ENTRY pose + a cumulative intended offset, not to
-                # "current palm_pos" every tick -- re-deriving the target
-                # from the live (possibly slightly-off-converged) pose
-                # every tick let per-tick IK residual bias compound over
-                # the now much-longer CONTACT_ACQUIRE run (up to
-                # contact_acquire_max_steps) into tens of mm of real,
-                # measured drift in X/Z that had nothing to do with the
-                # intended pure-lateral nudge -- exactly the kind of
-                # unintended backward drift the user reported seeing.
+                # Anchor the servo target to a ONE-TIME pose snapshot + a
+                # cumulative intended offset, not to "current palm_pos"
+                # every tick -- re-deriving the target from the live
+                # (possibly slightly-off-converged) pose every tick let
+                # per-tick IK residual bias compound over a long run into
+                # tens of mm of real, measured drift with no commanded
+                # cause (this session's other verified fix).
                 self._contact_acquire_anchor = {s: self.env.palm_pose(s)[0].copy() for s in SIDES}
                 self._contact_acquire_offset = {"left": 0.0, "right": 0.0}
+                self._palm_press_offset = {"left": 0.0, "right": 0.0}
+                self._palm_ever_contacted = {"left": False, "right": False}
                 if self._initial_obj_xy is None:
                     # [Direct-grasp session] Object displacement was NOT
                     # tracked at all before CONTACT_ACQUIRE (only from
@@ -2573,10 +2595,24 @@ class SharpaBimanualGraspExpert:
                     # here too instead of silently reporting 0.0.
                     self._initial_obj_xy = self._object_pos()[:2].copy()
             self._track_stability()
+
+            for side in SIDES:
+                was_contacted = self._palm_ever_contacted[side]
+                if self.env._palm_contact_force(side) > cfg.contact_force_threshold_n:
+                    self._palm_ever_contacted[side] = True
+                if self._palm_ever_contacted[side] and not was_contacted:
+                    # Just pressed -- re-anchor the (now separate) lateral
+                    # fine-servo phase from THIS pose, not the old
+                    # far-away DESCEND-exit anchor, so phase 2 doesn't
+                    # jump.
+                    self._contact_acquire_anchor[side] = self.env.palm_pose(side)[0].copy()
+                    self._contact_acquire_offset[side] = 0.0
+
             deltas = {"left": {}, "right": {}}
             for side in SIDES:
                 for group in ("index", "middle", "wrap"):
-                    if not self._group_contact_now(side, group):
+                    touched = self._group_contact_now(side, group)
+                    if self._palm_ever_contacted[side] and not touched:
                         deltas[side][group] = cfg.close_rate_per_step
             action[17:25] = self._group_action(deltas)
 
@@ -2584,13 +2620,8 @@ class SharpaBimanualGraspExpert:
             # contact (any of index/middle/wrap) was measured to strand
             # index/middle ~20mm short forever, because wrap (physically
             # closest) always touches first and used to stop the approach
-            # right there. Now a side keeps taking small inward steps
-            # (same recipe as FOREARM_SIDE_DESCEND's own servo --
-            # object-facing orientation held fixed at the frozen
-            # _descend_locked_R, PRECONTACT_JOINT_WEIGHT discouraging
-            # shoulder tuck, graduated collision recovery) until
-            # _side_reach_ready (wrap AND index-or-middle); only then does
-            # it hold its CURRENT position so the contact is not disturbed.
+            # right there. _side_reach_ready (wrap AND index-or-middle)
+            # matches Gate A's real topology need instead.
             torso_force_now = self.env._torso_arm_collision_force()
             table_forces_now = self.env._hand_table_forces_categorized()
             hand_hand_now = self.env._hand_hand_contact_force()
@@ -2605,18 +2636,56 @@ class SharpaBimanualGraspExpert:
             targets = {}
             R = {}
             need_solve = False
+            joint_weight = self.PRECONTACT_JOINT_WEIGHT.copy()
             for side in SIDES:
                 side_has_contact = self._side_reach_ready(side)
                 palm_pos, _ = self.env.palm_pose(side)
                 if side_has_contact:
                     targets[side] = palm_pos
-                else:
+                elif not self._palm_ever_contacted[side]:
+                    # PALM-PRESS: drive the palm toward the object along
+                    # the SAME lateral (Y) closing axis as the rest of
+                    # this grasp, not a generic nearest-point-on-box
+                    # vector -- tried that first and it silently pulled
+                    # the palm toward whichever face the anchor happened
+                    # to overshoot most (the object's TOP face, when
+                    # fingertips started above the Z band), which is the
+                    # wrong contact surface for this Horizontal-Wrap
+                    # grasp. Real fix for reaching the correct face is
+                    # side_descend_height_m (Z pre-alignment, see that
+                    # field's docstring) -- this phase only adds
+                    # loosened shoulder/elbow weight so genuine
+                    # translation (not just wrist rotation, which barely
+                    # moves the palm plate) is reachable by the solver.
                     need_solve = True
-                    # A group that already touched (typically wrap) can
-                    # still be pushed harder as the approach continues
-                    # toward index/middle -- guard on ITS force too, not
-                    # just torso/table collision, so this gentle push
-                    # never turns into a real over-force event.
+                    anchor = self._contact_acquire_anchor[side]
+                    direction = np.array([0.0, -Y_SIGN[side], 0.0])
+                    in_recovery = self._total_step < self._contact_acquire_recovery_until[side]
+                    if collision_now and not in_recovery:
+                        self._contact_acquire_recovery_until[side] = self._total_step + cfg.precontact_recovery_ticks
+                        in_recovery = True
+                    if in_recovery:
+                        step = -cfg.precontact_recovery_backoff_m / cfg.precontact_recovery_ticks
+                    else:
+                        step = cfg.precontact_servo_step_m * 0.1
+                    self._palm_press_offset[side] = float(np.clip(
+                        self._palm_press_offset[side] + step, 0.0,
+                        cfg.side_descend_standoff_m + cfg.side_descend_y_offset_m,
+                    ))
+                    targets[side] = anchor + direction * self._palm_press_offset[side]
+                    shoulder_idx = [3, 4, 5] if side == "left" else [10, 11, 12]
+                    elbow_idx = [6] if side == "left" else [13]
+                    joint_weight[shoulder_idx] = 3.0
+                    joint_weight[elbow_idx] = 1.5
+                else:
+                    # Palm already pressed -- same lateral fine-servo as
+                    # before to help index/middle also reach real contact
+                    # while curl runs. A group that already touched
+                    # (typically wrap) can still be pushed harder as this
+                    # continues -- guard on ITS force too, not just
+                    # torso/table collision, so this gentle push never
+                    # turns into a real over-force event.
+                    need_solve = True
                     contacted_peak = max(
                         (self.env._group_contact_force(side, g)[0]
                          for g in ("index", "middle", "wrap") if self._group_ever_contacted[side][g]),
@@ -2633,12 +2702,12 @@ class SharpaBimanualGraspExpert:
                         # [Direct-grasp session] Much gentler than
                         # FOREARM_SIDE_DESCEND's own step -- by this point
                         # curl alone is already closing most of the
-                        # remaining gap (measured: down to ~15-20mm), and
-                        # measured real physics showed a too-aggressive
-                        # simultaneous arm nudge + curl combination can
-                        # push the OBJECT itself away before a stable
-                        # contact registers (real object displacement
-                        # observed, ~90mm in one run) instead of helping.
+                        # remaining gap, and measured real physics showed
+                        # a too-aggressive simultaneous arm nudge + curl
+                        # combination can push the OBJECT itself away
+                        # before a stable contact registers (real object
+                        # displacement observed, ~90mm in one run) instead
+                        # of helping.
                         step = cfg.precontact_servo_step_m * 0.05
                     # Cap at the full lateral gap DESCEND started from --
                     # letting the commanded offset keep growing past what
@@ -2655,7 +2724,7 @@ class SharpaBimanualGraspExpert:
                 result = self._solve_both(
                     targets, R, require_orientation=False, ori_task_weight=0.3,
                     rest_q=self._current_rest_q(), rest_gain=0.3, pos_tol=cfg.precontact_servo_pos_tol_m,
-                    joint_weight=self.PRECONTACT_JOINT_WEIGHT,
+                    joint_weight=joint_weight,
                 )
                 self._apply_ik_result(result)
                 action[0:3] = self._waist_action_toward_target()

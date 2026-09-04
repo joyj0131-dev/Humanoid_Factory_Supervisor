@@ -233,6 +233,34 @@ class SharpaGraspEnv(gym.Env):
         self.data.ctrl[self._preshape_act_ids[side]] = fraction * self._preshape_targets[side]
 
     # ------------------------------------------------------------------
+    # [Palm-press session] The palm's own base body -- verified in the
+    # compiled model (mj_name2id), not guessed -- is a SEPARATE contact
+    # channel from any finger group: fingertip closure via wrist rotation
+    # was measured to leave this body at 0.00N contact for an entire
+    # CONTACT_ACQUIRE run even while wrap fingers touched, confirming the
+    # palm plate itself never presses against the object.
+    _PALM_BODY = {"left": "left_left_hand_C_MC", "right": "right_right_hand_C_MC"}
+
+    def _palm_contact_force(self, side: str) -> float:
+        """Peak single-contact force (N) between this side's palm base
+        body and the object."""
+        model, data = self.model, self.data
+        obj_body = self._object_body_id
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, self._PALM_BODY[side])
+        peak = 0.0
+        for i in range(data.ncon):
+            c = data.contact[i]
+            b1, b2 = model.geom_bodyid[c.geom1], model.geom_bodyid[c.geom2]
+            if obj_body not in (b1, b2):
+                continue
+            other = b2 if b1 == obj_body else b1
+            if other != bid:
+                continue
+            force6 = np.zeros(6)
+            mujoco.mj_contactForce(model, data, i, force6)
+            peak = max(peak, float(np.linalg.norm(force6[:3])))
+        return peak
+
     def _group_contact_force(self, side: str, group: str) -> tuple[float, float]:
         """Returns (peak_single_contact_N, net_group_force_N) between
         this finger group's real bodies and the object."""
