@@ -736,18 +736,15 @@ class BimanualGraspConfig:
     # side_descend_standoff_m's fix above -- see that field's own
     # docstring for the real-physics grid this pair was chosen from.
     #
-    # [Palm-press session] Tried -0.02 (a per-fingertip Z sweep showed it
-    # brings index/middle/ring/pinky all inside the object's Z band with
-    # 0.00N table force at the DESCEND-exit instant) but reverted: run
-    # through the FULL real state machine, it broke FOREARM_SIDE_DESCEND's
-    # own wrist_yaw-trim convergence (CONTACT_ACQUIRE-entry separation
-    # regressed from ~20mm to ~65mm, then diverged further to ~120mm
-    # within 30 more ticks with zero contact for the whole episode,
-    # measured) -- height interacts with that trim mechanism in a way a
-    # single-instant Z check does not capture. Left at the prior verified
-    # value; the real fix this session is CONTACT_ACQUIRE's palm-press
-    # sub-phase below, not this field. Revisit height only with a full
-    # rollout re-verification, not a DESCEND-exit-only snapshot.
+    # [Level-approach session] Tried -0.02 together with a second
+    # (wrist_roll) trim, both FK-verified to help fingertip Z-alignment
+    # and Y-separation individually -- but the FULL rollout revealed a
+    # real, serious regression: the object got pushed a measured 47mm
+    # (past the 30mm Gate A displacement limit) by CONTACT_ACQUIRE's own
+    # curl-delta logic reacting to marginal/oscillating contact at this
+    # geometry. Reverted to the last known-SAFE value; see
+    # PROJECT_CONTEXT.md for the full writeup and the curl-delta runaway
+    # hypothesis this session did not get to finish verifying.
     side_descend_height_m: float = 0.01
     side_descend_y_offset_m: float = 0.10
     # [Open-preshape session] 0.95 -> 0.7. Curls index/middle/wrap LESS
@@ -2593,6 +2590,22 @@ class SharpaBimanualGraspExpert:
                 self._palm_press_offset = {"left": 0.0, "right": 0.0}
                 self._palm_ever_contacted = {"left": False, "right": False}
                 self._palm_contact_streak = {"left": 0, "right": 0}
+                # [Level-approach session] Re-sync the held orientation
+                # target to what the arm is ACTUALLY holding right now,
+                # not the pre-trim waypoint-schedule value _descend_locked_R
+                # still carries -- DESCEND's wrist_yaw/roll trim adds raw
+                # joint deltas directly (see that block's own comment), so
+                # by DESCEND-exit the REAL orientation has already drifted
+                # from _descend_locked_R by however much the trim moved.
+                # CONTACT_ACQUIRE's first solve softly targets
+                # _descend_locked_R (ori_task_weight=0.3) while hard-
+                # anchoring position (pos_tol=0.0005) -- feeding it a
+                # stale, untrimmed orientation target made the IK yank the
+                # shoulder to reconcile both at once, measured to spike
+                # torso-arm force 0.00N -> 38-53N in a single tick right
+                # after entry. Using the real achieved orientation here
+                # means position and orientation targets agree from tick 0.
+                self._descend_locked_R = {s: self.env.palm_pose(s)[1].copy() for s in SIDES}
                 if self._initial_obj_xy is None:
                     # [Direct-grasp session] Object displacement was NOT
                     # tracked at all before CONTACT_ACQUIRE (only from
@@ -2652,6 +2665,16 @@ class SharpaBimanualGraspExpert:
                 return action
             if table_forces_now["forbidden"] > cfg.precontact_hard_collision_force_n:
                 self._fail(BimanualFailureReason.HAND_TABLE_COLLISION)
+                return action
+            # [Level-approach session] object_xy_displacement_limit_m was
+            # previously only checked at TABLETOP_HOLD's exit -- CONTACT_
+            # ACQUIRE could silently push the object arbitrarily far for
+            # its whole budget (measured, a bad geometry combination: 47mm
+            # of real object drift over ~1200 ticks, well past the 30mm
+            # Gate A limit, with no failure raised until far later, if
+            # ever). Check live here too.
+            if self.object_xy_displacement() > cfg.object_xy_displacement_limit_m:
+                self._fail(BimanualFailureReason.OBJECT_MOVED_TOO_MUCH)
                 return action
             guard = cfg.precontact_collision_guard_frac * cfg.hand_hand_force_limit_n
             collision_now = torso_force_now > guard or table_forces_now["forbidden"] > guard
