@@ -143,6 +143,34 @@ LOCAL_CLOSING_VEC = LOCAL_CLOSING_VEC / np.linalg.norm(LOCAL_CLOSING_VEC)
 # direction), so it is kept as a fixed local vector, not re-measured.
 LOCAL_APPROACH_VEC = np.array([1.0, 0.0, 0.0])
 
+# [Horizontal-Wrap session] Ulnar (pinky-side) local axis -- rigid-body
+# FK measurement (/tmp scratch script, folded into
+# scripts/measure_sharpa_side_grasp_axes.py's methodology: palm_R.T @
+# (pinky_MC_body_pos - palm_pos) vs the same for thumb_CMC_VL, at BOTH
+# stand pose and FOREARM_FORWARD_REACH's end pose -- identical in both,
+# confirming a structural/rigid property, not a pose artifact). Per-
+# finger local-Z components (left hand, either pose): thumb=-0.0260,
+# index=-0.0303, middle=-0.0100, ring=+0.0103, pinky=+0.0263 -- a clean,
+# monotonic radial(thumb/index)->ulnar(pinky) spread along local Z. This
+# coincides (within measurement noise, dot product against
+# cross(LOCAL_APPROACH_VEC, LOCAL_CLOSING_VEC) is +1) with the third axis
+# of the (approach, closing) frame, i.e. local +Z -- so it is defined as
+# that cross product directly rather than the raw (noisier, X/Z-mixed
+# because thumb and pinky also differ along the approach axis) pinky-
+# minus-thumb vector.
+LOCAL_ULNAR_VEC = np.cross(LOCAL_APPROACH_VEC, LOCAL_CLOSING_VEC)
+LOCAL_ULNAR_VEC = LOCAL_ULNAR_VEC / np.linalg.norm(LOCAL_ULNAR_VEC)
+# [Horizontal-Wrap session] Sign of LOCAL_ULNAR_VEC that actually points
+# toward the pinky, per side -- MEASURED (dot product of the same FK
+# vector above against LOCAL_ULNAR_VEC), not assumed from Y_SIGN or any
+# other existing left/right convention in this file: left hand measures
+# +1 (pinky at +local Z), right hand measures -1 (pinky at -local Z).
+# This differs per side because the left/right Sharpa Wave XMLs are two
+# independently authored mirrored meshes (see sharpa_config.py's
+# "left_left_..." docstring), not a single mesh reflected by convention,
+# so the sign is not assumed to follow any other axis's mirror rule.
+ULNAR_SIGN = {"left": 1.0, "right": -1.0}
+
 
 def _wahba_R(local_vecs: list, world_vecs: list, weights: list) -> np.ndarray:
     """Kabsch/Wahba best-fit rotation: R minimizing
@@ -158,69 +186,140 @@ def _wahba_R(local_vecs: list, world_vecs: list, weights: list) -> np.ndarray:
     return U @ np.diag([1.0, 1.0, d]) @ Vt
 
 
-def _down_target(to_obj_dir: np.ndarray, inward_weight: float = 0.60) -> np.ndarray:
-    """Desired world direction for the finger-longitudinal axis: mostly
-    down, slightly inward toward the object (not straight down into the
-    table, not straight sideways at the object).
+def _horizontal_wrap_target(to_obj_dir: np.ndarray, current_approach_world: np.ndarray, side: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """[Horizontal-Wrap session] REPLACES _down_target. _down_target
+    forced the finger-longitudinal axis toward world -Z (fingers pointing
+    down at the table) -- an incorrect task specification: the reference
+    posture (user-supplied screenshot, top-down view) shows palms nearly
+    VERTICAL facing the object's own left/right side faces, fingers
+    nearly HORIZONTAL wrapping the object's front/back edges, and only
+    the pinky-side (ulnar) edge of the hand resting near the table -- not
+    fingertips pointing down into it.
 
-    [Audit session -- weight re-derivation] inward_weight=0.60 (was
-    0.18). This is NOT a free tuning knob relaxed to make a Gate pass --
-    see _object_facing_R's docstring for the actual audit: the previous
-    (w_closing=0.95, inward_weight=0.18) pair was found to force
-    finger_down_deg to ~34.8-35.8deg REGARDLESS of inward_weight (0.0-
-    0.5 tested, <1deg sensitivity) once w_closing is that high, which is
-    why the OTHER commit under audit here widened the Gate's own
-    finger_down tolerance (25->40deg) instead of fixing this. That Gate
-    change is reverted (side_grasp_finger_down_tol_deg is back to 25.0);
-    this weight pair is the actual fix: a real-physics grid sweep
-    (w_closing, inward_weight) found (0.68, 0.60) is the combination
-    with the best simultaneous margin under BOTH the unchanged 15deg
-    closing-axis tolerance and the unchanged 25deg finger-down tolerance
-    (measured, real env.step() physics through WRIST_SIDE_GRASP_ALIGN/
-    FIVE_FINGER_PRESHAPE, seed=0: inward 12.63/12.66deg, finger-down
-    22.61/22.59deg, torso-arm 0.00N, hand-table 0.76N -- ~2.3deg real
-    margin on both axes, not a boundary-hugging value)."""
-    horiz = to_obj_dir.copy()
-    horiz[2] = 0.0
-    n = np.linalg.norm(horiz)
-    horiz = horiz / n if n > 1e-9 else np.zeros(3)
-    d = (1 - inward_weight) * np.array([0.0, 0.0, -1.0]) + inward_weight * horiz
-    return d / np.linalg.norm(d)
+    Returns three world targets for a 3-vector Wahba fit
+    (see _object_facing_R):
+      - closing_target: the REAL (full 3D, unprojected) palm->object
+        direction -- same convention _object_facing_angle_deg (the Gate's
+        own palm-inward metric, unchanged) already measures against, so
+        the closing axis genuinely tracks the object regardless of any
+        height offset between palm and object. The palm PLANE ends up
+        close to vertical as a natural consequence whenever the lateral
+        offset dominates the height offset (true at this approach's own
+        geometry), without needing an exact-horizontal target that would
+        otherwise conflict with the unchanged 15deg WRIST_NOT_OBJECT_
+        FACING check (measured: an exact-horizontal target reproduces a
+        systematic ~20deg+ residual purely from the align pose's own
+        height/y-offset ratio, an artifact of the projection, not of fit
+        quality -- WRIST_NOT_OBJECT_FACING fails outright under it).
+      - wrap_target: HORIZONTAL, exactly perpendicular to the horizontal
+        (Z=0) component of the palm->object direction (rotate 90deg
+        within the XY plane) -- the new finger-longitudinal target,
+        replacing "mostly down". Provably orthogonal to closing_target
+        regardless of closing_target's own Z component (wrap_target's
+        X/Y are proportional to closing_target's own X/Y direction, just
+        rotated 90 degrees, and wrap_target_z=0). There are two
+        perpendicular candidates (front-wrap vs back-wrap); the one
+        closer to whatever approach-axis direction the wrist is
+        CURRENTLY, already holding is chosen, for continuity with the
+        incoming trajectory (Section 5 objective priority 7) rather than
+        an arbitrary fixed convention -- UNLESS that choice conflicts
+        with Constraint C (ulnar-down), in which case handedness wins
+        (see below): continuity is this session's LOWEST-priority
+        objective (Section 5, priority 7), ulnar-down is priority 5.
+      - ulnar_target: exactly world -Z. Exactly orthogonal to wrap_target
+        (which has zero Z); only approximately orthogonal to
+        closing_target when closing_target has a nonzero Z component
+        (i.e. palm and object are at different heights) -- handled by
+        the same weighted-least-squares Wahba fit already used for the
+        (non-exactly-orthogonal) LOCAL_APPROACH_VEC/LOCAL_CLOSING_VEC
+        local pair, not a new kind of approximation.
+
+    [Bug found empirically, fixed here] The two perpendicular wrap
+    candidates are not just a left/right choice -- (approach, closing,
+    ulnar) is a RIGHT-HANDED local frame FOR THE LEFT HAND (LOCAL_ULNAR_
+    VEC is literally built as cross(LOCAL_APPROACH_VEC, LOCAL_CLOSING_
+    VEC)) but a LEFT-HANDED one for the right hand (ULNAR_SIGN["right"]
+    = -1 flips only the third local axis, which is exactly a reflection,
+    i.e. a handedness flip -- an expected, measured consequence of the
+    two hands being independently-authored mirrored meshes, see
+    ULNAR_SIGN's own docstring). The world target frame (wrap_target,
+    closing_target, ulnar_target) must match EACH side's own handedness
+    for the Wahba fit to be able to satisfy all three targets
+    simultaneously -- using the SAME (left-hand) handedness rule for
+    both sides silently forces the RIGHT hand's ulnar axis to fit best
+    on the WRONG side (measured: ulnar_down_deg ~147-161deg -- pointing
+    UP -- for the right hand only, across every weight combination
+    tried, before this per-side fix). Picking wrap_target by "closest to
+    current approach axis" alone does not track handedness at all -- it
+    must be checked explicitly, per side.
+    """
+    horiz_to_obj = to_obj_dir.copy()
+    horiz_to_obj[2] = 0.0
+    n = np.linalg.norm(horiz_to_obj)
+    horiz_to_obj = horiz_to_obj / n if n > 1e-9 else np.array([0.0, 1.0, 0.0])
+    wrap_a = np.array([-horiz_to_obj[1], horiz_to_obj[0], 0.0])
+    wrap_b = -wrap_a
+    ulnar_target = np.array([0.0, 0.0, -1.0])
+    # Handedness check (hard requirement, per side -- see docstring
+    # above): for the left hand (ULNAR_SIGN=+1) cross(wrap, closing)
+    # must point toward -Z (matching ulnar_target directly); for the
+    # right hand (ULNAR_SIGN=-1, mirrored/left-handed local frame) it
+    # must point toward +Z instead.
+    desired_cross_z_sign = -ULNAR_SIGN[side]
+    handed_ok = [w for w in (wrap_a, wrap_b)
+                 if np.sign(np.cross(w, to_obj_dir)[2]) == desired_cross_z_sign]
+    if len(handed_ok) == 1:
+        wrap_target = handed_ok[0]
+    else:
+        # Both (degenerate closing_target) or neither (should not happen
+        # for a non-degenerate closing_target) satisfy handedness -- fall
+        # back to the continuity choice among whatever remains.
+        candidates = handed_ok if handed_ok else [wrap_a, wrap_b]
+        cur_horiz = current_approach_world.copy()
+        cur_horiz[2] = 0.0
+        cur_n = np.linalg.norm(cur_horiz)
+        if cur_n > 1e-9 and len(candidates) > 1:
+            cur_horiz = cur_horiz / cur_n
+            candidates = sorted(candidates, key=lambda w: -np.dot(w, cur_horiz))
+        wrap_target = candidates[0]
+    return to_obj_dir, wrap_target, ulnar_target
 
 
-def _object_facing_R(side: str, palm_pos: np.ndarray, obj_pos: np.ndarray) -> np.ndarray:
-    """Rebuilt via 2-vector Kabsch/Wahba fit instead of the single-vector,
-    circularly-verified construction it replaces:
-      - LOCAL_CLOSING_VEC (real, independently-measured closing axis) ->
-        to_object direction.
-      - LOCAL_APPROACH_VEC (local +X, finger-longitudinal) -> "inward-
-        down" direction (_down_target).
+# [Horizontal-Wrap session] Weight priority among the three axis terms in
+# _object_facing_R's Wahba fit: palm-facing (closing, Constraint A) is
+# the primary geometric requirement so it carries the largest weight;
+# finger-horizontal (wrap, Constraint B) is second; ulnar-down
+# (Constraint C) is enforced but weighted lowest of the three -- chosen
+# from a bounded 4-candidate real-physics comparison (never a large
+# sweep), see docs/history for this session's candidate A/B/C/D table.
+HORIZONTAL_WRAP_WEIGHTS = (0.50, 0.30, 0.20)
 
-    [Audit session -- weight re-derivation, supersedes a prior commit on
-    this branch] The prior weighting (0.95/0.05) was audited and found to
-    force finger_down_deg to ~34.8-35.8deg as an UNAVOIDABLE consequence
-    of pinning the closing axis that tightly -- the prior commit "fixed"
-    this by widening the Gate's own finger_down tolerance (25->40deg)
-    instead of the actual orientation target, which is an improper Gate
-    relaxation (reverted; side_grasp_finger_down_tol_deg is back to
-    25.0). A real-physics grid sweep over (w_closing, inward_weight) --
-    not a single guess, not an Euler-angle hand-tune -- found (0.68,
-    0.60) satisfies BOTH the unchanged 15deg closing-axis tolerance AND
-    the unchanged 25deg finger-down tolerance with real margin (measured,
-    actual env.step() physics through WRIST_SIDE_GRASP_ALIGN/FIVE_
-    FINGER_PRESHAPE, seed=0: inward 12.63/12.66deg, finger-down
-    22.61/22.59deg, torso-arm 0.00N, hand-table 0.76N). Nearby weight
-    pairs were also swept (w_closing in [0.50, 0.99], inward_weight in
-    [0.0, 0.8]) -- (0.68, 0.60) has the best simultaneous margin on both
-    axes among the combinations that stay collision-free through this
-    state; several nearby pairs (e.g. 0.65/0.60) fail WRIST_NOT_OBJECT_
-    FACING outright, and high-w_closing pairs (>=0.80) all reproduce the
-    finger-down problem this fix targets."""
+
+def _object_facing_R(side: str, palm_pos: np.ndarray, obj_pos: np.ndarray,
+                      current_approach_world: np.ndarray | None = None,
+                      weights: tuple[float, float, float] = HORIZONTAL_WRAP_WEIGHTS) -> np.ndarray:
+    """[Horizontal-Wrap session] 3-vector Kabsch/Wahba fit (supersedes the
+    2-vector fit that forced fingers down -- see _horizontal_wrap_target):
+      - LOCAL_CLOSING_VEC (real, independently-measured closing/palm-
+        inside axis) -> horizontal to-object direction.
+      - LOCAL_APPROACH_VEC (finger-longitudinal, local +X) -> horizontal
+        wrap direction (replaces "mostly down").
+      - ULNAR_SIGN[side] * LOCAL_ULNAR_VEC (pinky-side axis) -> world -Z.
+    `current_approach_world` should be the palm_R column-0 direction the
+    wrist is CURRENTLY holding (continuity, see _horizontal_wrap_target);
+    defaults to world +X when unavailable (first-call/test convenience)."""
     to_obj = obj_pos - palm_pos
     n = np.linalg.norm(to_obj)
     to_obj = to_obj / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
-    down = _down_target(to_obj)
-    return _wahba_R([LOCAL_CLOSING_VEC, LOCAL_APPROACH_VEC], [to_obj, down], weights=[0.68, 0.32])
+    if current_approach_world is None:
+        current_approach_world = np.array([1.0, 0.0, 0.0])
+    closing_t, wrap_t, ulnar_t = _horizontal_wrap_target(to_obj, current_approach_world, side)
+    local_ulnar = ULNAR_SIGN[side] * LOCAL_ULNAR_VEC
+    return _wahba_R(
+        [LOCAL_CLOSING_VEC, LOCAL_APPROACH_VEC, local_ulnar],
+        [closing_t, wrap_t, ulnar_t],
+        weights=list(weights),
+    )
 
 
 def _object_facing_angle_deg(side: str, palm_R: np.ndarray, palm_pos: np.ndarray, obj_pos: np.ndarray) -> float:
@@ -241,14 +340,59 @@ def _object_facing_angle_deg(side: str, palm_R: np.ndarray, palm_pos: np.ndarray
 
 
 def _finger_down_angle_deg(palm_R: np.ndarray) -> float:
-    """Angle between the palm's approach axis (palm_R column 0 -- verified
-    this session, scripts/measure_sharpa_side_grasp_axes.py, to coincide
-    EXACTLY with the open/straight nonthumb fingers' own root->tip
-    direction) and world -Z ("fingers generally point down"), the Side-
-    Grasp Posture Gate's finger-down-angle metric."""
+    """[Retained for diagnostic/candidate-A comparison only -- NO LONGER
+    a Gate criterion, see _finger_table_angle_deg below.] Angle between
+    the palm's approach axis (palm_R column 0 -- verified, scripts/
+    measure_sharpa_side_grasp_axes.py, to coincide EXACTLY with the
+    open/straight nonthumb fingers' own root->tip direction) and world
+    -Z. This was the OLD (incorrect) task specification -- forcing this
+    angle toward 0 forces fingers to point AT the table, which is the
+    posture this session's user directive retracts (reference image:
+    fingers horizontal, wrapping the object's front/back edges)."""
     approach_axis = palm_R[:, 0]
     cos_ang = np.clip(np.dot(approach_axis, np.array([0.0, 0.0, -1.0])), -1.0, 1.0)
     return float(np.degrees(np.arccos(cos_ang)))
+
+
+def _finger_table_angle_deg(palm_R: np.ndarray) -> float:
+    """[Horizontal-Wrap session] Angle between the finger-longitudinal
+    axis (palm_R column 0) and the TABLE PLANE (world Z=0) -- the
+    Horizontal-Wrap Posture Gate's finger-to-table-plane metric
+    (Constraint B), replacing _finger_down_angle_deg. For a unit vector,
+    the angle to a plane equals arcsin(|component along the plane's
+    normal|); the plane normal here is world Z."""
+    approach_axis = palm_R[:, 0]
+    return float(np.degrees(np.arcsin(np.clip(abs(approach_axis[2]), 0.0, 1.0))))
+
+
+def _ulnar_down_angle_deg(side: str, palm_R: np.ndarray) -> float:
+    """[Horizontal-Wrap session] Angle between the ulnar (pinky-side)
+    local axis, transformed into world frame by the CURRENT palm_R, and
+    world -Z -- the Horizontal-Wrap Posture Gate's ulnar-edge-down metric
+    (Constraint C)."""
+    world_ulnar = palm_R @ (ULNAR_SIGN[side] * LOCAL_ULNAR_VEC)
+    cos_ang = np.clip(np.dot(world_ulnar, np.array([0.0, 0.0, -1.0])), -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos_ang)))
+
+
+WRIST_JOINT_SUFFIXES = ("roll", "pitch", "yaw")
+
+
+def _wrist_joint_margins_deg(env) -> dict:
+    """[Horizontal-Wrap session] Real joint-limit margin
+    (min(q-lo, hi-q), converted to degrees) for every wrist joint, both
+    sides -- Constraint D (wrist stays in a natural neutral range, never
+    pinned against a hard limit)."""
+    out = {}
+    for side in SIDES:
+        for suf in WRIST_JOINT_SUFFIXES:
+            jn = f"{side}_wrist_{suf}_joint"
+            jid = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_JOINT, jn)
+            qadr = env.model.jnt_qposadr[jid]
+            q = float(env.data.qpos[qadr])
+            lo, hi = env.model.jnt_range[jid]
+            out[f"{side}_wrist_{suf}"] = float(np.degrees(min(q - lo, hi - q)))
+    return out
 
 
 def _quintic_scale(tau: float) -> float:
@@ -481,22 +625,31 @@ class BimanualGraspConfig:
     side_align_waypoint_ticks: int = 30
     side_align_max_steps: int = 600
     side_align_stable_streak_required: int = 15
-    # Side-Grasp Posture Gate tolerances (Section 10 of this session's
-    # spec) -- measured directly, not guessed:
+    # Horizontal-Wrap Posture Gate tolerances (this session's spec,
+    # SUPERSEDES the old Side-Grasp Posture Gate's finger-down check) --
+    # measured directly, not guessed:
     side_grasp_inward_angle_tol_deg: float = 15.0
-    # [Audit session] A PRIOR commit on this branch widened this from 25
-    # to 40deg to paper over a finger-down residual (~34.8-35.8deg) caused
-    # by an overly-aggressive closing-axis weight (0.95) in
-    # _object_facing_R. That was an improper Gate relaxation (the Gate
-    # was changed to fit the implementation, not the other way around) --
-    # REVERTED to the original 25deg. The actual fix is in
-    # _object_facing_R/_down_target: a real-physics weight-pair sweep
-    # found (w_closing=0.68, inward_weight=0.60) satisfies this UNCHANGED
-    # 25deg tolerance (measured finger_down 22.6-22.7deg, both hands, real
-    # physics, seed=0) simultaneously with the also-unchanged 15deg
-    # side_grasp_inward_angle_tol_deg (measured 12.6-12.7deg) -- see that
-    # function's docstring for the sweep.
-    side_grasp_finger_down_tol_deg: float = 25.0
+    # [Horizontal-Wrap session] RETRACTED: side_grasp_finger_down_tol_deg
+    # (25deg, angle to world -Z) is REMOVED as a Gate criterion. It
+    # encoded an incorrect task specification -- forcing fingers to point
+    # AT the table -- that drove wrist_roll to within a few degrees of its
+    # +-113deg hard limit to satisfy. The finger_down_deg metric itself is
+    # RETAINED (_finger_down_angle_deg) for diagnostic/candidate-A
+    # comparison only; it is no longer gated on. Replaced by
+    # side_grasp_finger_table_tol_deg below (angle to the TABLE PLANE, not
+    # to world -Z) plus the new ulnar-edge-down and wrist-margin checks.
+    side_grasp_finger_table_tol_deg: float = 20.0
+    side_grasp_ulnar_down_tol_deg: float = 25.0
+    # [Horizontal-Wrap session] Constraint D: every wrist joint must keep
+    # at least this much margin (min(q-lo, hi-q)) from its own hard
+    # limit -- see _wrist_joint_margins_deg. Directly targets the failure
+    # mode this session's user directive retracts (wrist_roll pinned to
+    # within a few degrees of +-113deg under the old finger-down target).
+    wrist_joint_margin_tol_deg: float = 10.0
+    # [Horizontal-Wrap session] Wrist qvel peak across WRIST_SIDE_GRASP_
+    # ALIGN..FINGERTIP_PRECONTACT (see _update_wrap_wrist_qvel_peak) --
+    # reuses wrist_max_qvel_rad_s's own value/units (2.0rad/s), same
+    # metric family as ARM_LATERAL_CLEARANCE's Wrist Transition Gate.
     side_grasp_mirror_pos_tol_m: float = 0.020
     side_grasp_mirror_ori_tol_deg: float = 10.0
     # FOREARM_SIDE_DESCEND: a SECOND waypointed position move (orientation
@@ -575,7 +728,23 @@ class BimanualGraspConfig:
     # disclosed as such (see FINGERTIP_PRECONTACT's own docstring), but a
     # genuine improvement over curl=0.95's near-zero/negative remaining
     # closure travel, which was this session's actual mandate to remove.
-    side_descend_curl_target: float = 0.7
+    # [Horizontal-Wrap session] 0.7 -> 0.0. Section 7's own hypothesis
+    # confirmed by a bounded real-physics re-sweep under the NEW
+    # horizontal-wrap orientation ({0.0, 0.2, 0.35, 0.5, 0.7}, seed=0):
+    # EVERY value gives 0.00N forbidden hand-table force and 0.00N
+    # torso-arm collision through FOREARM_SIDE_DESCEND (unlike the old
+    # finger-down orientation, where curl<0.95 reliably speared the
+    # table). The table-collision-avoidance curl this field used to carry
+    # is no longer needed once the fingers approach horizontally instead
+    # of pointing down -- confirms it was compensating for the wrong
+    # orientation, not a property of the object/table geometry itself.
+    # 0.0 (matches the criteria in Section 7: fingers stay maximally
+    # open, full closure travel preserved for CONTACT_ACQUIRE) is chosen
+    # over the still-collision-free 0.2-0.7 values for exactly that
+    # reason -- side_align_preshape_curl (0.3, held from WRIST_SIDE_
+    # GRASP_ALIGN/FIVE_FINGER_PRESHAPE) already provides the hand's
+    # actual entering curl at this state, unchanged.
+    side_descend_curl_target: float = 0.0
     # [This session] 8@30 (budget 240, tail 160) converged to a genuine
     # steady-state ~10.71mm residual (measured: unchanged after +300
     # extra settle ticks -- not a timing artifact) at the curled (0.95)
@@ -765,6 +934,18 @@ class SharpaBimanualGraspExpert:
         self.right_object_facing_angle_deg: float = float("inf")
         self.torso_arm_collision_force_n: float = 0.0
         self.max_hand_table_force_n: float = 0.0
+        # [Horizontal-Wrap session] forbidden (fingertip/palm/wrist) vs
+        # allowed (ulnar-edge support geom) hand<->table force, tracked
+        # separately from max_hand_table_force_n above (kept for backward
+        # compatibility/diagnostics) -- see _hand_table_forces_categorized.
+        self.max_forbidden_hand_table_force_n: float = 0.0
+        self.max_allowed_ulnar_table_force_n: float = 0.0
+        # [Horizontal-Wrap session] wrist qvel peak from WRIST_SIDE_GRASP_
+        # ALIGN entry through FINGERTIP_PRECONTACT -- Constraint from the
+        # Horizontal-Wrap Posture Gate (wrist qvel <= 2rad/s), same metric
+        # family as ARM_LATERAL_CLEARANCE's own Wrist Transition Gate but
+        # tracked across this later, separate span of states.
+        self._wrap_max_wrist_qvel: float = 0.0
         self._clearance_target: np.ndarray | None = None
         self._clearance_max_raw_wrist_qvel: float = 0.0
         self._clearance_stable_streak = 0
@@ -961,6 +1142,15 @@ class SharpaBimanualGraspExpert:
         self._state_step = 0
         self._just_advanced = True
 
+    def _update_wrap_wrist_qvel_peak(self) -> None:
+        """[Horizontal-Wrap session] Same wrist-DOF-index construction as
+        ARM_LATERAL_CLEARANCE's own _clearance_max_raw_wrist_qvel, called
+        every tick of WRIST_SIDE_GRASP_ALIGN/FIVE_FINGER_PRESHAPE/
+        FOREARM_SIDE_DESCEND/FINGERTIP_PRECONTACT."""
+        wrist_dof = np.concatenate([self.env._arm_dof_adr[4:7], self.env._arm_dof_adr[11:14]])
+        v = float(np.max(np.abs(self.env.data.qvel[wrist_dof])))
+        self._wrap_max_wrist_qvel = max(self._wrap_max_wrist_qvel, v)
+
     def _track_stability(self) -> None:
         self._obj_xy_hist.append(self._object_pos()[:2])
         self._obj_angvel_hist.append(self._object_angvel())
@@ -986,13 +1176,17 @@ class SharpaBimanualGraspExpert:
         )
 
     def _measure_side_grasp_posture(self) -> dict:
-        """[This session] Side-Grasp Posture Gate (Section 10 of this
-        session's spec) -- measured directly from live FK/contact state,
-        called once when WRIST_SIDE_GRASP_ALIGN's own stability/collision/
-        object-facing checks have just passed. Every sub-condition here is
-        a real measurement (fingertip FK, palm axes, elbow/shoulder body
-        position, actual contact forces already tracked this tick) --
-        none of it is inferred from joint targets alone."""
+        """[Horizontal-Wrap session] Horizontal-Wrap Posture Gate --
+        SUPERSEDES the old Side-Grasp Posture Gate's finger-down check
+        (which forced fingers to point at the table, driving wrist_roll
+        toward its +-113deg hard limit -- retracted, see the module
+        docstring and side_grasp_finger_table_tol_deg's own docstring).
+        Measured directly from live FK/contact state, called once when
+        WRIST_SIDE_GRASP_ALIGN's own stability/collision/object-facing
+        checks have just passed. Every sub-condition here is a real
+        measurement (fingertip/body FK, palm axes, elbow/shoulder body
+        position, actual contact forces/qvel already tracked this tick)
+        -- none of it is inferred from joint targets alone."""
         env = self.env
         obj_pos = self._object_pos()
         half = env.config.object_half_size
@@ -1011,15 +1205,55 @@ class SharpaBimanualGraspExpert:
         # transformed through the current palm_R), not raw palm_R column 1
         # directly: column 1 is no longer guaranteed to coincide with the
         # actual closing direction now that _object_facing_R targets
-        # LOCAL_CLOSING_VEC via a 2-vector Wahba fit instead of setting
-        # column 1 itself (measured, this fix: left/right raw-column-1 dot
-        # product is only ~0.06, essentially orthogonal, NOT opposed --
-        # but the real closing axes ARE opposed, ~-0.9 dot product, since
-        # that is exactly what _object_facing_R was solved for).
+        # LOCAL_CLOSING_VEC via a Wahba fit instead of setting column 1
+        # itself.
         left_closing_world = palm["left"][1] @ LOCAL_CLOSING_VEC
         right_closing_world = palm["right"][1] @ LOCAL_CLOSING_VEC
         normals_opposed = float(np.dot(left_closing_world, right_closing_world)) < 0.0
+        # [Horizontal-Wrap session] finger_down_deg kept for diagnostic/
+        # candidate-A comparison only -- NOT gated on. finger_table_deg
+        # (Constraint B) and ulnar_down_deg (Constraint C) are the real
+        # Gate metrics now.
         finger_down_deg = {s: _finger_down_angle_deg(palm[s][1]) for s in SIDES}
+        finger_table_deg = {s: _finger_table_angle_deg(palm[s][1]) for s in SIDES}
+        ulnar_down_deg = {s: _ulnar_down_angle_deg(s, palm[s][1]) for s in SIDES}
+        wrist_margins_deg = _wrist_joint_margins_deg(env)
+        wrist_margin_ok = all(v >= cfg_margin for v, cfg_margin in
+                               zip(wrist_margins_deg.values(), [self.config.wrist_joint_margin_tol_deg] * len(wrist_margins_deg)))
+        wrist_qvel_ok = self._wrap_max_wrist_qvel <= self.config.wrist_max_qvel_rad_s
+        # [Horizontal-Wrap session] Constraint C's "lowest point" check:
+        # the ulnar support body's own origin must sit at or below every
+        # other candidate hand-table-contact body's origin (fingertip DP
+        # bodies, palm base, wrist housing) -- a real, body-position-based
+        # ordering, not just an axis-angle proxy. Small tolerance (5mm)
+        # for numerical/measurement noise, not a relaxation of intent.
+        ulnar_lowest_ok = {}
+        ulnar_margin_m = {}
+        for s in SIDES:
+            ulnar_bid = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, env.ULNAR_SUPPORT_BODY[s])
+            ulnar_z = float(env.data.xpos[ulnar_bid][2])
+            other_names = [sc.sharpa_body(s, f, "DP") for f in sc.FINGERS] + [
+                sc.sharpa_body(s, "hand", "C_MC"), f"{s}_wrist_roll_link", f"{s}_wrist_pitch_link", f"{s}_wrist_yaw_link",
+            ]
+            other_z = []
+            for n in other_names:
+                bid = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, n)
+                if bid >= 0:
+                    other_z.append(float(env.data.xpos[bid][2]))
+            margin = (min(other_z) - ulnar_z) if other_z else 0.0
+            ulnar_margin_m[s] = margin
+            ulnar_lowest_ok[s] = margin >= -0.005
+        # [Horizontal-Wrap session] DIAGNOSTIC ONLY, no longer gated on
+        # here. This check assumed the OLD finger-down geometry, where
+        # WRIST_SIDE_GRASP_ALIGN's own (deliberately staging, wide/high)
+        # pose already put fingertips down near the object's own height
+        # band. The new safe-path design (Section 8) makes this state a
+        # genuine STAGING pose away from the object BY DESIGN (palm/
+        # orientation set up before moving in) -- fingertips at this
+        # pose's height are expected to sit above the object, and the
+        # real "does closure reach the object" requirement is verified
+        # later by the closure-swept-path check (Constraint E) at the
+        # actual FOREARM_SIDE_DESCEND/FINGERTIP_PRECONTACT geometry.
         tip_height_overlaps_side = {
             s: bool(obj_pos[2] - half <= tip_centroid[s][2] <= obj_pos[2] + half) for s in SIDES
         }
@@ -1044,7 +1278,13 @@ class SharpaBimanualGraspExpert:
             elbow_above_shoulder_m[s] = float(env.data.xpos[eb][2] - env.data.xpos[sb][2])
 
         torso_arm_ok = self.torso_arm_collision_force_n <= self.config.hand_hand_force_limit_n
-        hand_table_ok = self.max_hand_table_force_n <= self.config.hand_hand_force_limit_n
+        # [Horizontal-Wrap session] hand_table_ok now checks the FORBIDDEN
+        # category only (fingertip/palm/wrist housing); the allowed ulnar-
+        # edge-support contact is tracked separately and does not, by
+        # itself, fail this Gate (it still must stay under the same 8N
+        # cap and not spike wrist qvel -- see allowed_ulnar_ok below).
+        hand_table_ok = self.max_forbidden_hand_table_force_n <= self.config.hand_hand_force_limit_n
+        allowed_ulnar_ok = self.max_allowed_ulnar_table_force_n <= self.config.hand_hand_force_limit_n
         hand_hand_ok = self._max_hand_hand <= self.config.hand_hand_force_limit_n if self._max_hand_hand else \
             env._hand_hand_contact_force() <= self.config.hand_hand_force_limit_n
         premature_contact_ok = self._proximal_penetration_ok()
@@ -1055,6 +1295,14 @@ class SharpaBimanualGraspExpert:
             "inward_angle_deg": inward_angle_deg,
             "normals_opposed": normals_opposed,
             "finger_down_deg": finger_down_deg,
+            "finger_table_deg": finger_table_deg,
+            "ulnar_down_deg": ulnar_down_deg,
+            "ulnar_lowest_ok": ulnar_lowest_ok,
+            "ulnar_margin_m": ulnar_margin_m,
+            "wrist_margins_deg": wrist_margins_deg,
+            "wrist_margin_ok": wrist_margin_ok,
+            "wrist_qvel_peak": self._wrap_max_wrist_qvel,
+            "wrist_qvel_ok": wrist_qvel_ok,
             "tip_height_overlaps_side": tip_height_overlaps_side,
             "crosses_top_footprint": crosses_top_footprint,
             "mirror_pos_err_m": mirror_pos_err_m,
@@ -1063,6 +1311,9 @@ class SharpaBimanualGraspExpert:
             "elbow_ok": elbow_ok,
             "torso_arm_ok": torso_arm_ok,
             "hand_table_ok": hand_table_ok,
+            "allowed_ulnar_ok": allowed_ulnar_ok,
+            "max_forbidden_hand_table_force_n": self.max_forbidden_hand_table_force_n,
+            "max_allowed_ulnar_table_force_n": self.max_allowed_ulnar_table_force_n,
             "hand_hand_ok": hand_hand_ok,
             "premature_contact_ok": premature_contact_ok,
             "wrist_orientation_drift_deg": self.wrist_orientation_drift_deg,
@@ -1074,15 +1325,20 @@ class SharpaBimanualGraspExpert:
             and inward_angle_deg["left"] <= cfg.side_grasp_inward_angle_tol_deg
             and inward_angle_deg["right"] <= cfg.side_grasp_inward_angle_tol_deg
             and normals_opposed
-            and finger_down_deg["left"] <= cfg.side_grasp_finger_down_tol_deg
-            and finger_down_deg["right"] <= cfg.side_grasp_finger_down_tol_deg
-            and all(tip_height_overlaps_side.values())
+            and finger_table_deg["left"] <= cfg.side_grasp_finger_table_tol_deg
+            and finger_table_deg["right"] <= cfg.side_grasp_finger_table_tol_deg
+            and ulnar_down_deg["left"] <= cfg.side_grasp_ulnar_down_tol_deg
+            and ulnar_down_deg["right"] <= cfg.side_grasp_ulnar_down_tol_deg
+            and all(ulnar_lowest_ok.values())
+            and wrist_margin_ok
+            and wrist_qvel_ok
             and not crosses_top_footprint
             and mirror_pos_err_m <= cfg.side_grasp_mirror_pos_tol_m
             and mirror_ori_err_deg <= cfg.side_grasp_mirror_ori_tol_deg
             and elbow_ok
             and torso_arm_ok
             and hand_table_ok
+            and allowed_ulnar_ok
             and hand_hand_ok
             and premature_contact_ok
             and self._side_align_stable_streak >= cfg.side_align_stable_streak_required
@@ -1165,6 +1421,7 @@ class SharpaBimanualGraspExpert:
                 "mean_disp_inward_mm": mean_disp_inward_m * 1000.0,
                 "inward_angle_deg": _object_facing_angle_deg(side, palm_R, palm_pos, obj_pos),
                 "finger_down_deg": _finger_down_angle_deg(palm_R),
+                "finger_table_deg": _finger_table_angle_deg(palm_R),
             }
         gate = all(per_side[s]["n_positive"] >= 3 and per_side[s]["mean_disp_inward_mm"] > 2.0 for s in SIDES)
         return {"per_side": per_side, "gate": gate}
@@ -1228,16 +1485,20 @@ class SharpaBimanualGraspExpert:
           - palm inside (= the real empirical closing axis) <=
             side_grasp_inward_angle_tol_deg (15deg) from the object
             direction, BOTH hands.
-          - finger-down <= side_grasp_finger_down_tol_deg (25deg, the
-            ORIGINAL tolerance -- see that field's docstring for the
-            prior commit's improper 40deg relaxation, now reverted), BOTH
-            hands.
-          - swept collision: cumulative torso-arm/hand-table force
-            recorded over the approach SO FAR (self.torso_arm_
-            collision_force_n / self.max_hand_table_force_n, updated
-            every tick since STABLE_START) stays under the shared 8N
-            forbidden-collision limit -- not just the instantaneous
-            reading at measurement time.
+          - finger-to-table-plane <= side_grasp_finger_table_tol_deg
+            (20deg -- [Horizontal-Wrap session] REPLACES the old finger-
+            down-vs-world--Z check, which forced fingers at the table and
+            drove wrist_roll toward its hard limit; see
+            side_grasp_finger_table_tol_deg's own docstring), BOTH hands.
+          - swept collision: cumulative torso-arm/FORBIDDEN hand-table
+            force recorded over the approach SO FAR (self.torso_arm_
+            collision_force_n / self.max_forbidden_hand_table_force_n,
+            updated every tick since STABLE_START) stays under the shared
+            8N forbidden-collision limit -- not just the instantaneous
+            reading at measurement time. The allowed ulnar-edge-support
+            contact is excluded from this check (see
+            max_allowed_ulnar_table_force_n, gated separately in
+            _measure_side_grasp_posture).
         [Audit session] Prior name/scope: this function used to BE what
         is now _measure_finger_closure_direction (4-finger check only) --
         it never checked thumb, never gated on the finger-down angle it
@@ -1249,21 +1510,21 @@ class SharpaBimanualGraspExpert:
         inward_ok = all(
             finger_closure["per_side"][s]["inward_angle_deg"] <= cfg.side_grasp_inward_angle_tol_deg for s in SIDES
         )
-        finger_down_ok = all(
-            finger_closure["per_side"][s]["finger_down_deg"] <= cfg.side_grasp_finger_down_tol_deg for s in SIDES
+        finger_table_ok = all(
+            finger_closure["per_side"][s]["finger_table_deg"] <= cfg.side_grasp_finger_table_tol_deg for s in SIDES
         )
         swept_collision_ok = (
             self.torso_arm_collision_force_n <= cfg.hand_hand_force_limit_n
-            and self.max_hand_table_force_n <= cfg.hand_hand_force_limit_n
+            and self.max_forbidden_hand_table_force_n <= cfg.hand_hand_force_limit_n
         )
         gate = (
-            finger_closure["gate"] and thumb["gate"] and inward_ok and finger_down_ok and swept_collision_ok
+            finger_closure["gate"] and thumb["gate"] and inward_ok and finger_table_ok and swept_collision_ok
         )
         return {
             "finger_closure_direction": finger_closure,
             "thumb_opposition": thumb,
             "inward_ok": inward_ok,
-            "finger_down_ok": finger_down_ok,
+            "finger_table_ok": finger_table_ok,
             "swept_collision_ok": swept_collision_ok,
             "curl_probe": curl_probe,
             "gate": gate,
@@ -1511,6 +1772,7 @@ class SharpaBimanualGraspExpert:
             # established and held, matching the "no large wrist rotation
             # after descending" requirement.
             if self._state_step == 0:
+                self._wrap_max_wrist_qvel = 0.0
                 self.env.set_preshape("left", 1.0)
                 self.env.set_preshape("right", 1.0)
                 self._side_align_start_pos = {s: self.env.palm_pose(s)[0].copy() for s in SIDES}
@@ -1519,7 +1781,10 @@ class SharpaBimanualGraspExpert:
                 self._side_align_final_pos = self._mirrored_targets(
                     cfg.approach_standoff_m, cfg.side_align_height_m, cfg.side_align_y_offset_m
                 )
-                self._side_align_final_R = {s: _object_facing_R(s, self._side_align_final_pos[s], obj_pos) for s in SIDES}
+                self._side_align_final_R = {
+                    s: _object_facing_R(s, self._side_align_final_pos[s], obj_pos,
+                                         current_approach_world=self._side_align_start_R[s][:, 0]) for s in SIDES
+                }
                 self._side_align_waypoint = 0
                 self._side_align_stable_streak = 0
                 self._side_align_R_hist = {"left": [], "right": []}
@@ -1535,8 +1800,19 @@ class SharpaBimanualGraspExpert:
             # short of its target (previously landed at curl=0.30 for a
             # nominal 0.5 target; see side_align_preshape_curl's own
             # docstring for the direct-trace confirmation).
+            # [Horizontal-Wrap session] curl_ramp_delay_ticks: the
+            # protective curl used to start at state_step=0, simultaneous
+            # with the FIRST position/orientation waypoint -- at that
+            # instant the hands are still at FOREARM_FORWARD_REACH's
+            # narrower (y_offset=0.15) end pose, not yet the wider
+            # (0.26) align target, so curling immediately produced a
+            # transient ~8.27N hand-hand graze (measured, swept-path
+            # check). Delaying curl start by one waypoint tick lets the
+            # first lateral-separation waypoint fire first (real physics
+            # re-verified: 0.00N swept hand-hand through this ramp).
+            curl_ramp_delay_ticks = cfg.side_align_waypoint_ticks
             curl_ramp_ticks = int(np.ceil(cfg.side_align_preshape_curl / max(cfg.close_rate_per_step, 1e-9)))
-            if self._state_step < curl_ramp_ticks:
+            if curl_ramp_delay_ticks <= self._state_step < curl_ramp_delay_ticks + curl_ramp_ticks:
                 action[17:25] = self._group_action({s: {"index": cfg.close_rate_per_step, "middle": cfg.close_rate_per_step,
                                                           "wrap": cfg.close_rate_per_step} for s in SIDES})
             ticks_per_wp = cfg.side_align_waypoint_ticks
@@ -1554,14 +1830,18 @@ class SharpaBimanualGraspExpert:
                 self._apply_ik_result(result)
             action[0:3] = self._waist_action_toward_target()
             action[3:17] = self._arm_action_toward_target()
+            self._update_wrap_wrist_qvel_peak()
             lR = self.env.palm_pose("left")[1].copy()
             rR = self.env.palm_pose("right")[1].copy()
             self._side_align_R_hist["left"].append(lR)
             self._side_align_R_hist["right"].append(rR)
             no_collision = (self.env._torso_arm_collision_force() <= cfg.hand_hand_force_limit_n
                              and self.env._hand_hand_contact_force() <= cfg.hand_hand_force_limit_n)
-            no_table_hit = self.env._hand_table_contact_force() <= cfg.hand_hand_force_limit_n
+            table_forces = self.env._hand_table_forces_categorized()
             self.max_hand_table_force_n = max(self.max_hand_table_force_n, self.env._hand_table_contact_force())
+            self.max_forbidden_hand_table_force_n = max(self.max_forbidden_hand_table_force_n, table_forces["forbidden"])
+            self.max_allowed_ulnar_table_force_n = max(self.max_allowed_ulnar_table_force_n, table_forces["allowed_ulnar"])
+            no_table_hit = table_forces["forbidden"] <= cfg.hand_hand_force_limit_n
             waypoints_done = self._side_align_waypoint >= cfg.side_align_waypoints
             if not no_table_hit:
                 self._fail(BimanualFailureReason.HAND_TABLE_COLLISION)
@@ -1626,12 +1906,16 @@ class SharpaBimanualGraspExpert:
                 self.env.set_preshape("right", 1.0)
             action[0:3] = self._waist_action_toward_target()
             action[3:17] = self._arm_action_toward_target()
+            self._update_wrap_wrist_qvel_peak()
             if self._state_step >= 30:
                 if (not self._proximal_penetration_ok()
                         or self.env._hand_hand_contact_force() > cfg.hand_hand_force_limit_n):
                     self._fail(BimanualFailureReason.SELF_COLLISION_BEFORE_CONTACT)
                     return action
-                if self.env._hand_table_contact_force() > cfg.hand_hand_force_limit_n:
+                table_forces = self.env._hand_table_forces_categorized()
+                self.max_forbidden_hand_table_force_n = max(self.max_forbidden_hand_table_force_n, table_forces["forbidden"])
+                self.max_allowed_ulnar_table_force_n = max(self.max_allowed_ulnar_table_force_n, table_forces["allowed_ulnar"])
+                if table_forces["forbidden"] > cfg.hand_hand_force_limit_n:
                     self._fail(BimanualFailureReason.HAND_TABLE_COLLISION)
                     return action
                 self._advance(BimanualGraspState.FOREARM_SIDE_DESCEND)
@@ -1729,7 +2013,8 @@ class SharpaBimanualGraspExpert:
                 # freeze here, held constant after, matches that principle.
                 obj_pos_0 = self._object_pos()
                 self._descend_locked_R = {
-                    s: _object_facing_R(s, self._side_descend_final[s], obj_pos_0) for s in SIDES
+                    s: _object_facing_R(s, self._side_descend_final[s], obj_pos_0,
+                                         current_approach_world=self._locked_R[s][:, 0]) for s in SIDES
                 }
             waypoints_exhausted = self._side_descend_waypoint >= cfg.side_descend_waypoints
             if self._state_step % cfg.side_descend_waypoint_ticks == 0 and not waypoints_exhausted:
@@ -1800,6 +2085,7 @@ class SharpaBimanualGraspExpert:
                 self._apply_ik_result(result)
             action[0:3] = self._waist_action_toward_target()
             action[3:17] = self._arm_action_toward_target()
+            self._update_wrap_wrist_qvel_peak()
             curl_now = self.env._group_synergy.copy()
             curl_target = np.array([0.0, cfg.side_descend_curl_target, cfg.side_descend_curl_target,
                                      cfg.side_descend_curl_target] * 2)
@@ -1812,7 +2098,10 @@ class SharpaBimanualGraspExpert:
                           float(np.linalg.norm(self._side_descend_final["right"] - right_pos)))
             hand_table_force = self.env._hand_table_contact_force()
             self.max_hand_table_force_n = max(self.max_hand_table_force_n, hand_table_force)
-            if hand_table_force > cfg.hand_hand_force_limit_n:
+            table_forces = self.env._hand_table_forces_categorized()
+            self.max_forbidden_hand_table_force_n = max(self.max_forbidden_hand_table_force_n, table_forces["forbidden"])
+            self.max_allowed_ulnar_table_force_n = max(self.max_allowed_ulnar_table_force_n, table_forces["allowed_ulnar"])
+            if table_forces["forbidden"] > cfg.hand_hand_force_limit_n:
                 self._fail(BimanualFailureReason.HAND_TABLE_COLLISION)
                 return action
             no_collision = (self.env._torso_arm_collision_force() <= cfg.hand_hand_force_limit_n
@@ -1939,6 +2228,7 @@ class SharpaBimanualGraspExpert:
                 self._apply_ik_result(result)
             action[0:3] = self._waist_action_toward_target()
             action[3:17] = self._arm_action_toward_target()
+            self._update_wrap_wrist_qvel_peak()
 
             if self._precontact_waypoint >= self.WAYPOINT_COUNT:
                 # [Session 39 finding -- see docs/history/

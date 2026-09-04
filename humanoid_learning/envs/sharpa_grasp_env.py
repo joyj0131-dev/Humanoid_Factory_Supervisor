@@ -320,6 +320,57 @@ class SharpaGraspEnv(gym.Env):
             peak = max(peak, float(np.linalg.norm(force6[:3])))
         return peak
 
+    # [Horizontal-Wrap session] Body verified by direct enumeration
+    # against the compiled model (never guessed by name pattern alone) --
+    # pinky_MC is the only Sharpa body whose relative palm position is
+    # fixed by a PRESHAPE-only joint (sharpa_config.py's _JOINT_ROLES:
+    # pinky "CMC": "preshape"), so it does not move during curl the way
+    # fingertip/PP/MP bodies do -- a stable, load-bearing edge, matching
+    # the FK finding (LOCAL_ULNAR_VEC's docstring) that it sits at the
+    # hand's own ulnar-most extreme.
+    ULNAR_SUPPORT_BODY = {"left": "left_left_pinky_MC", "right": "right_right_pinky_MC"}
+    _WRIST_HOUSING_BODIES = (
+        "left_wrist_roll_link", "left_wrist_pitch_link", "left_wrist_yaw_link",
+        "right_wrist_roll_link", "right_wrist_pitch_link", "right_wrist_yaw_link",
+    )
+
+    def _hand_table_forces_categorized(self) -> dict:
+        """[Horizontal-Wrap session] Splits the single hand<->table force
+        _hand_table_contact_force reports into:
+          - "allowed_ulnar": contact between the explicitly-identified
+            ULNAR_SUPPORT_BODY (one per side) and the table.
+          - "forbidden": contact between ANY OTHER hand body (fingertip,
+            palm, or wrist housing) and the table.
+        Body names verified against the compiled model's own body list
+        (see scripts/measure_sharpa_side_grasp_axes.py-style enumeration),
+        not guessed from naming convention alone."""
+        model, data = self.model, self.data
+        forbidden_peak = 0.0
+        allowed_peak = 0.0
+        ulnar_bodies = set(self.ULNAR_SUPPORT_BODY.values())
+        for i in range(data.ncon):
+            c = data.contact[i]
+            b1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom1]) or ""
+            b2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom2]) or ""
+
+            def _is_hand_or_wrist(n: str) -> bool:
+                return n.startswith("left_left_") or n.startswith("right_right_") or n in self._WRIST_HOUSING_BODIES
+
+            if "table" in b1 and _is_hand_or_wrist(b2):
+                other = b2
+            elif "table" in b2 and _is_hand_or_wrist(b1):
+                other = b1
+            else:
+                continue
+            force6 = np.zeros(6)
+            mujoco.mj_contactForce(model, data, i, force6)
+            f = float(np.linalg.norm(force6[:3]))
+            if other in ulnar_bodies:
+                allowed_peak = max(allowed_peak, f)
+            else:
+                forbidden_peak = max(forbidden_peak, f)
+        return {"forbidden": forbidden_peak, "allowed_ulnar": allowed_peak}
+
     def _proximal_object_penetration(self) -> float:
         """Max penetration between any NON-fingertip Sharpa link (i.e. any
         hand body that is not a *_DP fingertip body) and the object --
