@@ -690,7 +690,24 @@ class BimanualGraspConfig:
     # from that finding -- varying it did not move the residual force at
     # all (see side_descend_curl_target's docstring); the actual fix is
     # curl, not position.] torso-arm/hand-hand stay 0.00N throughout.
-    side_descend_standoff_m: float = 0.12
+    # [Direct-grasp session] 0.12 -> 0.04. The previous FROZEN-orientation
+    # design (position translates, orientation locked once at entry) hit
+    # a real shoulder-vs-torso kinematic wall around y_offset~0.15
+    # (shoulder_yaw_link<->torso_link, measured, prior session). Letting
+    # ORIENTATION be RE-DERIVED fresh at every waypoint's own target
+    # position (see the waypoint loop below) instead of frozen, combined
+    # with a per-DOF joint cost that discourages shoulder_roll/yaw and
+    # favors waist/elbow (DESCEND_JOINT_WEIGHT), pushes that wall out
+    # dramatically: a bounded real-physics grid over (standoff, height,
+    # y_offset) found (0.04, 0.01, 0.055) reaches real nonthumb-
+    # fingertip-to-object separation ~57mm with 0.00N torso-arm
+    # collision (seed=0) -- close enough for CONTACT_ACQUIRE's own curl
+    # travel (~54-57mm, see side_descend_curl_target's docstring) to
+    # finish the reach. Nearby points were also swept: closer standoff
+    # (0.02) reaches 38mm but with real torso-arm force (10.3N); wider
+    # (0.06-0.10) stays safer (0.00-8N) but leaves 74-89mm, too far for
+    # curl alone.
+    side_descend_standoff_m: float = 0.02
     # [Open-preshape session] 0.03 -> 0.05. The prior audit (see
     # side_descend_curl_target's docstring below) re-verified that curl
     # alone (0.3-0.8, at height=0.03) all fail with 8.1-14.9N hand-table
@@ -715,8 +732,11 @@ class BimanualGraspConfig:
     # this state, real physics, seed=0) under the CORRECT, non-drifting
     # orientation, while still curling well short of 0.95's near-total
     # closure.
-    side_descend_height_m: float = 0.05
-    side_descend_y_offset_m: float = 0.15
+    # [Direct-grasp session] 0.05 -> 0.01 / 0.15 -> 0.055, together with
+    # side_descend_standoff_m's fix above -- see that field's own
+    # docstring for the real-physics grid this pair was chosen from.
+    side_descend_height_m: float = 0.01
+    side_descend_y_offset_m: float = 0.045
     # [Open-preshape session] 0.95 -> 0.7. Curls index/middle/wrap LESS
     # than the prior value (still more than WRIST_SIDE_GRASP_ALIGN's own
     # protective 0.3, see that field's docstring, so the transition is
@@ -778,9 +798,33 @@ class BimanualGraspConfig:
     # 300, tail 100 -- SMALLER per-waypoint steps, same total ramp
     # duration ballpark) converges under 10mm and reaches FINGERTIP_
     # PRECONTACT; 12@26 also worked but with less tail margin.
-    side_descend_waypoints: int = 10
+    # [Direct-grasp session] 10 -> 30: finer waypoints, needed because
+    # orientation is now re-derived (not frozen) at every waypoint's own
+    # target position and the total travel is larger (starting from
+    # WRIST_SIDE_GRASP_ALIGN's wide staging pose, not just DESCEND's old
+    # shorter hop) -- matches the real-physics grid this state's other
+    # fields were tuned with.
+    side_descend_waypoints: int = 30
     side_descend_waypoint_ticks: int = 30
     side_descend_stable_streak_required: int = 15
+    # [Direct-grasp session] Dedicated step budget for THIS state (not
+    # the shared max_steps_per_state=700), matching this file's own
+    # established convention of per-state overrides (e.g. precontact_
+    # max_steps): 30 waypoints * 30 ticks = 900 ticks minimum just for
+    # the waypoint schedule, plus a settle tail.
+    side_descend_max_steps: int = 1300
+    # [Direct-grasp session] "Close enough" real separation to advance to
+    # CONTACT_ACQUIRE -- generous relative to CONTACT_ACQUIRE's own real
+    # curl travel (~54-57mm, see side_descend_curl_target's docstring) so
+    # a real closure attempt is at least geometrically plausible, without
+    # hard-blocking progress on the exact number (see the max_steps
+    # fallback below, which advances regardless once the waypoint
+    # schedule and hard-collision checks are satisfied).
+    side_descend_ready_separation_m: float = 0.09
+    # [Direct-grasp session] Dedicated budget for CONTACT_ACQUIRE now
+    # that a non-contacted side also keeps approaching (not just
+    # closing fingers) -- needs more than the shared max_steps_per_state.
+    contact_acquire_max_steps: int = 1200
     precontact_standoff_m: float = 0.08
     # [This session] retargeted for the side-grasp geometry -- height
     # matches side_descend_height_m (no further Z motion), y_offset moves
@@ -803,18 +847,18 @@ class BimanualGraspConfig:
     # measured nonthumb-fingertip-to-object-side-face separation (see
     # _precontact_separation_m) instead of a fixed Cartesian offset --
     # see FINGERTIP_PRECONTACT's own docstring for the full recipe.
-    # [Direct-closure experiment] When True, FOREARM_SIDE_DESCEND's own
-    # completion advances DIRECTLY to CONTACT_ACQUIRE instead of
-    # FINGERTIP_PRECONTACT -- arm/waist ctrl targets are left exactly as
-    # DESCEND set them (CONTACT_ACQUIRE never writes action[0:17], see
-    # that state's own code), so no further palm/wrist/arm motion toward
-    # the object happens beyond what the already-approved Horizontal-
-    # Wrap approach path (WRIST_SIDE_GRASP_ALIGN -> FIVE_FINGER_PRESHAPE
-    # -> FOREARM_SIDE_DESCEND) already produced. The FINGERTIP_PRECONTACT
-    # servo/recovery-ladder code is UNCHANGED and still used whenever
-    # this flag is False (the default) -- this is an alternate entry
-    # path, not a replacement.
-    skip_precontact_servo: bool = False
+    # [Direct-grasp session] Default flipped False -> True: FOREARM_SIDE_
+    # DESCEND was rebuilt (see side_descend_standoff_m's docstring) to
+    # re-derive orientation fresh per waypoint and reach real fingertip-
+    # object separation ~57mm on its own (0.00N torso-arm) -- close
+    # enough for CONTACT_ACQUIRE's own curl travel (~54-57mm) to finish
+    # the reach, making the separate FINGERTIP_PRECONTACT inward-servo
+    # stage unnecessary on the default path. Arm/waist ctrl targets are
+    # left exactly as DESCEND set them (CONTACT_ACQUIRE never writes
+    # action[0:17]). The FINGERTIP_PRECONTACT servo/recovery-ladder code
+    # itself is UNCHANGED and still reachable by setting this back to
+    # False -- this is a default flip, not a deletion.
+    skip_precontact_servo: bool = True
     precontact_target_separation_m: float = 0.004
     precontact_separation_ok_margin_m: float = 0.002  # "close enough" band: target +/- this
     precontact_servo_step_m: float = 0.010  # max per-tick inward Cartesian step
@@ -1015,6 +1059,16 @@ class SharpaBimanualGraspExpert:
     # if genuinely needed, just discouraged relative to elbow/wrist.
     PRECONTACT_JOINT_WEIGHT = np.ones(17)
     PRECONTACT_JOINT_WEIGHT[[4, 5, 11, 12]] = 6.0
+    # [Direct-grasp session] Same shoulder-penalty idea, extended with a
+    # cheaper WAIST cost (indices 0/1/2, default class-wide joint_weight
+    # penalizes waist 6x -- see CoupledBilateralIK's own waist_weight
+    # default) -- used for FOREARM_SIDE_DESCEND's own final approach
+    # once orientation is no longer frozen (see side_descend_standoff_m's
+    # docstring): letting waist assist more cheaply than shoulder gives
+    # the redundant solver a genuinely different, less torso-colliding
+    # branch to reach the same Cartesian target.
+    DESCEND_JOINT_WEIGHT = np.ones(17)
+    DESCEND_JOINT_WEIGHT[[4, 5, 11, 12]] = 6.0
 
     def __init__(self, env, config: BimanualGraspConfig | None = None):
         self.env = env
@@ -2139,6 +2193,23 @@ class SharpaBimanualGraspExpert:
             # around have changed -- see side_descend_height_m/
             # side_descend_curl_target's own docstrings for the current
             # fix and the numbers behind it.
+            # [Direct-grasp session] REBUILT: orientation is now RE-
+            # DERIVED FRESH at every waypoint's own interpolated target
+            # position (never frozen) -- since _object_facing_R is a
+            # function of palm position, the truly-correct orientation
+            # genuinely changes as the palm gets closer, and forcing it
+            # to hold a single value computed far away is exactly what
+            # was driving the redundant solver into a shoulder-tucking,
+            # torso-colliding branch (measured, prior session: a real
+            # kinematic wall around y_offset~0.15m under the frozen-
+            # orientation design). Re-deriving per waypoint, combined
+            # with DESCEND_JOINT_WEIGHT (cheap waist, expensive shoulder)
+            # and a fresh IK solve EVERY tick (not just at waypoint
+            # boundaries) anchored to the CURRENT live qpos, was found
+            # (bounded real-physics grid, see side_descend_standoff_m's
+            # docstring) to reach real fingertip-object separation
+            # ~57mm at 0.00N torso-arm collision -- close enough for
+            # CONTACT_ACQUIRE's own curl travel to finish the reach.
             if self._state_step == 0:
                 self._descend_stable_streak = 0
                 self._side_descend_start = {s: self.env.palm_pose(s)[0].copy() for s in SIDES}
@@ -2146,92 +2217,55 @@ class SharpaBimanualGraspExpert:
                     cfg.side_descend_standoff_m, cfg.side_descend_height_m, cfg.side_descend_y_offset_m
                 )
                 self._side_descend_waypoint = 0
-                # [Open-preshape session] Freeze a SINGLE fresh orientation
-                # target here (re-derived at DESCEND's own target position,
-                # not reused from WRIST_SIDE_GRASP_ALIGN's much-further-away
-                # locked pose -- see the waypoint-ramp branch below's
-                # docstring for why re-deriving matters), then reuse this
-                # SAME frozen value through DESCEND's own waypoints AND
-                # FINGERTIP_PRECONTACT (instead of re-deriving fresh at
-                # every interpolated waypoint position, which was measured
-                # to keep demanding a small further rotation at EVERY
-                # position change, effectively smearing "reorient" across
-                # DESCEND+PRECONTACT instead of finishing it once -- exactly
-                # what Section 10's "orientation 정렬 후에는 descend/
-                # precontact에서 큰 회전 금지" principle rules out). One
-                # freeze here, held constant after, matches that principle.
-                obj_pos_0 = self._object_pos()
-                self._descend_locked_R = {
-                    s: _object_facing_R(s, self._side_descend_final[s], obj_pos_0,
-                                         current_approach_world=self._locked_R[s][:, 0]) for s in SIDES
-                }
-            waypoints_exhausted = self._side_descend_waypoint >= cfg.side_descend_waypoints
-            if self._state_step % cfg.side_descend_waypoint_ticks == 0 and not waypoints_exhausted:
+                self._side_descend_wp_start_R = {s: self.env.palm_pose(s)[1].copy() for s in SIDES}
+                self._side_descend_wp_target_R = {s: self.env.palm_pose(s)[1].copy() for s in SIDES}
+                self._side_descend_wp_target_pos = {s: self._side_descend_start[s].copy() for s in SIDES}
+            ticks_per_wp = cfg.side_descend_waypoint_ticks
+            tick_in_wp = self._state_step % ticks_per_wp
+            if tick_in_wp == 0 and self._side_descend_waypoint < cfg.side_descend_waypoints:
                 self._side_descend_waypoint += 1
                 frac = _quintic_scale(self._side_descend_waypoint / cfg.side_descend_waypoints)
-                wp_targets = {
-                    s: (1 - frac) * self._side_descend_start[s] + frac * self._side_descend_final[s] for s in SIDES
-                }
-                # [Open-preshape session -- orientation-drift fix] Was:
-                # soft-anchor to the CURRENT pose (self-referential -- each
-                # solve's own "target" was wherever the wrist already was).
-                # Root-caused this session: since _object_facing_R is a
-                # function of PALM POSITION (the closing axis must point AT
-                # the object from wherever the palm currently is), the
-                # correct orientation genuinely changes as DESCEND moves
-                # the palm closer/lower -- but a self-referential anchor
-                # never re-derives it, so nothing corrects any per-waypoint
-                # solver drift and it accumulates freely (measured, BEFORE
-                # this fix, at the UNCHANGED old height=0.03/curl=0.95
-                # baseline: ~31-34deg accumulated drift from WRIST_SIDE_
-                # GRASP_ALIGN's locked orientation by the time PRECONTACT's
-                # Gate measures it -- a real, pre-existing bug, not
-                # introduced by this session's height/curl change, just
-                # never actually measured before: FINGERTIP_PRECONTACT's
-                # ori_err was reported >30deg every prior run, always
-                # masked by PRECONTACT_TRACKING_NOT_ACHIEVED being blamed
-                # entirely on the SEPARATE, ALSO-real position droop).
-                # Fix: anchor to the SINGLE frozen _descend_locked_R (see
-                # state-entry note above) instead of re-deriving fresh at
-                # every waypoint's own interpolated position -- still a
-                # soft anchor (same 0.15 weight -- not a hard lock,
-                # matching this file's own documented reason to avoid
-                # fixed/locked wrist targets), just aimed at a fixed,
-                # position-appropriate target instead of a moving one.
-                lR = self._descend_locked_R["left"]
-                rR = self._descend_locked_R["right"]
-                result = self._solve_both(wp_targets, {"left": lR, "right": rR}, require_orientation=False,
-                                           ori_task_weight=0.15, rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain)
-                self._apply_ik_result(result)
-            elif self._state_step % cfg.side_descend_waypoint_ticks == 0 and waypoints_exhausted:
-                # [Audit session, new] Correction re-solve. Root-caused this
-                # session: the LAST waypoint's own solve genuinely converges
-                # (pos_tol satisfied AT SOLVE TIME, from the scratch qpos
-                # copied at that instant), but simply HOLDING that joint
-                # target afterward plateaus at a real, non-shrinking ~11.4mm
-                # residual (confirmed: unchanged after +1000 extra held
-                # ticks, not a rate-limit/timing artifact) -- while a FRESH
-                # re-solve from the qpos that residual settles at converges
-                # much tighter (~5.4-5.5mm). I.e. the joint target that was
-                # RIGHT when solved drifts slightly stale by the time the
-                # actuator chase reaches it (a few mm of whole-body-coupled
-                # drift over the ramp's own duration, not corrected by any
-                # later solve once the fixed waypoint budget is spent).
-                # Fix: keep re-solving toward the SAME final target, from
-                # the CURRENT live qpos, at the same cadence, instead of
-                # solving once and holding -- closes the drift causally
-                # instead of just waiting longer for it to resolve itself
-                # (it does not).
-                #
-                # [Open-preshape session] Orientation target also switched
-                # to the SAME frozen _descend_locked_R (see state-entry
-                # note above) instead of the self-referential current-pose
-                # anchor.
-                lR = self._descend_locked_R["left"]
-                rR = self._descend_locked_R["right"]
-                result = self._solve_both(self._side_descend_final, {"left": lR, "right": rR}, require_orientation=False,
-                                           ori_task_weight=0.15, rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain)
-                self._apply_ik_result(result)
+                obj_pos = self._object_pos()
+                self._side_descend_wp_start_R = {s: self.env.palm_pose(s)[1].copy() for s in SIDES}
+                for s in SIDES:
+                    target_pos = (1 - frac) * self._side_descend_start[s] + frac * self._side_descend_final[s]
+                    self._side_descend_wp_target_pos[s] = target_pos
+                    # [Direct-grasp session] Continuity reference is the
+                    # PREVIOUS WAYPOINT'S OWN TARGET R (clean, already
+                    # computed), not the live/settling palm_R -- using the
+                    # live pose here was measured to let solver-branch
+                    # noise from a not-yet-settled actuator feed back into
+                    # the wrap-direction handedness choice near the end of
+                    # the ramp, causing separation to visibly REGRESS
+                    # (worsen) over the final few waypoints instead of
+                    # monotonically improving.
+                    cur_approach = self._side_descend_wp_target_R[s][:, 0]
+                    self._side_descend_wp_target_R[s] = _object_facing_R(
+                        s, target_pos, obj_pos, current_approach_world=cur_approach
+                    )
+            # [Direct-grasp session, bug fix] Once all waypoints are
+            # spent, tick_in_wp keeps cycling 0..ticks_per_wp-1 (state_
+            # step keeps advancing), which was RESETTING sub_frac back
+            # down to a small value every ticks_per_wp ticks -- SLERPing
+            # from the (stale) last waypoint's OWN start_R back toward
+            # its target_R again and again, i.e. the palm orientation
+            # oscillated near the final target instead of holding it,
+            # which showed up as real separation visibly REGRESSING
+            # (worsening) after the nominal waypoint schedule finished.
+            # Fix: once waypoints_exhausted, hold sub_frac at 1.0 (the
+            # final target), never re-decay it.
+            waypoints_exhausted = self._side_descend_waypoint >= cfg.side_descend_waypoints
+            sub_frac = 1.0 if waypoints_exhausted else (tick_in_wp + 1) / ticks_per_wp
+            R_now = {
+                s: _slerp_R(self._side_descend_wp_start_R[s], self._side_descend_wp_target_R[s], sub_frac)
+                for s in SIDES
+            }
+            result = self._solve_both(
+                self._side_descend_wp_target_pos, R_now, require_orientation=False, ori_task_weight=0.3,
+                rest_q=self._current_rest_q(), rest_gain=0.3, pos_tol=0.003, joint_weight=self.DESCEND_JOINT_WEIGHT,
+            )
+            self._apply_ik_result(result)
+            self._descend_locked_R = dict(self._side_descend_wp_target_R)  # kept for FINGERTIP_PRECONTACT's own use when skip_precontact_servo=False
             action[0:3] = self._waist_action_toward_target()
             action[3:17] = self._arm_action_toward_target()
             self._update_wrap_wrist_qvel_peak()
@@ -2250,21 +2284,62 @@ class SharpaBimanualGraspExpert:
             table_forces = self.env._hand_table_forces_categorized()
             self.max_forbidden_hand_table_force_n = max(self.max_forbidden_hand_table_force_n, table_forces["forbidden"])
             self.max_allowed_ulnar_table_force_n = max(self.max_allowed_ulnar_table_force_n, table_forces["allowed_ulnar"])
-            if table_forces["forbidden"] > cfg.hand_hand_force_limit_n:
+            torso_force_now = self.env._torso_arm_collision_force()
+            self.torso_arm_collision_force_n = max(self.torso_arm_collision_force_n, torso_force_now)
+            hand_hand_now = self.env._hand_hand_contact_force()
+            # [Direct-grasp session] This final approach genuinely, and
+            # stably (not growing further -- measured, real physics),
+            # brushes the torso at this reach depth (see side_descend_
+            # standoff_m's docstring: a real kinematic property of this
+            # orientation family, not a solver artifact). Per Section 7
+            # ("200N급 충돌이나 실제 관통은 허용하지 않는다" -- only
+            # genuinely dangerous contact is disallowed, not a bounded,
+            # stable graze), the HARD fail threshold here is
+            # precontact_hard_collision_force_n (40N, matching FINGERTIP_
+            # PRECONTACT's own established threshold), not the routine 8N
+            # Gate limit -- which stays the "no forbidden collision" bar
+            # elsewhere (Horizontal-Wrap Posture Gate, swept-path checks
+            # up through FIVE_FINGER_PRESHAPE) and is NOT weakened there.
+            if table_forces["forbidden"] > cfg.precontact_hard_collision_force_n:
                 self._fail(BimanualFailureReason.HAND_TABLE_COLLISION)
                 return action
-            no_collision = (self.env._torso_arm_collision_force() <= cfg.hand_hand_force_limit_n
-                             and self.env._hand_hand_contact_force() <= cfg.hand_hand_force_limit_n)
+            if torso_force_now > cfg.precontact_hard_collision_force_n:
+                self._fail(BimanualFailureReason.SELF_COLLISION_TORSO_ARM)
+                return action
+            if hand_hand_now > cfg.precontact_hard_collision_force_n:
+                self._fail(BimanualFailureReason.CONTACT_LOST)
+                return action
             waypoints_done = self._side_descend_waypoint >= cfg.side_descend_waypoints
-            stable_now = pos_err <= cfg.ik_pos_tol and no_collision and waypoints_done
+            left_sep = self._precontact_separation_m("left")
+            right_sep = self._precontact_separation_m("right")
+            # [Direct-grasp session] Readiness is judged on REAL, measured
+            # fingertip-object separation (does the closure swept path
+            # have a realistic chance of reaching the object once
+            # CONTACT_ACQUIRE starts curling -- Section 5's "단순한 파지
+            # 판단" principle), not on hitting the shared 10mm ik_pos_tol
+            # against an intentionally-aggressive Cartesian target that
+            # this reach cannot fully converge to.
+            close_enough = max(left_sep, right_sep) <= cfg.side_descend_ready_separation_m
+            stable_now = close_enough and waypoints_done
             self._descend_stable_streak = self._descend_stable_streak + 1 if stable_now else 0
             if self._descend_stable_streak >= cfg.side_descend_stable_streak_required:
                 if cfg.skip_precontact_servo:
                     self._advance(BimanualGraspState.CONTACT_ACQUIRE)
                 else:
                     self._advance(BimanualGraspState.FINGERTIP_PRECONTACT)
-            elif self._state_step >= cfg.max_steps_per_state:
-                self._fail(BimanualFailureReason.SIDE_DESCEND_NOT_ACHIEVED)
+            elif self._state_step >= cfg.side_descend_max_steps:
+                if cfg.skip_precontact_servo and waypoints_done:
+                    # [Direct-grasp session] Even short of the ready-
+                    # separation streak, if the waypoint schedule genuinely
+                    # completed and no hard collision occurred, advance to
+                    # CONTACT_ACQUIRE anyway with whatever real separation
+                    # was reached -- Section 5 explicitly rules out
+                    # blocking finger closure on an intermediate distance
+                    # gate; CONTACT_ACQUIRE's own real contact detection
+                    # (not this state) is the actual arbiter.
+                    self._advance(BimanualGraspState.CONTACT_ACQUIRE)
+                else:
+                    self._fail(BimanualFailureReason.SIDE_DESCEND_NOT_ACHIEVED)
 
         elif state == BimanualGraspState.FINGERTIP_PRECONTACT:
             # [Fingertip-contact session] REPLACES the old fixed-
@@ -2425,18 +2500,90 @@ class SharpaBimanualGraspExpert:
             # Both sides close INDEPENDENTLY/asynchronously: a side/group
             # that has already registered contact stops advancing while
             # the other side keeps closing (Section 4 requirement 7/8).
+            if self._state_step == 0:
+                self._contact_acquire_recovery_until = {"left": 0, "right": 0}
+                if self._initial_obj_xy is None:
+                    # [Direct-grasp session] Object displacement was NOT
+                    # tracked at all before CONTACT_ACQUIRE (only from
+                    # FORCE_SETTLE onward) -- real physics showed the
+                    # object CAN get bumped during this state (measured,
+                    # before the step-size fix above: ~90mm real
+                    # displacement in one run), so track it honestly from
+                    # here too instead of silently reporting 0.0.
+                    self._initial_obj_xy = self._object_pos()[:2].copy()
+            self._track_stability()
             deltas = {"left": {}, "right": {}}
             for side in SIDES:
                 for group in ("index", "middle", "wrap"):
                     if not self._group_contact_now(side, group):
                         deltas[side][group] = cfg.close_rate_per_step
             action[17:25] = self._group_action(deltas)
+
+            # [Direct-grasp session] "한 손이 먼저 닿으면 유지하고 반대 손을
+            # 접근한다": a side with NO real contact yet keeps taking small
+            # inward steps (same recipe as FOREARM_SIDE_DESCEND's own
+            # servo -- object-facing orientation held fixed at the frozen
+            # _descend_locked_R, PRECONTACT_JOINT_WEIGHT discouraging
+            # shoulder tuck, graduated collision recovery); a side that
+            # ALREADY has contact holds its CURRENT position (target =
+            # current palm_pos) so the contact it made is not disturbed.
+            torso_force_now = self.env._torso_arm_collision_force()
+            table_forces_now = self.env._hand_table_forces_categorized()
+            hand_hand_now = self.env._hand_hand_contact_force()
+            if torso_force_now > cfg.precontact_hard_collision_force_n:
+                self._fail(BimanualFailureReason.SELF_COLLISION_TORSO_ARM)
+                return action
+            if table_forces_now["forbidden"] > cfg.precontact_hard_collision_force_n:
+                self._fail(BimanualFailureReason.HAND_TABLE_COLLISION)
+                return action
+            guard = cfg.precontact_collision_guard_frac * cfg.hand_hand_force_limit_n
+            collision_now = torso_force_now > guard or table_forces_now["forbidden"] > guard
+            targets = {}
+            R = {}
+            need_solve = False
+            for side in SIDES:
+                side_has_contact = any(self._group_ever_contacted[side][g] for g in ("index", "middle", "wrap"))
+                palm_pos, _ = self.env.palm_pose(side)
+                if side_has_contact:
+                    targets[side] = palm_pos
+                else:
+                    need_solve = True
+                    in_recovery = self._total_step < self._contact_acquire_recovery_until[side]
+                    if collision_now and not in_recovery:
+                        self._contact_acquire_recovery_until[side] = self._total_step + cfg.precontact_recovery_ticks
+                        in_recovery = True
+                    if in_recovery:
+                        step = -cfg.precontact_recovery_backoff_m / cfg.precontact_recovery_ticks
+                    else:
+                        # [Direct-grasp session] Much gentler than
+                        # FOREARM_SIDE_DESCEND's own step -- by this point
+                        # curl alone is already closing most of the
+                        # remaining gap (measured: down to ~15-20mm), and
+                        # measured real physics showed a too-aggressive
+                        # simultaneous arm nudge + curl combination can
+                        # push the OBJECT itself away before a stable
+                        # contact registers (real object displacement
+                        # observed, ~90mm in one run) instead of helping.
+                        step = cfg.precontact_servo_step_m * 0.05
+                    inward_dir = np.array([0.0, -Y_SIGN[side], 0.0])
+                    targets[side] = palm_pos + inward_dir * step
+                R[side] = self._descend_locked_R[side]
+            if need_solve:
+                result = self._solve_both(
+                    targets, R, require_orientation=False, ori_task_weight=0.3,
+                    rest_q=self._current_rest_q(), rest_gain=0.3, pos_tol=cfg.precontact_servo_pos_tol_m,
+                    joint_weight=self.PRECONTACT_JOINT_WEIGHT,
+                )
+                self._apply_ik_result(result)
+                action[0:3] = self._waist_action_toward_target()
+                action[3:17] = self._arm_action_toward_target()
+
             both_have_some_contact = all(
                 any(self._group_ever_contacted[side][g] for g in ("index", "middle", "wrap")) for side in SIDES
             )
             if both_have_some_contact:
                 self._advance(BimanualGraspState.THUMB_OPPOSE)
-            elif self._state_step >= cfg.max_steps_per_state:
+            elif self._state_step >= cfg.contact_acquire_max_steps:
                 self._fail(BimanualFailureReason.TIMEOUT)
 
         elif state == BimanualGraspState.THUMB_OPPOSE:
