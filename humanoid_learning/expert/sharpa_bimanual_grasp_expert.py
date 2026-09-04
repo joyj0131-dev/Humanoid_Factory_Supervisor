@@ -1117,9 +1117,21 @@ class SharpaBimanualGraspExpert:
     PRECONTACT_JOINT_WEIGHT[[3, 4, 5, 10, 11, 12]] = 8.0
     PRECONTACT_JOINT_WEIGHT[[6, 13]] = 3.0
     PRECONTACT_JOINT_WEIGHT[[7, 8, 9, 14, 15, 16]] = 0.15
+    # [Level-approach session] Real FK sweep at a SAFE (0.00N torso)
+    # DESCEND-exit pose, one joint at a time: shoulder_roll is the only
+    # dangerous DOF (-0.1rad -> +4.7mm palm-Z but 28.53N torso-arm
+    # contact); shoulder_pitch and elbow both lower the palm's Z
+    # substantially with ZERO torso force (elbow +0.1rad -> -19.9mm/0N,
+    # shoulder_pitch +0.1rad -> -13.1mm/0N). Uniformly pricing the whole
+    # shoulder group at 8.0 (below) hid this -- the solver had no reason
+    # to prefer the safe pitch DOF over the risky roll one when matching
+    # a lower Z target under a hard orientation constraint, and was
+    # measured to reach for the expensive/risky combination anyway
+    # (23.36N). shoulder_pitch is priced like elbow instead; shoulder_
+    # roll/yaw stay expensive.
     DESCEND_JOINT_WEIGHT = np.ones(17)
-    DESCEND_JOINT_WEIGHT[[3, 4, 5, 10, 11, 12]] = 8.0
-    DESCEND_JOINT_WEIGHT[[6, 13]] = 3.0
+    DESCEND_JOINT_WEIGHT[[4, 5, 11, 12]] = 8.0
+    DESCEND_JOINT_WEIGHT[[3, 6, 10, 13]] = 3.0
     DESCEND_JOINT_WEIGHT[[7, 8, 9, 14, 15, 16]] = 0.15
 
     def __init__(self, env, config: BimanualGraspConfig | None = None):
