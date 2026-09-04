@@ -130,6 +130,11 @@ def _hand_axis_segments(env, expert) -> list[tuple[np.ndarray, np.ndarray, tuple
         segs.append((palm_pos, palm_pos + inside_normal * long_len, (0.9, 0.9, 0.0, 1.0), f"{side}_inside_normal"))
         closing_dir = palm_R @ sbe.LOCAL_CLOSING_VEC
         segs.append((palm_pos, palm_pos + closing_dir * long_len, (0.85, 0.1, 0.85, 1.0), f"{side}_empirical_closing"))
+        # [Horizontal-Wrap session] cyan = ulnar (pinky-side) edge
+        # direction -- should point roughly straight down (world -Z) at
+        # a converged Horizontal-Wrap pose.
+        ulnar_dir = palm_R @ (sbe.ULNAR_SIGN[side] * sbe.LOCAL_ULNAR_VEC)
+        segs.append((palm_pos, palm_pos + ulnar_dir * long_len, (0.1, 0.85, 0.85, 1.0), f"{side}_ulnar_down"))
         if obj_pos is not None:
             to_obj = obj_pos - palm_pos
             n = np.linalg.norm(to_obj)
@@ -185,7 +190,7 @@ def mode_grasp(
     print("Official Sharpa bimanual grasp; Gate A is still incomplete.")
     if show_hand_axes:
         print("  --show-hand-axes ON: red/green/blue=palm local XYZ, yellow=inside normal, "
-              "magenta=empirical closing direction, white=to-object direction")
+              "magenta=empirical closing direction, cyan=ulnar-edge-down direction, white=to-object direction")
 
     def restart() -> None:
         env.reset(seed=0)
@@ -217,8 +222,11 @@ def mode_grasp(
         # instead of drawn in-scene.
         if show_hand_axes and tick % 60 == 0:
             import humanoid_learning.envs.sharpa_config as sc
+            import humanoid_learning.expert.sharpa_bimanual_grasp_expert as sbe
             torso = env._torso_arm_collision_force()
             table = env._hand_table_contact_force()
+            table_cat = env._hand_table_forces_categorized()
+            wrist_margins = sbe._wrist_joint_margins_deg(env)
             wrist_dof = np.concatenate([env._arm_dof_adr[4:7], env._arm_dof_adr[11:14]])
             wrist_qvel = float(np.max(np.abs(env.data.qvel[wrist_dof])))
             fo = getattr(expert, "_functional_orientation", {}) or {}
@@ -250,8 +258,11 @@ def mode_grasp(
             # at 60-tick cadence) -- see scripts/audit_sharpa_curl_table_
             # feasibility.py / candidate_open_preshape_descend.py for the
             # authoritative offline measurement of that quantity.
+            wrist_margin_min = min(wrist_margins.values())
             print(f"  [hud] state={expert.state.name} reason={expert.failure_reason} "
-                  f"torso_arm={torso:.2f}N hand_table={table:.2f}N wrist_qvel={wrist_qvel:.2f}rad/s "
+                  f"torso_arm={torso:.2f}N hand_table={table:.2f}N "
+                  f"table_forbidden={table_cat['forbidden']:.2f}N table_allowed_ulnar={table_cat['allowed_ulnar']:.2f}N "
+                  f"wrist_qvel={wrist_qvel:.2f}rad/s wrist_margin_min_deg={wrist_margin_min:.1f} "
                   f"fingertip_min_z={fingertip_table_clearance} fingertip_obj_sep_mm={fingertip_obj_sep_mm} "
                   f"contact_groups={contact_groups} precontact_pos_err={expert._precontact_final_pos_error} "
                   f"precontact_ori_err_deg={expert._precontact_final_ori_error_deg} "
