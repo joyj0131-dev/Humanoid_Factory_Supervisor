@@ -514,7 +514,23 @@ class BimanualGraspConfig:
     # remains a separately reported, unchanged diagnostic.
     contact_driven_lift: bool = True
     hold_noslip_iterations: int = 10
-    hold_squeeze_m: float = 0.012
+    # [Precision-grasp session] 0.012 -> 0.003. Two attempts to ADD finger
+    # closing force on top of the original 12mm arm-squeeze both
+    # regressed the working rollout (see this file's SharpaContactLift
+    # usage site for the failure record) -- the frozen finger posture
+    # plus a 12mm squeeze was a narrow, finely-tuned equilibrium that any
+    # extra finger force disrupted. A parameter sweep of hold_squeeze_m
+    # alone (no new finger logic) found real headroom instead: 0.001
+    # fails (CONTACT_LOST) but 0.002-0.012 all reach SUCCESS with nearly
+    # identical clearance/hold numbers -- the original 12mm was massively
+    # over-provisioned. Measured per-body contact force at seed0's
+    # AIR_HOLD: at 0.012 fingers carried only 14-16% of each hand's
+    # support force (palm+wrist did 84-86%); at 0.003 (3x margin above
+    # the 0.001 failure point) fingers carry 30.5-37.7% -- roughly
+    # doubling the fingers' real share WITHOUT adding any new finger-
+    # closing code, just by not over-squeezing with the arm. See
+    # PROJECT_CONTEXT.md for the full sweep table.
+    hold_squeeze_m: float = 0.003
     lift_speed_m_s: float = 0.01
     lift_tracking_allowance_m: float = 0.04
     # [Session 41] ARM_LATERAL_CLEARANCE joint posture -- NOT a Cartesian
