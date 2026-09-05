@@ -64,6 +64,14 @@ tick에서 30회 연속 유지되고, object XY 이동 ≤0.03m, peak angular ve
 접촉 후 MuJoCo `noslip_iterations=10`을 적용한다(마찰계수/질량/geometry
 불변). 손을 열면 물체가 낙하하는 테스트로 고정/부착 없는 물리 접촉임을 검증한다.
 
+**지지력 구성 (실측, seed0)**: 손바닥(hand_C_MC)+손목(wrist_yaw_link) 접촉이
+전체 지지력의 약 84~86%, 손가락(주로 wrap인 ring/pinky, middle 일부)은 약
+14~16%다. 접촉 지점을 물체 로컬 좌표로 보면 왼손은 +Y면, 오른손은 -Y면을
+누르고 있어 양손이 서로 반대쪽에서 물체를 사이에 끼우는 협동(vise-like)
+구조다. 엄지는 이 rollout 내내 접촉력 0 — 한 손 안에서 엄지가 index/middle에
+대립하는 tripod 구조(Gate A가 요구하는 것)는 아니며, 손가락이 실제로 물체를
+감싸 쥐는 비중을 늘리는 게 다음 목표다.
+
 ## Commands
 
 ```bash

@@ -69,3 +69,8 @@ force safety는 유지한다. reset은 접근 시점 solver 설정을 복원한�
 엄지 대향접촉, 초기 접근의 손목 transient 및 전체 Phase 4.5 승인은 별도다.
 실제 지지는 손가락+손바닥+손목 접촉을 사용하며 hold 구간 최대 관통은
 약 3.85mm다. 순수 fingertip grasp 또는 기존 1mm 관통 Gate 통과로 해석하지 않는다.
+seed0 성공 rollout의 몸체별 접촉력 합산: 손바닥(hand_C_MC)+손목(wrist_yaw_link)이
+지지력의 약 84~86%, 손가락(주로 wrap, middle 일부)은 약 14~16%다. 접촉 지점을
+물체 로컬 좌표로 보면 양손 모두 서로 반대쪽 Y면(측면)을 누르는 구조라 실제로는
+양손이 물체를 사이에 끼우는 협동 grasp에 가깝고, 손 안에서 엄지가 index/middle에
+대립하는 tripod 구조는 아니다(엄지는 이 rollout 내내 접촉력이 0이다).

@@ -1856,6 +1856,21 @@ class SharpaBimanualGraspExpert:
             for group in sc.GROUPS:
                 self._group_contact_now(side, group)
         action = lift.step(lift.height)
+        # [Precision-grasp session] Tried reinforcing (not chasing)
+        # already-contacting groups here with a small extra close
+        # command (0.3x close_rate_per_step), to shift some support load
+        # from the arm-squeeze (measured 84-86% palm+wrist / 14-16%
+        # fingers) onto the fingers. Measured regression: seed0 failed
+        # CONTACT_LOST even faster than the THUMB_OPPOSE-window attempt
+        # (tick 2445 vs 2645) -- this success state is a narrow, finely-
+        # balanced equilibrium (the exact frozen finger posture + exact
+        # squeeze amount) that any additional finger closing force
+        # disrupts, even applied only to already-contacting groups.
+        # Reverted, not committed. Shifting support toward fingers likely
+        # needs a change to the squeeze GEOMETRY/timing itself (e.g. a
+        # gentler combined squeeze+curl ramp from the start of contact,
+        # not an add-on layered onto the already-frozen final posture) --
+        # not found this session, see PROJECT_CONTEXT.md.
         if not np.isfinite(self.env.data.qpos).all() or not np.isfinite(self.env.data.qvel).all():
             self._fail(BimanualFailureReason.NUMERICAL_ERROR)
             return action
@@ -2987,6 +3002,20 @@ class SharpaBimanualGraspExpert:
                     if not self._group_contact_now(side, group):
                         deltas[side][group] = cfg.close_rate_per_step
             action[17:25] = self._group_action(deltas)
+            # [Precision-grasp session] Tried extending this window to 3s
+            # (waiting for both sides' thumb to touch) so the CMC_FE
+            # nudge above had more runway. Measured regression: the
+            # previously-succeeding seed=0 rollout now fails CONTACT_LOST
+            # at FORCE_SETTLE -- more thumb-press time destabilizes the
+            # already-working wrap/middle contact rather than adding to
+            # it (consistent with this session's other finding that the
+            # thumb's growing pressure can displace the object away from
+            # already-established contact instead of opposing it in
+            # place). Reverted to the flat 1s window verified in commit
+            # 75c161e; extending thumb's contact window is not a safe
+            # lever on its own -- it needs to be paired with fixing WHY
+            # thumb contact currently displaces other groups instead of
+            # complementing them (see PROJECT_CONTEXT.md).
             if cfg.contact_driven_lift and self._state_step >= sim_time_to_steps(self.env, 1.0) - 1:
                 self._advance(BimanualGraspState.ENVELOPING_CLOSE)
             elif all(self._group_ever_contacted[side][g] for side in SIDES for g in sc.GROUPS):

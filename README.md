@@ -12,7 +12,11 @@ dropped part, misalignment, jam 같은 예외에 whole-body로 개입한다.
 `phase4/dex3-grasp` 브랜치에 보존한다.
 
 현재 접촉에는 손가락뿐 아니라 손바닥·손목도 참여한다. 손끝만의 정밀 파지는
-아니며 soft-contact 관통은 hold 구간 최대 약 3.85mm로 별도 기록한다.
+아니며 soft-contact 관통은 hold 구간 최대 약 3.85mm로 별도 기록한다. seed0
+성공 rollout의 접촉력을 몸체별로 합산하면 손바닥+손목이 지지력의 약
+84~86%를 차지하고 손가락(주로 wrap: ring/pinky, middle 일부)은 약
+14~16%뿐이다 — 양손이 물체를 사이에 끼우는 방식이 지지력의 대부분이고,
+손가락이 실제로 감싸 쥐는 비중은 작다.
 
 ## 현재 실행
 
