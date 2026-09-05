@@ -531,6 +531,8 @@ class BimanualGraspConfig:
     # closing code, just by not over-squeezing with the arm. See
     # PROJECT_CONTEXT.md for the full sweep table.
     hold_squeeze_m: float = 0.003
+    enveloping_acquire_min_seconds: float = 3.0
+    enveloping_acquire_support_seconds: float = 0.3
     lift_speed_m_s: float = 0.01
     lift_tracking_allowance_m: float = 0.04
     # [Session 41] ARM_LATERAL_CLEARANCE joint posture -- NOT a Cartesian
@@ -607,6 +609,8 @@ class BimanualGraspConfig:
     # which target a genuine object-facing, fingers-down orientation and
     # use their OWN geometry fields.
     forward_reach_stable_streak_required: int = 15
+    forward_reach_refine_after_steps: int = 400
+    forward_reach_refine_pos_tol_m: float = 0.001
 
     # ---- Side-grasp geometry (this session) --------------------------
     # User-directed requirement: both palms end up beside the object's
@@ -1305,9 +1309,10 @@ class SharpaBimanualGraspExpert:
         precontact_target_separation_m) -- replaces the old fixed
         precontact_y_offset_m Cartesian target."""
         obj_pos = self._object_pos()
-        half = self.env.config.object_half_size
-        tip_centroid = self._nonthumb_tip_centroid(side)
-        return float(Y_SIGN[side] * (tip_centroid[1] - obj_pos[1]) - half)
+        rotation = self.env.data.xmat[self.env._object_body_id].reshape(3, 3)
+        half_y = self.env.config.effective_object_half_extents[1]
+        local_tip = rotation.T @ (self._nonthumb_tip_centroid(side) - obj_pos)
+        return float(Y_SIGN[side] * local_tip[1] - half_y)
 
     def _solve_both(self, targets: dict, R: dict, require_orientation: bool, ori_task_weight: float,
                      rest_q: np.ndarray | None = None, rest_gain: float | None = None,
@@ -1517,14 +1522,17 @@ class SharpaBimanualGraspExpert:
         -- none of it is inferred from joint targets alone."""
         env = self.env
         obj_pos = self._object_pos()
-        half = env.config.object_half_size
+        half = np.asarray(env.config.effective_object_half_extents)
+        object_R = env.data.xmat[env._object_body_id].reshape(3, 3)
         palm = {s: env.palm_pose(s) for s in SIDES}
         tip_centroid = {}
         for s in SIDES:
             tips = {f: env.fingertip_pos(s, f) for f in sc.FINGERS}
             tip_centroid[s] = np.mean([tips[f] for f in ("index", "middle", "ring", "pinky")], axis=0)
 
-        outside_side_face = {s: bool(abs(palm[s][0][1]) > half) for s in SIDES}
+        local_palm = {s: object_R.T @ (palm[s][0] - obj_pos) for s in SIDES}
+        local_tip = {s: object_R.T @ (tip_centroid[s] - obj_pos) for s in SIDES}
+        outside_side_face = {s: bool(Y_SIGN[s] * local_palm[s][1] > half[1]) for s in SIDES}
         inward_angle_deg = {
             "left": self.left_object_facing_angle_deg, "right": self.right_object_facing_angle_deg,
         }
@@ -1583,13 +1591,13 @@ class SharpaBimanualGraspExpert:
         # later by the closure-swept-path check (Constraint E) at the
         # actual FOREARM_SIDE_DESCEND/FINGERTIP_PRECONTACT geometry.
         tip_height_overlaps_side = {
-            s: bool(obj_pos[2] - half <= tip_centroid[s][2] <= obj_pos[2] + half) for s in SIDES
+            s: bool(abs(local_tip[s][2]) <= half[2]) for s in SIDES
         }
         # "crosses the object's TOP footprint" -- palm/fingertip XY within the object's
         # own X/Y half-extent AND above the object's top face.
         crosses_top_footprint = any(
-            abs(tip_centroid[s][0] - obj_pos[0]) < half and abs(tip_centroid[s][1] - obj_pos[1]) < half
-            and tip_centroid[s][2] > obj_pos[2] + half
+            abs(local_tip[s][0]) < half[0] and abs(local_tip[s][1]) < half[1]
+            and local_tip[s][2] > half[2]
             for s in SIDES
         )
         mirror_pos_err_m = float(np.linalg.norm(
@@ -2060,8 +2068,15 @@ class SharpaBimanualGraspExpert:
                 )
                 self._forward_reach_waypoint = 0
             ticks_per_wp = self.FORWARD_REACH_WAYPOINT_TICKS
-            if self._state_step % ticks_per_wp == 0 and self._forward_reach_waypoint < self.FORWARD_REACH_WAYPOINTS:
-                self._forward_reach_waypoint += 1
+            refine_final = self._state_step >= cfg.forward_reach_refine_after_steps
+            if self._state_step % ticks_per_wp == 0 and (
+                    self._forward_reach_waypoint < self.FORWARD_REACH_WAYPOINTS or refine_final):
+                # Let the nominal transit settle before correcting its final
+                # target from measured qpos; preserve already-working paths.
+                # A one-shot IK solution at the 10mm acceptance boundary
+                # left no tracking margin when the object moved even 5mm.
+                self._forward_reach_waypoint = min(
+                    self._forward_reach_waypoint + 1, self.FORWARD_REACH_WAYPOINTS)
                 frac = self._forward_reach_waypoint / self.FORWARD_REACH_WAYPOINTS
                 wp_targets = {
                     s: (1 - frac) * self._forward_reach_start[s] + frac * self._forward_reach_final[s] for s in SIDES
@@ -2083,7 +2098,8 @@ class SharpaBimanualGraspExpert:
                 # does not reintroduce the 36th session's wrist_pitch
                 # DYNAMIC instability (qvel stays bounded through physics).
                 result = self._solve_both(wp_targets, {"left": lR, "right": rR}, require_orientation=False,
-                                           ori_task_weight=0.0, rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain)
+                                           ori_task_weight=0.0, rest_q=self._clearance_target, rest_gain=cfg.posture_rest_gain,
+                                           pos_tol=cfg.forward_reach_refine_pos_tol_m if refine_final else cfg.ik_pos_tol)
                 self._apply_ik_result(result)
             action[0:3] = self._waist_action_toward_target()
             action[3:17] = self._arm_action_toward_target()
@@ -2773,6 +2789,7 @@ class SharpaBimanualGraspExpert:
             # existing curl-toward-Gate-A behavior.
             if self._state_step == 0:
                 self._contact_acquire_recovery_until = {"left": 0, "right": 0}
+                self._acquire_support_streak = 0
                 # Anchor the servo target to a ONE-TIME pose snapshot + a
                 # cumulative intended offset, not to "current palm_pos"
                 # every tick -- re-deriving the target from the live
@@ -2978,6 +2995,22 @@ class SharpaBimanualGraspExpert:
                 action[3:17] = self._arm_action_toward_target()
 
             both_have_some_contact = all(self._side_reach_ready(side) for side in SIDES)
+            # A whole-hand enveloping grasp need not reach the historical
+            # index/middle+wrap topology. After giving finger acquisition
+            # time, accept sustained CURRENT opposing support plus a real
+            # non-thumb contact on both sides; never merely an old touch flag.
+            if cfg.contact_driven_lift and self._state_step >= sim_time_to_steps(self.env, cfg.enveloping_acquire_min_seconds):
+                from humanoid_learning.expert.sharpa_contact_lift import SharpaContactLift
+                forces = SharpaContactLift.measure_support_forces(self.env)
+                actual_support = (
+                    all(np.linalg.norm(forces[s]) > 0.5 for s in SIDES)
+                    and np.dot(forces['left'][:2], forces['right'][:2]) < 0
+                    and all(any(self._group_contact_now(s, g)
+                                for g in ('index', 'middle', 'wrap')) for s in SIDES))
+                self._acquire_support_streak = (
+                    self._acquire_support_streak + 1 if actual_support else 0)
+                both_have_some_contact |= self._acquire_support_streak >= sim_time_to_steps(
+                    self.env, cfg.enveloping_acquire_support_seconds)
             if both_have_some_contact:
                 self._advance(BimanualGraspState.THUMB_OPPOSE)
             elif self._state_step >= cfg.contact_acquire_max_steps:

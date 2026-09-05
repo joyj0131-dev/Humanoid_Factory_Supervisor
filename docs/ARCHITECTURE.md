@@ -54,6 +54,13 @@ pre-hand-equipped base가 남기던 손목당 0.202839kg의 ghost hand mass도
 
 ## Current blocker
 
+2026-09-05 작업영역 확장: 같은 설정으로 위치·크기·yaw 14조건과 별도 조합
+4조건의 물리 파지/상승이 성공했다. 최종 접근 재보정, 손목을 포함한 실제
+지지력 집계, 작은 물체용 현재 접촉 기반 enveloping 전이를 추가했다.
+환경은 XYZ 크기와 seeded XY/yaw reset을 지원한다. 자세한 검증 범위와
+다음 IL 기록/재생 과제는 [작업영역 평가](SHARPA_WORKSPACE_EVALUATION.md)에 있다.
+아래 기본 장면의 과거 수치는 다양한 조건 전체의 품질 보장이 아니다.
+
 기본 rollout은 CONTACT_ACQUIRE → THUMB_OPPOSE → FORCE_SETTLE →
 TABLETOP_HOLD → LIFT → AIR_HOLD → SUCCESS까지 진행한다. `physical_grasp_success`는
 실제 양손 지지와 5cm 이상 table clearance를 연속 5초 유지해야 한다.

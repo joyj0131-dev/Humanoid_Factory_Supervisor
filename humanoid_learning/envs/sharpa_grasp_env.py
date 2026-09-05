@@ -200,6 +200,20 @@ class SharpaGraspEnv(gym.Env):
         qpos = np.zeros(self.model.nq)
         qpos[: len(self._stand_qpos)] = self._stand_qpos
         obj_x, obj_y, _ = self.config.object_pos
+        radius = np.asarray(self.config.object_xy_randomization_m)
+        obj_x, obj_y = np.array([obj_x, obj_y]) + self.np_random.uniform(-radius, radius)
+        yaw = self.config.object_yaw_rad + self.np_random.uniform(
+            -self.config.object_yaw_randomization_rad, self.config.object_yaw_randomization_rad)
+        options = options or {}
+        if "object_xy" in options:
+            xy = np.asarray(options["object_xy"], dtype=float)
+            if xy.shape != (2,) or not np.isfinite(xy).all():
+                raise ValueError("reset object_xy must contain two finite coordinates")
+            obj_x, obj_y = xy
+        if "object_yaw_rad" in options:
+            yaw = float(options["object_yaw_rad"])
+        if not np.isfinite(yaw):
+            raise ValueError("reset object_yaw_rad must be finite")
         obj_z = (
             self.config.table_pos[2]
             + self.config.table_half_size[2]
@@ -207,7 +221,8 @@ class SharpaGraspEnv(gym.Env):
             + tc.OBJECT_TABLE_GAP
         )
         qpos[self._object_qpos_adr : self._object_qpos_adr + 3] = [obj_x, obj_y, obj_z]
-        qpos[self._object_qpos_adr + 3 : self._object_qpos_adr + 7] = [1.0, 0.0, 0.0, 0.0]
+        qpos[self._object_qpos_adr + 3 : self._object_qpos_adr + 7] = [np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)]
+        self._reset_object_xy_yaw = np.array([obj_x, obj_y, yaw])
 
         self.data.qpos[:] = qpos
         self.data.qvel[:] = 0.0
@@ -575,6 +590,8 @@ class SharpaGraspEnv(gym.Env):
         return {
             "step_count": self._step_count,
             "object_position": obj_pos,
+            "reset_object_xy_yaw": self._reset_object_xy_yaw.copy(),
+            "object_half_extents": np.asarray(self.config.effective_object_half_extents),
             "object_velocity": obj_vel,
             "hand_object_contact": touched,
             "max_contact_force": max_force,

@@ -25,23 +25,47 @@ class SharpaContactLift:
         self.height = 0.0
         self.table_geom = mujoco.mj_name2id(self.env.model, mujoco.mjtObj.mjOBJ_GEOM, tc.TABLE_GEOM)
         self.object_geom = mujoco.mj_name2id(self.env.model, mujoco.mjtObj.mjOBJ_GEOM, tc.OBJECT_GEOM)
+        # This controller deliberately performs an enveloping hand/wrist grasp.
+        # Excluding the G1 wrist while counting the opposing Sharpa fingers
+        # misclassified real support as CONTACT_LOST (the uncounted wrist
+        # balances the fingers' fore/aft force). Do not include forearms/torso.
+        self.support_body_ids = self.hand_wrist_body_ids(self.env)
         self.env.model.opt.noslip_iterations = expert.config.hold_noslip_iterations
+
+    @staticmethod
+    def hand_wrist_body_ids(env):
+        bodies = {}
+        for side in sc.SIDES:
+            ids = set(getattr(env, f'_{side}_hand_body_ids'))
+            for axis in ('roll', 'pitch', 'yaw'):
+                bid = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY,
+                                      f'{side}_wrist_{axis}_link')
+                if bid >= 0:
+                    ids.add(bid)
+            bodies[side] = ids
+        return bodies
 
     def support_forces(self):
         """Actual object forces from each whole hand, not historical touch flags."""
+        return self.measure_support_forces(self.env, self.support_body_ids)
+
+    @staticmethod
+    def measure_support_forces(env, bodies=None):
+        """Read-only contact census: safe to use before enabling lift control."""
         result = {s: np.zeros(3) for s in sc.SIDES}
-        bodies = {"left": self.env._left_hand_body_ids, "right": self.env._right_hand_body_ids}
-        model, data = self.env.model, self.env.data
+        if bodies is None:
+            bodies = SharpaContactLift.hand_wrist_body_ids(env)
+        model, data = env.model, env.data
         for i in range(data.ncon):
             c = data.contact[i]
             b1, b2 = model.geom_bodyid[c.geom1], model.geom_bodyid[c.geom2]
-            if self.env._object_body_id not in (b1, b2):
+            if env._object_body_id not in (b1, b2):
                 continue
-            other = b2 if b1 == self.env._object_body_id else b1
+            other = b2 if b1 == env._object_body_id else b1
             f = np.zeros(6)
             mujoco.mj_contactForce(model, data, i, f)
             world = c.frame.reshape(3, 3).T @ f[:3]
-            if b1 == self.env._object_body_id:
+            if b1 == env._object_body_id:
                 world = -world
             for side in sc.SIDES:
                 if other in bodies[side]:

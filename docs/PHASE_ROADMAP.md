@@ -33,6 +33,12 @@
 
 현재 확인 상태(2026-09-05):
 
+작업영역 확장 검증: 수정 전 2/14 → 수정 후 14/14 조건 성공, 별도 위치·
+크기·회전 조합 4/4 성공. 유한한 조건 검증이며 범용 파지 완료가 아니다.
+[정확한 조건 및 한계](SHARPA_WORKSPACE_EVALUATION.md)를 따른다.
+다음 구현은 Sharpa 명령 기록/재생 검증 후 소규모 state-based BC다.
+카메라 인식·BC/PPO는 이번 작업에서 구현하지 않았다.
+
 - Mount Integration Gate: PASS
 - Natural Posture Gate: PASS
 - Wrist Transition Gate: FAIL (`5.125rad/s > 2.0rad/s`)

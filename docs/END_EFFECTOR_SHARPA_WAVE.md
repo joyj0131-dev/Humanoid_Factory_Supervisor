@@ -45,6 +45,11 @@ thumb | index | middle | wrap(ring+pinky)
 
 Phase 4.5는 미완료다.
 
+작업영역 확장(2026-09-05): 동일한 제어기로 위치·크기·yaw 14조건과 별도
+조합 4조건의 실제 상승/5초 유지 검증 완료. 손목을 누락하던 지지력 집계를
+수정했으며, 손가락만의 파지로 재분류하지 않는다. 모델 질량·마찰·장착·
+관절은 변경하지 않았다. [평가 조건/재현법](SHARPA_WORKSPACE_EVALUATION.md) 참고.
+
 - Natural Posture Gate: PASS
 - Wrist Transition Gate: FAIL (`5.125rad/s > 2.0rad/s`)
 - Forward Reach Gate: PASS (settled palm error 약 9.96mm, streak 15,

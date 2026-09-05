@@ -210,6 +210,9 @@ def mode_grasp(
     visual_style: str,
     show_hand_axes: bool = False,
     fps_log: bool = False,
+    object_pos_y: float = 0.0,
+    object_size: list[float] | None = None,
+    object_yaw_deg: float = 0.0,
 ) -> None:
     from humanoid_learning.envs.grasp_config import GraspEnvConfig
     from humanoid_learning.envs.sharpa_grasp_env import SharpaGraspEnv
@@ -219,7 +222,8 @@ def mode_grasp(
     )
 
     kwargs = {
-        "object_pos": (object_pos_x, 0.0, 0.0),
+        "object_pos": (object_pos_x, object_pos_y, 0.0),
+        "object_yaw_rad": float(np.deg2rad(object_yaw_deg)),
         "arm_kp": 120.0,
         "arm_gravity_compensation": True,
         "sharpa_mount": mount,
@@ -228,6 +232,8 @@ def mode_grasp(
     }
     if object_half_size is not None:
         kwargs["object_half_size"] = object_half_size
+    if object_size is not None:
+        kwargs["object_half_extents"] = tuple(v / 2 for v in object_size)
     env = SharpaGraspEnv(GraspEnvConfig(**kwargs))
     state = {"expert": SharpaBimanualGraspExpert(env), "terminal": False, "last": None}
     env.reset(seed=0)
@@ -372,7 +378,12 @@ def main() -> None:
     modes.add_argument("--grasp", action="store_true")
     modes.add_argument("--sharpa-hand-demo", action="store_true")
     parser.add_argument("--object-pos-x", type=float, default=0.27)
-    parser.add_argument("--object-half-size", type=float, default=None)
+    parser.add_argument("--object-pos-y", type=float, default=0.0)
+    sizes = parser.add_mutually_exclusive_group()
+    sizes.add_argument("--object-half-size", type=float, default=None)
+    sizes.add_argument("--object-size", type=float, nargs=3, metavar=("X", "Y", "Z"),
+                       help="Full box dimensions in metres, not half-extents.")
+    parser.add_argument("--object-yaw-deg", type=float, default=0.0)
     parser.add_argument("--no-restart", action="store_true")
     parser.add_argument("--sharpa-mount", choices=["wrist", "flange"], default="wrist")
     parser.add_argument("--sharpa-visual-style", choices=["upstream", "g1"], default="g1")
@@ -392,7 +403,8 @@ def main() -> None:
         mode_planar()
     elif args.grasp:
         mode_grasp(args.object_pos_x, args.object_half_size, args.no_restart,
-                   args.sharpa_mount, args.sharpa_visual_style, args.show_hand_axes, args.fps_log)
+                   args.sharpa_mount, args.sharpa_visual_style, args.show_hand_axes, args.fps_log,
+                   args.object_pos_y, args.object_size, args.object_yaw_deg)
     else:
         mode_hand_demo(args.no_restart, args.sharpa_visual_style)
 

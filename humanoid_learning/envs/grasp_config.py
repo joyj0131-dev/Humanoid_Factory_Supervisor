@@ -70,17 +70,26 @@ class GraspEnvConfig:
     # Track: a larger object gives real finger contact more surface to
     # engage instead of relying on a bimanual palm squeeze.
     object_half_size: float = tc.OBJECT_HALF_SIZE * 2  # 0.06
+    object_half_extents: tuple[float, float, float] | None = None
+    object_yaw_rad: float = 0.0
+    object_xy_randomization_m: tuple[float, float] = (0.0, 0.0)
+    object_yaw_randomization_rad: float = 0.0
 
     @property
     def effective_object_half_extents(self) -> tuple[float, float, float]:
-        """Return canonical cubic half-extents for model builders.
+        """Box half-extents in metres; explicit XYZ overrides the cubic default."""
+        return self.object_half_extents if self.object_half_extents is not None else (self.object_half_size,) * 3
 
-        Sharpa model construction has consumed this shape-aware interface
-        since its integration commit.  The official Phase 4.5 branch still
-        uses a cube, so keep the compatibility API independent from the
-        uncommitted rectangular-object viewer experiment.
-        """
-        return (self.object_half_size,) * 3
+    def __post_init__(self):
+        import math
+        half = self.effective_object_half_extents
+        if len(half) != 3 or any(not math.isfinite(v) or v <= 0 for v in half):
+            raise ValueError("object half extents must contain three finite positive lengths in metres")
+        if len(self.object_xy_randomization_m) != 2 or any(
+                not math.isfinite(v) or v < 0 for v in self.object_xy_randomization_m):
+            raise ValueError("XY randomization must contain two finite nonnegative radii in metres")
+        if not math.isfinite(self.object_yaw_rad) or not math.isfinite(self.object_yaw_randomization_rad) or self.object_yaw_randomization_rad < 0:
+            raise ValueError("yaw must be finite and yaw randomization nonnegative (radians)")
 
     # Mass is DELIBERATELY NOT density-scaled by default (condition A --
     # "controller validation": isolates whether the controller/contact

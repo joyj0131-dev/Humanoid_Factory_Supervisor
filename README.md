@@ -43,10 +43,32 @@ OPENBLAS_NUM_THREADS=1 python3 scripts/test_sharpa_grasp_lift.py --seeds 0 1 2
 실패 상태를 고정한 낡은 assertion들이 남아 있으므로 별도로 보고한다.
 
 접촉 후에는 `SharpaContactLift`가 달성한 손가락 자세를 유지하며 양손을
-각각 12mm 더 모으고, 실제 qpos에서 IK를 다시 풀어 1cm/s로 올린다.
+각각 3mm 더 모으고, 실제 qpos에서 IK를 다시 풀어 1cm/s로 올린다.
 MuJoCo `noslip_iterations=10`을 접촉 후 적용해 soft-contact creep를 줄인다.
 질량·마찰·충돌 geometry는 바꾸지 않으며 물체 고정/weld/teleport는 없다.
 reset 시 solver 설정도 원래 값으로 복구된다.
+
+## 위치·크기·회전 변화 평가
+
+같은 제어기/설정으로 14개 평가 조건과 별도 조합 4개에서 실제 파지·상승·
+공중 5초 유지에 성공했다. 수정 전에는 같은 14조건 중 2조건만 성공했다.
+시험 조건은 X/Y ±5·10mm, 11/12/13cm 정육면체, 10×15×10cm 직육면체,
+yaw ±5°다. 모든 조합을 시험한 것은 아니며 넓은 작업영역 보장이 아니다.
+13cm 블록은 최대 관통이 약 9.9mm여서 접촉 품질 개선 대상으로 남는다.
+성공한 18조건을 전부 깨끗한 학습 데모로 자동 채택한다는 뜻은 아니다.
+자세한 조건·한계·재현법은 [작업영역 평가](docs/SHARPA_WORKSPACE_EVALUATION.md)에 기록한다.
+
+```bash
+DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --object-size 0.10 0.15 0.10 --no-restart
+DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --object-pos-x 0.27 --object-pos-y 0.01 --no-restart
+DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --object-yaw-deg 5 --no-restart
+OPENBLAS_NUM_THREADS=1 python3 scripts/evaluate_sharpa_workspace.py --suite all --workers 3 --output results/sharpa_workspace/evaluation.jsonl
+```
+
+현재는 카메라가 아니라 시뮬레이터의 실제 물체 상태를 사용한다. Sharpa용
+모방학습은 아직 시작하지 않았다. 다음은 실행 명령 기록·재생 검증이며,
+기존 reach용 BC 파이프라인에 25차원 action만 저장해서 바로 학습하면
+preshape/엄지 제어 등 action 밖의 명령을 놓치므로 그대로 재현되지 않는다.
 
 ## 문서 안내
 
