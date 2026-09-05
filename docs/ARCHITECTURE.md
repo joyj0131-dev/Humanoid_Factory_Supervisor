@@ -15,6 +15,7 @@ scripts/view_whole_body.py
   │    └─ SharpaGraspEnv (25 action, 129 observation)
   │         └─ SharpaBimanualGraspExpert
   │              ├─ CoupledBilateralIK
+  │              ├─ SharpaContactLift (contact/hold/lift feedback)
   │              ├─ pose_ik
   │              └─ timing.sim_time_to_steps
   └─ --sharpa-hand-demo
@@ -43,6 +44,7 @@ pre-hand-equipped base가 남기던 손목당 0.202839kg의 ghost hand mass도
 - `envs/sharpa_config.py`: Sharpa naming, joint roles, preshape
 - `envs/sharpa_grasp_env.py`: fixed-base grasp physics/contact safety
 - `expert/sharpa_bimanual_grasp_expert.py`: 공식 양손 controller
+- `expert/sharpa_contact_lift.py`: 실제 양손 지지 및 물체-table 간격 기반 hold/lift
 - `expert/sharpa_hand_demo.py`: free-space hand diagnostic
 - `expert/coupled_ik.py`, `pose_ik.py`, `timing.py`: 공통 expert 도구
 - `data/`, `imitation/`, `evaluation/`: Phase 2/3 및 이후 학습 기반
@@ -52,10 +54,18 @@ pre-hand-equipped base가 남기던 손목당 0.202839kg의 ghost hand mass도
 
 ## Current blocker
 
-Phase 4.5는 미완료다. `FOREARM_FORWARD_REACH` Gate(9.96mm)와 신규
-Side-Grasp Posture Gate(양손이 물체 좌우에서 마주보고 손가락이 아래를
-향하는 bilateral side-grasp 자세)는 모두 PASS했다. official rollout은
-collision 없이 `FOREARM_SIDE_DESCEND`까지 진행하지만 그 상태의 후반
-waypoint에서 hand-table collision(최대 약 18.21N, 8N 한계 초과)으로
-막힌다. Gate를 완화하지 않고 이 충돌을 해결한 뒤 FINGERTIP_PRECONTACT/
-contact로 진행한다.
+기본 rollout은 CONTACT_ACQUIRE → THUMB_OPPOSE → FORCE_SETTLE →
+TABLETOP_HOLD → LIFT → AIR_HOLD → SUCCESS까지 진행한다. `physical_grasp_success`는
+실제 양손 지지와 5cm 이상 table clearance를 연속 5초 유지해야 한다.
+기존 엄지-specific Gate A는 별도 진단으로 남으며 아직 미통과다.
+`contact_driven_lift=False`는 과거 모든 그룹 접촉 대기 경로를 비교할 때만 쓴다.
+
+접촉 이후 `noslip_iterations=10`으로 수치적 creep를 줄이고, 달성한 손가락
+목표는 유지한다. 각 그룹에 계속 더 닫는 명령을 적분하는 방식은 fingertip이
+블록 모서리에서 굴러 벗어나는 문제가 있어 사용하지 않는다. 기존 substep
+force safety는 유지한다. reset은 접근 시점 solver 설정을 복원한다.
+
+기본 12cm/0.1kg fixed-base 장면의 파지·상승은 검증했지만 다양한 물체,
+엄지 대향접촉, 초기 접근의 손목 transient 및 전체 Phase 4.5 승인은 별도다.
+실제 지지는 손가락+손바닥+손목 접촉을 사용하며 hold 구간 최대 관통은
+약 3.85mm다. 순수 fingertip grasp 또는 기존 1mm 관통 Gate 통과로 해석하지 않는다.

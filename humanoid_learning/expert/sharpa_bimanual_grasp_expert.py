@@ -1,5 +1,12 @@
 """Official bimanual Sharpa Wave grasp controller.
 
+Current default: after contact and a short thumb-opposition attempt,
+SharpaContactLift executes bilateral support, hold, lift and air hold. Historical
+Gate A below is still measured, but is NOT a prerequisite for attempting a lift.
+`physical_grasp_success` requires continuous actual bilateral support and a
+table-clear block for five seconds; it does not claim the thumb-specific Gate A.
+Set contact_driven_lift=False only for a comparison with the old waiting path.
+
 Both hands grasp the SAME object from opposite lateral (Y) sides --
 mirrored, not one hand crossing the body midline to reproduce a
 single-hand grasp. CoupledBilateralIK solves BOTH palm targets in one
@@ -502,6 +509,14 @@ class BimanualFailureReason(Enum):
 
 @dataclass
 class BimanualGraspConfig:
+    # Execute a real bilateral enveloping hold/lift without requiring the
+    # historical per-hand thumb+index/middle+wrap topology first. Gate A itself
+    # remains a separately reported, unchanged diagnostic.
+    contact_driven_lift: bool = True
+    hold_noslip_iterations: int = 10
+    hold_squeeze_m: float = 0.012
+    lift_speed_m_s: float = 0.01
+    lift_tracking_allowance_m: float = 0.04
     # [Session 41] ARM_LATERAL_CLEARANCE joint posture -- NOT a Cartesian
     # IK target (redundant-arm IK choosing an arbitrary elbow-up branch
     # was the root cause of the "unnatural" pose the 41st session's user
@@ -1051,6 +1066,9 @@ class BimanualGraspOutcome:
     side_grasp_gate: bool  # [This session] Side-Grasp Posture Gate PASS/FAIL (Section 10 of this session's spec)
     functional_orientation: dict  # [This session] Functional Orientation Gate metrics, see _measure_functional_orientation
     functional_orientation_gate: bool  # [This session] Functional Orientation Gate PASS/FAIL (Section 9 of this session's spec)
+    physical_grasp_success: bool = False
+    object_table_clearance_m: float = 0.0
+    min_air_hold_clearance_m: float = 0.0
 
 
 class SharpaBimanualGraspExpert:
@@ -1210,6 +1228,10 @@ class SharpaBimanualGraspExpert:
         self._side_grasp_gate: bool = False
         self._functional_orientation: dict = {}
         self._functional_orientation_gate: bool = False
+        self._contact_lift = None
+        self._physical_support_streak = 0
+        self._lost_support_steps = 0
+        self._min_air_clearance = float('inf')
 
         model = env.model
         waist_dof = np.array([model.jnt_dofadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)] for n in wbc.WAIST_JOINTS])
@@ -1820,12 +1842,77 @@ class SharpaBimanualGraspExpert:
             "gate": gate,
         }
 
+    def _step_contact_lift(self) -> np.ndarray:
+        from humanoid_learning.expert.sharpa_contact_lift import SharpaContactLift
+        cfg = self.config
+        if self._contact_lift is None:
+            self._contact_lift = SharpaContactLift(self)
+        lift = self._contact_lift
+        supported = lift.supported()
+        self._physical_support_streak = self._physical_support_streak + 1 if supported else 0
+        self._lost_support_steps = 0 if supported else self._lost_support_steps + 1
+        self._track_stability()  # Retain strict Gate A telemetry, independently.
+        for side in SIDES:
+            for group in sc.GROUPS:
+                self._group_contact_now(side, group)
+        action = lift.step(lift.height)
+        if not np.isfinite(self.env.data.qpos).all() or not np.isfinite(self.env.data.qvel).all():
+            self._fail(BimanualFailureReason.NUMERICAL_ERROR)
+            return action
+        if self._lost_support_steps > sim_time_to_steps(self.env, 0.5):
+            self._fail(BimanualFailureReason.CONTACT_LOST)
+            return action
+        if self.state == BimanualGraspState.ENVELOPING_CLOSE:
+            self._advance(BimanualGraspState.FORCE_SETTLE)
+        elif self.state == BimanualGraspState.FORCE_SETTLE:
+            # Finish the small bilateral squeeze, then confirm actual support.
+            if lift.ticks * lift.dt >= 2.0 and self._physical_support_streak >= 30:
+                self._advance(BimanualGraspState.TABLETOP_HOLD)
+            elif self._state_step > 700:
+                self._fail(BimanualFailureReason.CONTACT_LOST)
+        elif self.state == BimanualGraspState.TABLETOP_HOLD:
+            self._tabletop_hold_steps = self._tabletop_hold_steps + 1 if supported else 0
+            if self._tabletop_hold_steps >= sim_time_to_steps(self.env, cfg.tabletop_hold_seconds):
+                self._lift_start_obj_z = self._object_pos()[2]
+                self._advance(BimanualGraspState.LIFT)
+        elif self.state == BimanualGraspState.LIFT:
+            lift.height = min(lift.height + cfg.lift_speed_m_s * lift.dt,
+                              cfg.lift_height_m + cfg.lift_tracking_allowance_m)
+            self._lift_height_achieved = max(self._lift_height_achieved,
+                                             self._object_pos()[2] - self._lift_start_obj_z)
+            # Finish the ramp before timing AIR_HOLD. A raised wrist, an old
+            # maximum height, or a tilted block still touching the table fails.
+            if (lift.height >= cfg.lift_height_m + cfg.lift_tracking_allowance_m
+                    and lift.clearance() >= cfg.lift_height_m and supported):
+                self._advance(BimanualGraspState.AIR_HOLD)
+            elif self._state_step * lift.dt > 20.0:
+                self._fail(BimanualFailureReason.LIFT_FAILED)
+        elif self.state == BimanualGraspState.AIR_HOLD:
+            clearance = lift.clearance()
+            self._min_air_clearance = min(self._min_air_clearance, clearance)
+            # Continuous actual free-space support, not an accumulated counter.
+            good = supported and clearance >= cfg.lift_height_m
+            self._air_hold_steps = self._air_hold_steps + 1 if good else 0
+            if self._air_hold_steps >= sim_time_to_steps(self.env, cfg.air_hold_seconds):
+                self._advance(BimanualGraspState.SUCCESS)
+            elif self._state_step * lift.dt > 15.0:
+                self._fail(BimanualFailureReason.LIFT_FAILED)
+        if not self._just_advanced:
+            self._state_step += 1
+        self._total_step += 1
+        return action
+
     # ------------------------------------------------------------------
     def step(self) -> np.ndarray:
         action = self._zero_action()
         state = self.state
         self._just_advanced = False
         cfg = self.config
+
+        if cfg.contact_driven_lift and state in (
+                BimanualGraspState.ENVELOPING_CLOSE, BimanualGraspState.FORCE_SETTLE,
+                BimanualGraspState.TABLETOP_HOLD, BimanualGraspState.LIFT, BimanualGraspState.AIR_HOLD):
+            return self._step_contact_lift()
 
         if state == BimanualGraspState.STABLE_START:
             # [Session 41 -- tried applying set_preshape here to tuck the
@@ -2900,7 +2987,9 @@ class SharpaBimanualGraspExpert:
                     if not self._group_contact_now(side, group):
                         deltas[side][group] = cfg.close_rate_per_step
             action[17:25] = self._group_action(deltas)
-            if all(self._group_ever_contacted[side][g] for side in SIDES for g in sc.GROUPS):
+            if cfg.contact_driven_lift and self._state_step >= sim_time_to_steps(self.env, 1.0) - 1:
+                self._advance(BimanualGraspState.ENVELOPING_CLOSE)
+            elif all(self._group_ever_contacted[side][g] for side in SIDES for g in sc.GROUPS):
                 self._advance(BimanualGraspState.ENVELOPING_CLOSE)
             elif self._state_step >= cfg.max_steps_per_state:
                 self._advance(BimanualGraspState.ENVELOPING_CLOSE)
@@ -3050,4 +3139,11 @@ class SharpaBimanualGraspExpert:
             side_grasp_gate=self._side_grasp_gate,
             functional_orientation=self._functional_orientation,
             functional_orientation_gate=self._functional_orientation_gate,
+            physical_grasp_success=(self._contact_lift is not None
+                and self.state == BimanualGraspState.SUCCESS
+                and self._contact_lift.supported()
+                and self._contact_lift.clearance() >= self.config.lift_height_m
+                and self._air_hold_steps >= sim_time_to_steps(self.env, self.config.air_hold_seconds)),
+            object_table_clearance_m=self._contact_lift.clearance() if self._contact_lift else 0.0,
+            min_air_hold_clearance_m=self._min_air_clearance if np.isfinite(self._min_air_clearance) else 0.0,
         )

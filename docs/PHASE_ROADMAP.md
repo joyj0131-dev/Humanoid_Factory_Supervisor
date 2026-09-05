@@ -31,21 +31,21 @@
 6. Gate C — 5cm lift
 7. Gate D — 5초 air hold
 
-현재 확인 상태:
+현재 확인 상태(2026-09-05):
 
 - Mount Integration Gate: PASS
 - Natural Posture Gate: PASS
 - Wrist Transition Gate: FAIL (`5.125rad/s > 2.0rad/s`)
 - Forward Reach Gate: PASS (`9.96mm ≤ 10mm`, 15-tick streak, 금지 충돌 0건)
-- Side-Grasp Posture Gate: PASS (양손이 물체 좌우 측면에서 마주보고
-  손가락이 아래를 향하는 bilateral side-grasp 자세, mirror 오차
-  <0.1mm/<0.04°, 금지 충돌 0건, 15-tick streak)
-- Precontact Tracking Gate: 미도달 (`FOREARM_SIDE_DESCEND`의 hand-table
-  collision 최대 약 18.21N로 막힘)
-- Gate A: FAIL (`0/30`), Gate B/C/D: 미시도
+- 접근: horizontal-wrap 자세에서 실제 CONTACT_ACQUIRE 진입
+- 엄지-specific Gate A: FAIL (`0/30`), 정의 유지
+- 실제 양손 포괄 파지: hold 2초 → 상승 → table clearance ≥5cm에서 5초 유지 성공
+- 실제 clearance 약 8.3cm, 추가 5초 유지 및 actuator로 손을 열면 낙하 검증
+- 전체 Phase 4.5 완료 선언은 아님. 다양한 물체/접근 및 엄지 topology 검증은 남음
 
-Gate A 이전 실패를 성공으로 포장하거나 threshold를 낮추지 않는다. Gate
-A~D를 통과하기 전에 Factory/IL/BC/PPO를 구현하지 않는다.
+사용자 요청에 따라 엄지-specific Gate A를 실제 lift 시도의 선행조건에서
+분리했다. 기존 Gate A를 통과했다고 재명명하지 않고 `physical_grasp_success`로
+실제 지지·상승 결과를 별도 보고한다. Factory/IL/BC/PPO는 이번 변경 범위 밖이다.
 
 ## Final target
 

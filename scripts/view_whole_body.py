@@ -224,13 +224,15 @@ def mode_grasp(
         "arm_gravity_compensation": True,
         "sharpa_mount": mount,
         "sharpa_visual_style": visual_style,
+        "max_episode_steps": 8000,
     }
     if object_half_size is not None:
         kwargs["object_half_size"] = object_half_size
     env = SharpaGraspEnv(GraspEnvConfig(**kwargs))
     state = {"expert": SharpaBimanualGraspExpert(env), "terminal": False, "last": None}
     env.reset(seed=0)
-    print("Official Sharpa bimanual grasp; Gate A is still incomplete.")
+    print("Sharpa bilateral contact -> hold -> lift -> 5-second air hold. "
+          "Historical thumb-topology Gate A is reported separately.")
     if show_hand_axes:
         print("  --show-hand-axes ON: red/green/blue=palm local XYZ, yellow=inside normal, "
               "magenta=empirical closing direction, cyan=ulnar-edge-down direction, white=to-object direction")
@@ -252,6 +254,10 @@ def mode_grasp(
         if expert.state in (BimanualGraspState.SUCCESS, BimanualGraspState.FAILURE):
             print(f"  terminal={expert.state.name}, reason={expert.failure_reason}, "
                   f"streak={expert._max_bilateral_streak}/{expert.config.bilateral_streak_required}")
+            if expert._contact_lift is not None:
+                print(f"  actual object-table clearance={expert._contact_lift.clearance()*1000:.1f}mm, "
+                      f"bilateral_support={expert._contact_lift.supported()}, "
+                      f"air_hold={expert._air_hold_steps * expert._contact_lift.dt:.2f}s")
             if no_restart:
                 state["terminal"] = True
                 print("  holding final pose (--no-restart)")

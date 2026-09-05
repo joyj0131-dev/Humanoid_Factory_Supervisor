@@ -49,20 +49,20 @@ Phase 4.5는 미완료다.
 - Wrist Transition Gate: FAIL (`5.125rad/s > 2.0rad/s`)
 - Forward Reach Gate: PASS (settled palm error 약 9.96mm, streak 15,
   collision 0 — waypoint 스케줄 버그 수정으로 해결)
-- Side-Grasp Posture Gate: **PASS** — 양손이 물체 좌우 측면 바깥에서
-  서로 마주보고, 손가락이 아래를 향하는 실제 bilateral side-grasp 자세를
-  달성했다(palm inward angle ≈14°, finger-down angle ≈15°, 좌우 mirror
-  오차 <0.1mm, forbidden collision 0). `WRIST_SIDE_GRASP_ALIGN` +
-  `FOREARM_SIDE_DESCEND`가 과거 `FOREARM_DESCEND`/`WRIST_ALIGN`을 대체한다.
-- Precontact/Contact Acquisition: 미도달 — `FOREARM_SIDE_DESCEND`에서
-  hand-table collision(최대 약 18.21N, 8N 한계 초과)으로 막힘
-- Gate A: FAIL
-- Gate B/C/D: 미시도
+- 접근: horizontal-wrap 정렬 후 CONTACT_ACQUIRE에서 실제 양손 접촉
+- 엄지-specific Gate A: FAIL (정의 유지, 실제 lift 시도의 선행조건에서는 분리)
+- 기본 양손 포괄 파지: 2초 hold, 실제 상승, table clearance ≥5cm에서 공중 5초 유지 성공
+- 기본 12cm/0.1kg 장면에서 clearance 약 8.3cm, 추가 5초 유지 및 놓기 검증
 
 Gate A는 양손의 thumb + (index 또는 middle) + wrap 대향 접촉이 같은
 tick에서 30회 연속 유지되고, object XY 이동 ≤0.03m, peak angular velocity
 ≤2.0rad/s, forbidden penetration/hand-hand collision 없음까지 만족해야 한다.
 기준을 낮춰 통과시키지 않는다.
+
+`physical_grasp_success`는 이 엄지-specific Gate와 별개의 실제 물체 지지/상승
+결과다. 손가락 자세를 무조건 더 닫지 않고 유지하면서 양팔을 함께 올린다.
+접촉 후 MuJoCo `noslip_iterations=10`을 적용한다(마찰계수/질량/geometry
+불변). 손을 열면 물체가 낙하하는 테스트로 고정/부착 없는 물리 접촉임을 검증한다.
 
 ## Commands
 
@@ -72,11 +72,12 @@ python3 scripts/test_sharpa_wave_model.py
 python3 scripts/test_sharpa_g1_integration.py
 python3 scripts/test_sharpa_hand_demo.py
 python3 scripts/test_sharpa_bimanual_grasp.py
+OPENBLAS_NUM_THREADS=1 python3 scripts/test_sharpa_grasp_lift.py --seeds 0 1 2
 
 DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --no-restart
 DISPLAY=:0 python3 scripts/view_whole_body.py --sharpa-hand-demo --no-restart
 DISPLAY=:0 python3 scripts/view_whole_body.py --stand
 ```
 
-`test_sharpa_bimanual_grasp.py`의 실제 Gate A assertion은 성공 전까지
-의도적으로 실패한다.
+기존 bimanual 테스트의 엄지 Gate A 및 과거 실패 결과 assertion과, 새 실제
+lift 회귀 결과는 구분하여 보고한다.

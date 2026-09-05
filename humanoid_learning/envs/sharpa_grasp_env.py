@@ -50,6 +50,7 @@ class SharpaGraspEnv(gym.Env):
 
         self.model = model_builder.build_grasp_model_sharpa(self.config)
         self.data = mujoco.MjData(self.model)
+        self._reset_noslip_iterations = self.model.opt.noslip_iterations
         self._resolve_indices()
 
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(ACTION_DIM,), dtype=np.float32)
@@ -190,6 +191,9 @@ class SharpaGraspEnv(gym.Env):
 
     # ------------------------------------------------------------------
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
+        # The contact-lift controller enables no-slip iterations after contact;
+        # reset restores the approach solver so repeated rollouts are identical.
+        self.model.opt.noslip_iterations = self._reset_noslip_iterations
         super().reset(seed=seed)
         mujoco.mj_resetData(self.model, self.data)
 

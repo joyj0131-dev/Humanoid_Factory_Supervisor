@@ -4,13 +4,15 @@ MuJoCo에서 Unitree G1이 공장 자동화의 예외 상황을 복구하도록 
 프로젝트다. 정상 생산은 scripted robot arm/conveyor가 담당하고, G1은
 dropped part, misalignment, jam 같은 예외에 whole-body로 개입한다.
 
-현재 개발 대상은 G1 + Sharpa Wave 양손의 fixed-base grasp다. Phase 4.5는
-아직 미완료다. Forward Reach Gate와 신규 Side-Grasp Posture Gate(양손이
-물체 좌우 측면에서 마주보고 손가락이 아래를 향하는 bilateral side-grasp
-자세)는 모두 PASS했지만, `FOREARM_SIDE_DESCEND`의 hand-table collision으로
-Precontact에 아직 도달하지 못했다. 따라서 Gate A(안정 파지) 이후의
-hold/lift는 시작하지 않았다. 과거 Dex3 연구는
+현재 개발 대상은 G1 + Sharpa Wave 양손의 fixed-base grasp다. 기본 실행에서
+12cm/0.1kg 블록을 양손으로 잡고 들어올려 공중 5초 유지한다. 실제 물체와
+테이블의 간격은 약 8.3cm이며, 추가 5초 유지와 손을 열었을 때 낙하도 검증한다.
+이는 양손의 포괄 파지이며, 각 손의 엄지까지 요구하는 기존 Gate A 통과를
+뜻하지 않는다. Phase 4.5 전체는 아직 미완료다. 과거 Dex3 연구는
 `phase4/dex3-grasp` 브랜치에 보존한다.
+
+현재 접촉에는 손가락뿐 아니라 손바닥·손목도 참여한다. 손끝만의 정밀 파지는
+아니며 soft-contact 관통은 hold 구간 최대 약 3.85mm로 별도 기록한다.
 
 ## 현재 실행
 
@@ -28,10 +30,18 @@ python3 scripts/test_sharpa_g1_integration.py
 DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --no-restart
 DISPLAY=:0 python3 scripts/view_whole_body.py --sharpa-hand-demo --no-restart
 python3 scripts/test_sharpa_bimanual_grasp.py
+OPENBLAS_NUM_THREADS=1 python3 scripts/test_sharpa_grasp_lift.py --seeds 0 1 2
 ```
 
-마지막 테스트에는 아직 달성하지 못한 실제 Gate A 성공 assertion 1개가
-의도적으로 실패한다. 이를 threshold 완화로 통과시키지 않는다.
+`test_sharpa_grasp_lift.py`는 실제 상승·연속 공중 유지·양손 지지·놓았을 때
+낙하를 검사한다. 기존 bimanual 테스트에는 미달성 엄지 Gate A 및 과거
+실패 상태를 고정한 낡은 assertion들이 남아 있으므로 별도로 보고한다.
+
+접촉 후에는 `SharpaContactLift`가 달성한 손가락 자세를 유지하며 양손을
+각각 12mm 더 모으고, 실제 qpos에서 IK를 다시 풀어 1cm/s로 올린다.
+MuJoCo `noslip_iterations=10`을 접촉 후 적용해 soft-contact creep를 줄인다.
+질량·마찰·충돌 geometry는 바꾸지 않으며 물체 고정/weld/teleport는 없다.
+reset 시 solver 설정도 원래 값으로 복구된다.
 
 ## 문서 안내
 
