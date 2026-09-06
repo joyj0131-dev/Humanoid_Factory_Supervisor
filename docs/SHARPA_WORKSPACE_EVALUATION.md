@@ -110,12 +110,22 @@ strict-Gate contracts 8/8. The full historical bimanual suite, containing obsole
 failure/pose assertions, was not claimed clean or rerun in full. The physical
 18-scene benchmark and canonical extended-hold/release test are separate checks.
 
-The next step is a small demonstration collection and exact command replay.
-The expert also writes preshape, thumb CMC targets and solver settings outside
-its returned 25-D action, so recording only `(observation, action)` is currently
-insufficient. Choose an explicit replayable action/controller interface first,
-then split training/validation by scene/episode and train a small state-based BC
-baseline. Shape context must be available to the learner, not only the expert.
+**Done, 2026-09-06**: the replayable command interface now exists and a
+10-scene pilot has been recorded and replayed. `SharpaGraspCommand` carries the
+25-D action together with the 16 preshape actuator targets (including the thumb
+CMC_FE nudge) and `noslip_iterations`, which the expert previously wrote outside
+its returned action. All 10 recordings replay from commands alone, with no expert
+constructed, to a maximum error of exactly 0.0 across qpos/qvel/ctrl/targets/
+observation/telemetry/time. Stripping the preshape commands from a copy of a
+successful recording is detected as a replay mismatch -- note that the stripped
+copy still lifts the block, so a success-only check would not have caught it.
+See the README's recording/replay section.
+
+Still open before training: the recorded 129-D observation does not determine the
+recorded command, because the expert is a state machine using contact information
+that is not in the observation. Shape context must be available to the learner,
+not only the expert. Recordings are marked `learner_ready=False` and
+`quality_review_required=True`; replay fidelity is not demonstration quality.
 Existing 43-D/14-D Foundation learning contracts remain unchanged.
 
 Camera-derived object pose can later replace simulator state through a separate

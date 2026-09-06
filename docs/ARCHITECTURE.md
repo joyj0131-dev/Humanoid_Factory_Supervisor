@@ -36,18 +36,26 @@ pre-hand-equipped base가 남기던 손목당 0.202839kg의 ghost hand mass도
   thumb/index/middle/wrap 네 그룹이다.
 - Fixed-base Sharpa grasp: action 25, observation 129.
 - G1+Sharpa compiled integration: `nq=80`, `nv=79`, `nu=73`.
+- Demo replay(schema 1): `SharpaGraspCommand` = action 25 + preshape 목표 16 +
+  `noslip_iterations`. 이는 기존 action/observation 계약을 바꾸지 않고,
+  action 밖에서 나가던 보조 명령을 명시적으로 포함시킨 것이다.
 
 ## Source ownership
 
 - `envs/task_config.py`, `whole_body_config.py`: G1 공통 설정
 - `envs/model_builder.py`: G1 scene + Sharpa attachment
 - `envs/sharpa_config.py`: Sharpa naming, joint roles, preshape
-- `envs/sharpa_grasp_env.py`: fixed-base grasp physics/contact safety
+- `envs/sharpa_grasp_env.py`: fixed-base grasp physics/contact safety,
+  `capture_command()` / `step_command()`
+- `envs/sharpa_command.py`: 검증되는 불변 완전 명령 dataclass
+- `data/sharpa_demo.py`: 기록/재생과 Expert flag를 보지 않는 `PhysicalMonitor`
 - `expert/sharpa_bimanual_grasp_expert.py`: 공식 양손 controller
 - `expert/sharpa_contact_lift.py`: 실제 양손 지지 및 물체-table 간격 기반 hold/lift
 - `expert/sharpa_hand_demo.py`: free-space hand diagnostic
 - `expert/coupled_ik.py`, `pose_ik.py`, `timing.py`: 공통 expert 도구
 - `data/`, `imitation/`, `evaluation/`: Phase 2/3 및 이후 학습 기반
+- `scripts/sharpa_demos.py`: 파일럿 기록/재생 CLI
+- `scripts/test_sharpa_demo.py`: 명령 완전성·진단 격리·재생 부정 테스트
 
 과거 Dex3 runtime/planner/test는 활성 branch에서 제거됐다. 재현이 필요하면
 `phase4/dex3-grasp` branch 또는 `phase4-dex3-end` tag를 사용한다.
@@ -92,3 +100,29 @@ force safety는 유지한다. reset은 접근 시점 solver 설정을 복원한�
 `hold_squeeze_m=0.003`(실패 지점 대비 3배 여유)으로 낮추기만 해도 새 손가락
 로직 없이 손가락 비중이 seed0/1/2에서 약 30~38%까지 오른다 -- 팔이 덜
 누르는 만큼 이미 있던 손가락 접촉이 상대적으로 더 많은 일을 하게 된다.
+
+## Demonstration recording and Expert-free replay
+
+`SharpaGraspEnv.capture_command()`는 `expert.step()`이 반환한 25차원 action에
+더해 Expert가 action 밖에서 직접 쓴 명령 -- preshape 16개 actuator 목표(엄지
+CMC_FE nudge 포함)와 solver의 `noslip_iterations` -- 를 함께 포착한다.
+`step_command()`는 그 보조 명령을 적용한 뒤 **기존 `env.step`을 그대로 호출**하므로
+중력 보상과 substep force safety가 우회되지 않는다. 이 두 메서드는 기존
+action_space 25 / observation_space 129를 바꾸지 않는다.
+
+재생(`replay_episode`)은 grasp policy를 import하지 않고 IK를 다시 풀지 않으며,
+기록된 qpos/qvel을 물리에 대입하지 않는다. 같은 seed로 reset한 뒤 저장된 명령만
+실행하고 기록된 상태와 비교한다(허용 오차 1e-6, reset 시점은 1e-9). MuJoCo 버전,
+`envs/*.py` hash, 컴파일 모델 hash, preshape actuator 순서, 배열 정렬, 기록된
+step 수가 하나라도 어긋나면 재생 자체를 거부한다.
+
+정렬 규약: `observations[t]`가 `commands[t]`보다 앞선다. 명령은 T개,
+비교용 상태는 T+1개다.
+
+`_empirical_group_closure_world` 진단은 이제 `copy.copy(env)` + 별도 `MjData` +
+`mj_copyData`로 만든 **복제 환경**에서 실제 물리를 돌린다. 이전에는 실제 env에서
+step한 뒤 qpos/qvel/ctrl만 되돌려서 시간, warm-start, controller target, counter가
+남을 수 있었다. 복제본은 model을 공유하지만 `env.step`은 model을 쓰지 않는다.
+
+기록 파일에는 `learner_ready=False`, `quality_review_required=True`가 들어 있다.
+재생 성공과 학습 데모 품질 승인은 분리한다.

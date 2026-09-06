@@ -251,6 +251,27 @@ class SharpaGraspEnv(gym.Env):
         never touched again."""
         self.data.ctrl[self._preshape_act_ids[side]] = fraction * self._preshape_targets[side]
 
+    def capture_command(self, action):
+        """Capture the returned action AND the expert's auxiliary commands."""
+        from humanoid_learning.envs.sharpa_command import SharpaGraspCommand
+        ids = np.concatenate([self._preshape_act_ids[s] for s in sc.SIDES])
+        return SharpaGraspCommand(action, self.data.ctrl[ids], int(self.model.opt.noslip_iterations))
+
+    def step_command(self, command):
+        """Replay through the same feedback, gravity compensation and substeps."""
+        from humanoid_learning.envs.sharpa_command import SharpaGraspCommand
+        if not isinstance(command, SharpaGraspCommand):
+            raise TypeError('expected SharpaGraspCommand')
+        ids = np.concatenate([self._preshape_act_ids[s] for s in sc.SIDES])
+        if command.preshape_targets.shape != ids.shape:
+            raise ValueError('preshape command does not match the compiled model')
+        limits = self.model.actuator_ctrlrange[ids]
+        if np.any(command.preshape_targets < limits[:, 0]) or np.any(command.preshape_targets > limits[:, 1]):
+            raise ValueError('preshape targets exceed actuator limits')
+        self.data.ctrl[ids] = command.preshape_targets
+        self.model.opt.noslip_iterations = command.noslip_iterations
+        return self.step(command.action)
+
     # ------------------------------------------------------------------
     # [Palm-press session] The palm's own base body -- verified in the
     # compiled model (mj_name2id), not guessed -- is a SEPARATE contact

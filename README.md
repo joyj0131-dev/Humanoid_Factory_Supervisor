@@ -65,10 +65,43 @@ DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --object-yaw-deg 5 --no-re
 OPENBLAS_NUM_THREADS=1 python3 scripts/evaluate_sharpa_workspace.py --suite all --workers 3 --output results/sharpa_workspace/evaluation.jsonl
 ```
 
-현재는 카메라가 아니라 시뮬레이터의 실제 물체 상태를 사용한다. Sharpa용
-모방학습은 아직 시작하지 않았다. 다음은 실행 명령 기록·재생 검증이며,
-기존 reach용 BC 파이프라인에 25차원 action만 저장해서 바로 학습하면
-preshape/엄지 제어 등 action 밖의 명령을 놓치므로 그대로 재현되지 않는다.
+현재는 카메라가 아니라 시뮬레이터의 실제 물체 상태를 사용한다.
+
+## 데모 기록과 Expert 없는 재생
+
+성공하는 파지를 파일로 기록하고, Expert를 전혀 만들지 않은 채 저장된 명령만
+실행해 같은 파지가 재현되는지 검증한다. 아직 BC/PPO 학습 단계가 아니다.
+
+기록 단위는 25차원 action 하나가 아니라 **완전한 명령**(`SharpaGraspCommand`)이다.
+Expert는 반환 action 밖에서도 preshape 관절 목표와 엄지 CMC 명령(실측 16개
+actuator), 그리고 접촉 이후 solver의 `noslip_iterations`를 직접 바꾼다. action만
+저장하면 이 명령들이 빠져 재현되지 않는다. `capture_command()`가 `expert.step()`
+직후 이 보조 명령까지 함께 포착하고, `step_command()`는 보조 명령을 적용한 뒤
+기존 `env.step`을 호출하므로 중력 보상과 substep 접촉 안전 로직이 그대로 돈다.
+기존 action 25 / observation 129 계약은 바뀌지 않는다.
+
+재생은 기록된 qpos/qvel을 물리에 대입하지 않는다. 같은 seed로 reset한 뒤 저장된
+명령만 실행하고, 기록된 상태는 오직 비교용으로만 쓴다. 최대 허용 오차는 1e-6이다.
+
+```bash
+OPENBLAS_NUM_THREADS=1 python3 scripts/sharpa_demos.py collect \
+  --output datasets/sharpa_pilot_v1 --count 10 --resume --workers 3
+OPENBLAS_NUM_THREADS=1 python3 scripts/sharpa_demos.py replay \
+  --input datasets/sharpa_pilot_v1 --report results/sharpa_demos/pilot_replay.json --workers 3
+OPENBLAS_NUM_THREADS=1 python3 scripts/test_sharpa_demo.py \
+  --episode datasets/sharpa_pilot_v1/episode_0001_canonical.npz
+```
+
+파일럿 10개는 12cm 기본 장면 1개, X ±5/10mm 4개, Y ±5/10mm 4개, 11cm cube 1개로
+서로 다른 장면이다. 기록 파일은 명령·비교용 상태·Expert FSM 상태·실측 접촉
+telemetry와 함께 MuJoCo 버전, `humanoid_learning/envs/*.py` hash, 컴파일된 모델
+hash, actuator 순서를 담는다. 이 중 하나라도 다르면 재생이 거부된다.
+
+**기록된 파일은 아직 학습용으로 승인된 데모가 아니다**(`learner_ready=False`,
+`quality_review_required=True`). 재생 성공은 "같은 명령이 같은 물리를 만든다"는
+뜻이지 "이 궤적이 좋은 학습 데이터"라는 뜻이 아니다. 특히 기록된 129차원
+observation만으로는 명령을 결정할 수 없다 — Expert는 접촉력 등 관측에 없는
+정보를 쓰는 상태 기계이므로, 그대로 BC에 넣는 것은 별도 설계 문제다.
 
 ## 문서 안내
 

@@ -1685,17 +1685,25 @@ class SharpaBimanualGraspExpert:
     def _empirical_group_closure_world(self, side: str, groups: tuple[int, ...], curl_amount: float) -> tuple[dict, dict]:
         """State-preserving: applies a REAL curl delta to the given hand
         GROUPS (sc.GROUPS index, e.g. (1,2,3)=index/middle/wrap or
-        (0,)=thumb) via actual env.step() physics, reads the resulting
-        fingertip world positions for EVERY finger, then restores
-        qpos/qvel/ctrl exactly -- callable mid-rollout with no side
-        effects. Returns (tips_after, tips_before). [Audit session]
+        (0,)=thumb) via actual physics in a cloned environment and reads
+        the resulting fingertip positions. The live episode's full physics
+        and controller state remain untouched. Returns (tips_after, tips_before).
+        [Audit session]
         generalized from the old hardcoded-(1,2,3) version (renamed) so
         the same real-physics recipe can probe the thumb group too, for
         the Thumb Opposition Subgate."""
-        env = self.env
+        # Probe a complete copy: restoring only qpos/qvel left time, warm-start
+        # forces, controller targets and counters changed in the live episode.
+        import copy
+        env = copy.copy(self.env)
+        env.data = mujoco.MjData(env.model)
+        mujoco.mj_copyData(env.data, env.model, self.env.data)
+        env._arm_target = self.env._arm_target.copy()
+        env._waist_target = self.env._waist_target.copy()
+        env._group_synergy = self.env._group_synergy.copy()
+        env.last_safety_events = list(self.env.last_safety_events)
         side_idx = 0 if side == "left" else 1
         tips0 = {f: env.fingertip_pos(side, f).copy() for f in sc.FINGERS}
-        saved = (env.data.qpos.copy(), env.data.qvel.copy(), env.data.ctrl.copy(), env._group_synergy.copy())
         steps = max(1, int(np.ceil(curl_amount / max(env.config.hand_synergy_action_scale, 1e-9))))
         for _ in range(steps):
             a = self._zero_action()
@@ -1703,9 +1711,6 @@ class SharpaBimanualGraspExpert:
                 a[17 + side_idx * 4 + g] = 1.0
             env.step(a)
         tips1 = {f: env.fingertip_pos(side, f).copy() for f in sc.FINGERS}
-        env.data.qpos[:], env.data.qvel[:], env.data.ctrl[:] = saved[0], saved[1], saved[2]
-        env._group_synergy[:] = saved[3]
-        mujoco.mj_forward(env.model, env.data)
         return tips1, tips0
 
     def _measure_finger_closure_direction(self, curl_probe: float = 0.15) -> dict:
