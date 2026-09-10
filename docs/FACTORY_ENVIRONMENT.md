@@ -403,7 +403,72 @@ drops it. That is the remaining half of step 1.
 The stabiliser cannot take a step, so it cannot recover from a disturbance that
 needs one. It is not a walking controller and must never be reported as one.
 
-## Walking to the stations — attempted, BLOCKED (2026-09-10)
+## Walking to the stations — SOLVED with an external policy (2026-09-10)
+
+**Result: the G1 walks from home to either station and passes the Navigation
+Gate.** Final position error 34.8 mm (station 0) and 46.8 mm (station 1) against
+the 100 mm limit, heading within 4.5 deg of the 8.6 deg limit, held for 641/579
+steps against the 100 required, no falls, no forbidden contact. Maximum base
+displacement per step is 4.7 mm -- real gait, far under the 50 mm teleport
+threshold the gate rejects.
+
+Locomotion is **Unitree's pre-trained G1 policy** (`unitree_rl_gym`, BSD
+3-Clause), used unmodified. It is an external tool, not part of this project's
+research: the BC vs BC+PPO comparison applies to the recovery skill, and walking
+is treated as given. Provenance, license and checksum are in
+`assets/policies/g1_walk/NOTICE`; the binary is not committed and
+`scripts/install_g1_walk_policy.py` reproduces it.
+
+```bash
+python3 scripts/install_g1_walk_policy.py
+DISPLAY=:0 python3 scripts/view_factory.py --walk-to 0
+DISPLAY=:0 python3 scripts/view_factory.py --walk-to 1 --scenario dropped_part
+OPENBLAS_NUM_THREADS=1 MUJOCO_GL=egl python3 scripts/test_factory_walk.py
+```
+
+### Integration, and four things that had to be fixed
+
+The policy contract was read from `deploy_mujoco.py` and `g1.yaml`: 47 obs (base
+angular velocity, gravity in base frame, velocity command, leg pos/vel, previous
+action, 0.8 s gait phase), 12 leg actions scaled by 0.25 onto a crouched default
+stance, at 50 Hz with kp=[100,100,100,150,40,40], kd=[2,2,2,4,2,2].
+
+1. **Control mode.** This env drives legs with position actuators at kp=500. A
+   MuJoCo position actuator with `gainprm=[kp]`, `biasprm=[0,-kp,-kv]` computes
+   exactly `kp*(ctrl-q) - kv*qvel` -- the policy's own PD law -- so the gains are
+   retuned rather than a torque path bolted on.
+2. **Indexing.** Unitree's scene is legs-only and uses `qpos[7:]`; this robot has
+   a waist, arms and two hands, so leg indices are resolved by joint name.
+3. **Steady-state error.** The policy under-tracks small commands on this robot,
+   leaving a ~70 mm shortfall. Integral action (clamped, and only within 0.6 m)
+   removes it.
+4. **It cannot stand still.** Commanding zero velocity still produces gait steps
+   and drifts 0.6 m over 15 s. Arriving is therefore a **handoff**: the leg
+   actuators go back to stiff position gains and hold. Freezing mid-gait left
+   the robot leaning and 90 mm off, so the handoff waits for **double support**
+   (both feet above 40 N). With that, drift after arrival is under 57 mm.
+
+### A real layout bug this exposed
+
+The first walking runs failed the gate on `forbidden_contact`, and it was
+correct: the **torso struck the conveyor's near side rail**. The manipulation
+pose is at x=1.70 and the rail spanned x 1.710-1.750 at z 0.750-0.810, while the
+torso bottom sits at z=0.817 and its front reaches x=1.779 -- 7 mm of clearance,
+which walking bob closed. The rails were added for looks and were blocking the
+robot from the spot it must stand on. Rail height is now 0.030 m (top at 0.780),
+which still catches a part whose underside is at 0.752 while clearing the torso
+by 37 mm.
+
+### Sim-to-sim gap, stated not hidden
+
+The policy was trained on a stock G1. This robot carries **2.49 kg of Sharpa
+hands (7% of its mass)** that the policy never saw, plus a waist and arms its
+training scene did not have. It walks anyway, but under-tracks velocity
+commands, which is why the navigator needs integral action.
+
+### What was tried first and abandoned
+
+#### From-scratch attempt (kept for the record)
 
 Both stations sit at heading 0, the same as the G1's home pose, so reaching
 either one needs forward + sideways stepping and **no turning** -- the easy case.

@@ -206,13 +206,13 @@ def _add_conveyor(spec) -> None:
             pos=[
                 fcfg.CONVEYOR_CENTRE_X + sign * (fcfg.BELT_HALF_SIZE[0] + 0.02),
                 0.0,
-                fcfg.TABLE_TOP_Z + 0.03,
+                fcfg.TABLE_TOP_Z + fcfg.RAIL_HALF_HEIGHT,
             ],
         )
         rail.add_geom(
             name=f"conveyor_rail_{tag}_geom",
             type=mujoco.mjtGeom.mjGEOM_BOX,
-            size=[0.02, fcfg.BELT_HALF_SIZE[1], 0.03],
+            size=[0.02, fcfg.BELT_HALF_SIZE[1], fcfg.RAIL_HALF_HEIGHT],
             rgba=[0.55, 0.57, 0.60, 1],
         )
 

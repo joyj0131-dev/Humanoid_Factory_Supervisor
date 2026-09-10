@@ -143,7 +143,15 @@ Navigation Gate는 **보행 정책이 생기기 전에 미리** 못박았다: �
 step당 base 이동 0.05m 초과는 보행이 아니므로 실격. 테스트로 순간이동·엉뚱한 셀
 경유·넘어짐이 실제로 걸러지는 것을 확인했다.
 
+G1이 **집 위치에서 각 스테이션까지 실제로 걸어간다**(Unitree 사전학습 G1 정책,
+BSD-3, 외부 도구). 최종 위치 오차 34.8mm / 46.8mm(허용 100mm), step당 base 이동
+4.7mm(순간이동 판정 50mm)로 진짜 보행이다. 보행은 연구 대상이 아니라 주어진
+도구이며 출처는 `assets/policies/g1_walk/NOTICE`에 기록했다.
+
 ```bash
+python3 scripts/install_g1_walk_policy.py
+DISPLAY=:0 python3 scripts/view_factory.py --walk-to 0
+DISPLAY=:0 python3 scripts/view_factory.py --walk-to 1 --scenario dropped_part
 DISPLAY=:0 python3 scripts/view_factory.py
 DISPLAY=:0 python3 scripts/view_factory.py --scenario dropped_part
 DISPLAY=:0 python3 scripts/view_factory.py --scenario misplaced_part --fault-workcell 0

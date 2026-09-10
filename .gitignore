@@ -105,3 +105,4 @@ results/sharpa_workspace/
 results/sharpa_demos/
 results/factory/
 MUJOCO_LOG.TXT
+assets/policies/g1_walk/motion.pt

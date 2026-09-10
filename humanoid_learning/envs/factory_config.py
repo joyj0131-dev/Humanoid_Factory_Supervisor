@@ -55,6 +55,15 @@ BELT_DRIVE_GAIN = 200.0
 BELT_MAX_DRIVE_N = 5.0
 BELT_DIRECTION = 1.0  # parts flow toward +Y
 
+# Side-rail height, measured against the robot rather than chosen for looks.
+# The G1's torso bottom sits at z=0.817 while standing at the manipulation pose,
+# and its front reaches x=1.779 -- straight through the near rail's x span. The
+# first version's rail top was at 0.810, leaving 7 mm, which walking bob closed:
+# the torso struck the rail and the Navigation Gate correctly failed the run.
+# A 0.030 m rail (top at 0.780) still catches the part, whose underside is at
+# 0.752, while clearing the torso by 37 mm.
+RAIL_HALF_HEIGHT = 0.015
+
 # Station-local frame: origin on the floor at the pelvis stand spot, +x = robot
 # heading (world +X), +y = robot left. Identical to the canonical grasp
 # relationship, so both stations are the same scene under a pure translation.

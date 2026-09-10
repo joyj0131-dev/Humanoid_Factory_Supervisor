@@ -91,14 +91,34 @@ def _update_beacons(env) -> None:
             )
 
 
-def _panel(env, info, paused=False) -> tuple[str, str]:
+def _g1_status(env, walk) -> str:
+    """What the G1 is actually doing, so the panel cannot go stale."""
+    if walk is None:
+        return "standing (no walk requested)"
+    walker, navigator, _ = walk
+    result = env.navigation_result()
+    if walker.holding:
+        return (f"arrived at station {navigator_station(navigator, env)} "
+                f"({result['final_position_error_m'] * 1000:.0f} mm) -- standing hold")
+    return f"walking to station {navigator_station(navigator, env)}"
+
+
+def navigator_station(navigator, env) -> int:
+    goal = np.asarray(navigator.goal_xy)
+    for pose in env.poses:
+        if float(np.linalg.norm(goal - np.asarray(pose.manipulation_xy))) < 1e-6:
+            return pose.index
+    return -1
+
+
+def _panel(env, info, paused=False, walk=None) -> tuple[str, str]:
     target = info["target_workcell"]
     labels = ["FACTORY SUPERVISOR", "Simulation", "Line", "Belt", "Request",
               "Verification", "G1", "Station 0", "Station 1", "Controls", "Manual signals"]
     values = [f"t={env.data.time:.1f}s", "PAUSED" if paused else "RUNNING",
               info["line_state"], "ON" if info["belt_running"] else "STOPPED",
               "none" if target < 0 else f"Station {target}",
-              f"{info['recovery_progress']:.0%}", "standing / walking not implemented",
+              f"{info['recovery_progress']:.0%}", _g1_status(env, walk),
               *[f"{'FAULT' if info['arm_faulted'][k] else 'CYCLE'} / phase {info['arm_waypoint'][k]}"
                 for k in range(2)], "SPACE pause | R reset | 0/1/2 cameras",
               "A accept | C request verification (no physical recovery)"]
@@ -119,8 +139,12 @@ def run_offscreen(env, args) -> None:
     _, info = env.reset(seed=args.seed, options=_reset_options(args))
     camera = _camera(env.factory)
     zero = np.zeros(env.action_space.shape[0], dtype=np.float32)
+    bundle = _make_walker(env, args.walk_to) if args.walk_to is not None else None
+    announced: dict = {}
     shots = {}
     for step in range(args.steps):
+        if bundle is not None:
+            _drive_walker(env, bundle, announced)
         _, _, _, _, info = env.step(zero)
         _update_beacons(env)
         if step + 1 in args.capture:
@@ -130,8 +154,8 @@ def run_offscreen(env, args) -> None:
                 path = out if len(args.capture) == 1 else out.with_name(f"{out.stem}_{step + 1:04d}{out.suffix}")
                 frame = Image.fromarray(renderer.render())
                 draw = ImageDraw.Draw(frame)
-                labels, values = _panel(env, info)
-                draw.rectangle((8, 8, 675, 240), fill=(20, 24, 30))
+                labels, values = _panel(env, info, walk=bundle)
+                draw.rectangle((8, 8, 700, 240), fill=(20, 24, 30))
                 draw.multiline_text((16, 16), labels, fill="white", spacing=3)
                 draw.multiline_text((160, 16), values, fill="white", spacing=3)
                 frame.save(path)
@@ -203,6 +227,35 @@ def run_interactive(env, args) -> None:
                 time.sleep(remaining)
 
 
+def _make_walker(env, station: int):
+    """Walk the G1 to a station and hand off to a standing hold on arrival."""
+    from humanoid_learning.expert.g1_walk_policy import G1WalkPolicy, WalkToPose
+    from humanoid_learning.expert.stance_stabilizer import StanceGains, StanceStabilizer
+
+    walker = G1WalkPolicy(env)
+    pose = env.poses[station]
+    navigator = WalkToPose(walker, pose.manipulation_xy, pose.heading_rad)
+    stabilizer = StanceStabilizer(env, StanceGains(pitch_kp=1.0, pitch_kd=0.1,
+                                                   roll_kp=0.7, roll_kd=0.07))
+    print(f"Walking to station {station} at {np.round(pose.manipulation_xy, 3)}. "
+          "Locomotion is Unitree's pre-trained G1 policy (BSD-3); see "
+          "assets/policies/g1_walk/NOTICE.")
+    return walker, navigator, stabilizer
+
+
+def _drive_walker(env, bundle, announced: dict) -> None:
+    walker, navigator, stabilizer = bundle
+    navigator.step()
+    if walker.holding:
+        stabilizer.apply()
+        if not announced.get("arrived"):
+            announced["arrived"] = True
+            result = env.navigation_result()
+            print(f"  ARRIVED: position error {result['final_position_error_m'] * 1000:.1f} mm, "
+                  f"heading error {np.degrees(result['final_heading_error_rad']):.1f} deg "
+                  "-- handed off to a standing hold.")
+
+
 def _reset_options(args) -> dict:
     options = {"scenario": args.scenario}
     if args.fault_workcell is not None:
@@ -223,6 +276,9 @@ def main() -> None:
                         help="override the seed's choice of which cell fails")
     parser.add_argument("--fault-step", type=int, default=None,
                         help="earliest eligible step; fault requires the physical event")
+    parser.add_argument("--walk-to", type=int, choices=range(fcfg.N_WORKCELLS), default=None,
+                        help="walk the G1 from home to this station using Unitree's pre-trained "
+                             "G1 locomotion policy, then hold a standing pose there")
     parser.add_argument("--offscreen", action="store_true", help="render PNGs instead of opening a window")
     parser.add_argument("--out", default="results/factory/factory.png")
     parser.add_argument("--steps", type=int, default=400)

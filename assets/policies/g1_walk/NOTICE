@@ -1,0 +1,18 @@
+Unitree RL GYM -- pre-trained G1 locomotion policy
+==================================================
+
+File:    motion.pt  (TorchScript, 47 obs -> 12 leg actions)
+Source:  https://github.com/unitreerobotics/unitree_rl_gym
+Path:    deploy/pre_train/g1/motion.pt
+License: BSD 3-Clause (see LICENSE in this directory)
+Copyright (c) 2016-2023 HangZhou YuShu TECHNOLOGY CO.,LTD. ("Unitree Robotics")
+
+sha256:  cf668f75b90d1abf73d2b87612a6e76bccc61ff7e083b63582d3f6aaa3c1759d
+
+This policy is used UNMODIFIED as an external locomotion tool. It is not part
+of this project's research contribution: the BC vs BC+PPO comparison this
+project studies applies to the recovery manipulation skill, not to walking.
+Locomotion is treated as given, and its provenance is recorded here.
+
+The binary itself is NOT committed (see .gitignore); run
+scripts/install_g1_walk_policy.py to fetch it and verify the checksum.
