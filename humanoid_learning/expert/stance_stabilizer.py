@@ -73,6 +73,9 @@ class StanceStabilizer:
         self.pelvis_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, wbc.PELVIS_BODY)
         self._neutral_pitch = model.actuator_ctrlrange[self.pitch_ids].mean(axis=1) * 0.0
         self._neutral_roll = model.actuator_ctrlrange[self.roll_ids].mean(axis=1) * 0.0
+        # Positions of these ankles inside the env's 12-entry leg target vector.
+        self._pitch_leg_slots = [wbc.LEG_JOINTS.index(n) for n in ANKLE_PITCH_JOINTS]
+        self._roll_leg_slots = [wbc.LEG_JOINTS.index(n) for n in ANKLE_ROLL_JOINTS]
 
     # ------------------------------------------------------------------
     def tilt(self) -> tuple[float, float, float, float]:
@@ -98,14 +101,28 @@ class StanceStabilizer:
                                  -gains.max_command_rad, gains.max_command_rad))
         data = self.env.data
         model = self.env.model
-        data.ctrl[self.pitch_ids] = np.clip(
+        pitch_ctrl = np.clip(
             self._neutral_pitch + pitch_cmd,
             model.actuator_ctrlrange[self.pitch_ids, 0],
             model.actuator_ctrlrange[self.pitch_ids, 1],
         )
-        data.ctrl[self.roll_ids] = np.clip(
+        roll_ctrl = np.clip(
             self._neutral_roll + roll_cmd,
             model.actuator_ctrlrange[self.roll_ids, 0],
             model.actuator_ctrlrange[self.roll_ids, 1],
         )
+        data.ctrl[self.pitch_ids] = pitch_ctrl
+        data.ctrl[self.roll_ids] = roll_ctrl
+        # Envs that own the legs (WholeBodyEnv and FactoryEnv) rewrite every leg
+        # actuator from their internal _leg_target on each step, which silently
+        # erased everything written above -- measured: the ankle command went
+        # 0.3 -> 0.0 across one step, making this class a no-op in the factory
+        # while it worked in SharpaGraspEnv, which never touches leg ctrl.
+        # Writing the target as well survives that rewrite.
+        leg_target = getattr(self.env, "_leg_target", None)
+        if leg_target is not None:
+            for slot, value in zip(self._pitch_leg_slots, pitch_ctrl):
+                leg_target[slot] = value
+            for slot, value in zip(self._roll_leg_slots, roll_ctrl):
+                leg_target[slot] = value
         return {"roll": roll, "pitch": pitch, "pitch_cmd": pitch_cmd, "roll_cmd": roll_cmd}

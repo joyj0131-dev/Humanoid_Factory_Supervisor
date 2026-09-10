@@ -18,9 +18,6 @@ import numpy as np
 from humanoid_learning.envs import factory_config as fcfg
 from humanoid_learning.envs.factory_env import ACTION_DIM, FactoryEnv
 from humanoid_learning.expert.g1_walk_policy import POLICY_PATH, G1WalkPolicy, WalkToPose
-from humanoid_learning.expert.stance_stabilizer import StanceGains, StanceStabilizer
-
-TUNED = StanceGains(pitch_kp=1.0, pitch_kd=0.1, roll_kp=0.7, roll_kd=0.07)
 
 
 def _walk(station: int, seed: int = 0, steps: int = 1500):
@@ -30,15 +27,18 @@ def _walk(station: int, seed: int = 0, steps: int = 1500):
         walker = G1WalkPolicy(env)
         pose = env.poses[station]
         navigator = WalkToPose(walker, pose.manipulation_xy, pose.heading_rad)
-        stabilizer = StanceStabilizer(env, TUNED)
         zero = np.zeros(ACTION_DIM)
         goal = np.asarray(pose.manipulation_xy)
         arrived_at = None
         drift = 0.0
         for i in range(steps):
             navigator.step()
-            if walker.holding:
-                stabilizer.apply()
+            # Deliberately NOT running the stance stabiliser here. After the
+            # handoff the legs are held with stiff position gains, which is
+            # already enough to stand; the ankle regulator is tuned for the
+            # compliant grasp plant and destabilises this one (measured: the
+            # robot fell at every station once the stabiliser stopped being a
+            # silent no-op). It belongs to the grasp phase, not the walk.
             env.step(zero)
             if navigator.arrived and arrived_at is None:
                 arrived_at = i

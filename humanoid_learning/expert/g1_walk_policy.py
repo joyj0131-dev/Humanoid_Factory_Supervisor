@@ -104,6 +104,12 @@ class NavigationGains:
     arrive_radius_m: float = 0.06
     arrive_yaw_rad: float = 0.10
     release_radius_m: float = 0.20
+    # NOTE: a per-axis arrival test (fore 20 mm / lateral 12 mm) was tried, to
+    # match the grasp's asymmetric window. This controller cannot meet it -- its
+    # measured closest approach is ~50 mm total -- so `arrived` never latched,
+    # the robot never settled, and it wandered off. Arrival stays radius-based
+    # until the approach itself is more precise. See the fore/aft gap recorded
+    # in docs/FACTORY_ENVIRONMENT.md.
 
 
 class G1WalkPolicy:
@@ -240,6 +246,25 @@ class G1WalkPolicy:
         # target here and passing a zero leg action leaves it exactly in place.
         self.env._leg_target[:] = self.leg_target
         return self.leg_target
+
+
+def stand_pose_for_part(part_xy, heading: float, canonical_local_xy=None) -> np.ndarray:
+    """Where the pelvis must stand for a part to sit at the canonical grasp spot.
+
+    The station's nominal ``manipulation_xy`` is only correct while the part is
+    where production left it. After a fault the part is elsewhere -- the drop
+    zone is 0.28 m downstream -- so walking to the nominal spot puts the robot
+    next to a part that is not there. Deriving the stand pose from the MEASURED
+    part position instead is what makes "go fix that block" mean the right thing.
+    """
+    from humanoid_learning.envs import factory_config as fcfg
+
+    local = np.asarray(canonical_local_xy if canonical_local_xy is not None
+                       else fcfg.LOCAL_CANONICAL_PART_XY, dtype=np.float64)
+    cos, sin = np.cos(heading), np.sin(heading)
+    offset_world = np.array([cos * local[0] - sin * local[1],
+                             sin * local[0] + cos * local[1]])
+    return np.asarray(part_xy, dtype=np.float64)[:2] - offset_world
 
 
 class WalkToPose:

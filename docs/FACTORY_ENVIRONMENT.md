@@ -510,6 +510,56 @@ Nothing here fakes the result. The Navigation Gate still rejects base
 teleportation, `PlanarDebugEnv` is still labelled a kinematic oracle, and no
 navigation result is claimed.
 
+## Correction (2026-09-10): the earlier error analysis below was wrong
+
+Two claims in the section that follows were mistaken and are corrected here.
+The section is kept because the workspace-window sweep itself stands.
+
+**1. "35-47 mm outside the window laterally" was wrong.** That compared a TOTAL
+position error against a LATERAL tolerance. Decomposing the arrival error in the
+robot's own frame:
+
+| | station 0 | station 1 |
+| --- | --- | --- |
+| fore/aft error | +34.3 mm | +44.0 mm |
+| **lateral error** | **−11.1 mm** | **+7.4 mm** |
+
+Lateral is at the edge of the +-10 mm window, not 3-5x outside it. The binding
+axis is **fore/aft**: the robot stops short, so the block sits 304-314 mm ahead
+instead of 270 mm, and +35 mm fore/aft is exactly where the sweep shows
+CONTACT_LOST. So the conclusion "widen the grasp laterally" did not follow.
+
+**2. The stance stabiliser was a silent no-op in the factory.** It wrote the
+ankle `data.ctrl`, and `WholeBodyEnv.step()` overwrites every leg actuator from
+its internal `_leg_target` afterwards. Measured: the ankle command went 0.3 to
+0.0 across a single step. It worked in `SharpaGraspEnv` only because that env
+never writes leg ctrl. Any claim that the free-base grasp result carried over to
+the factory was unfounded.
+
+Also corrected: the sweep measures the **current controller's** success envelope,
+not a kinematic limit of the arm. `OBJECT_MOVED_TOO_MUCH`, `CONTACT_LOST` and
+`TIMEOUT` are approach and contact failures. Calling it "the arm's physical
+limit" overstated it.
+
+### What was fixed
+
+- The stabiliser now also writes `_leg_target`, so its command survives the
+  env's rewrite. It is **scoped to the grasp phase**: after the walk handoff the
+  legs are stiff-held, which already stands fine, and running the regulator
+  there made the robot fall (its gains are tuned for the compliant grasp plant).
+- `g1_walk_policy.stand_pose_for_part()` derives the stand pose from the
+  **measured part position** instead of the station's nominal spot. With the
+  part in the drop zone the nominal aim leaves a −207.5 mm lateral error;
+  aiming at the part brings it to **+8.6 mm**, inside the window.
+
+### What is still open
+
+Fore/aft. The navigator latches arrival on total distance and stops 34-44 mm
+short. A per-axis test (fore 20 mm / lateral 12 mm) was tried and reverted: this
+controller's closest approach is ~50 mm total, so it never latched and the robot
+wandered off. Closing the fore/aft gap needs a more precise final approach, not
+a tighter threshold on the existing one.
+
 ## Grasping at the station — BLOCKED by the grasp's workspace window
 
 Walking works, but "walk there, then grasp" does not, and the reason is measured.

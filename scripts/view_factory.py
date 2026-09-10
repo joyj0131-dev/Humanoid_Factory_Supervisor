@@ -254,10 +254,12 @@ def _make_walker(env, station: int):
 
 
 def _drive_walker(env, bundle, announced: dict) -> None:
-    walker, navigator, stabilizer = bundle
+    walker, navigator, _stabilizer = bundle
     navigator.step()
     if walker.holding:
-        stabilizer.apply()
+        # No ankle regulator here: the post-handoff stance is stiff-held and the
+        # regulator is tuned for the compliant grasp plant. It is engaged when
+        # manipulation starts, not while merely standing.
         if not announced.get("arrived"):
             announced["arrived"] = True
             result = env.navigation_result()
