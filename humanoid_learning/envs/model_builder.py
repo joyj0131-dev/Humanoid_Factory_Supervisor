@@ -484,13 +484,20 @@ def _add_sharpa_grasp_sites(spec: "mujoco.MjSpec") -> None:
 
 
 def build_grasp_model_sharpa(config) -> mujoco.MjModel:
-    """Build the canonical fixed-base G1 + Sharpa grasp model."""
+    """Build the canonical G1 + Sharpa grasp model.
+
+    Fixed-base by default (the pelvis freejoint is deleted), which is what every
+    existing grasp result was measured on. With ``config.fixed_base=False`` the
+    freejoint is kept and the stand keyframe is left un-stripped, so the robot
+    balances on its own legs while grasping -- the Phase 5 factory case.
+    """
     spec = mujoco.MjSpec.from_file(str(config.g1_xml_path))
 
-    freejoint = spec.joint(tc.FLOATING_BASE_JOINT)
-    spec.delete(freejoint)
-    stand_key = spec.key(tc.STAND_KEYFRAME)
-    stand_key.qpos = np.asarray(stand_key.qpos)[7:].tolist()
+    if getattr(config, "fixed_base", True):
+        freejoint = spec.joint(tc.FLOATING_BASE_JOINT)
+        spec.delete(freejoint)
+        stand_key = spec.key(tc.STAND_KEYFRAME)
+        stand_key.qpos = np.asarray(stand_key.qpos)[7:].tolist()
 
     attach_sharpa_hands(spec, mount=config.sharpa_mount, visual_style=config.sharpa_visual_style)
     _add_ee_sites(spec)

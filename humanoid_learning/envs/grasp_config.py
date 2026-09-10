@@ -15,6 +15,12 @@ class GraspEnvConfig:
     frame_skip: int = 5
     max_episode_steps: int = 600
 
+    # Phase 5 recovery work: the factory G1 stands on its own two feet, so the
+    # grasp has to survive its own arm reaction forces instead of pushing
+    # against a welded pelvis. Default stays True so every existing grasp
+    # result, demo and gate keeps its original fixed-base meaning.
+    fixed_base: bool = True
+
     arm_action_scale: float = 0.05  # matches Foundation EnvConfig.action_scale
     # Waist action channel, added for the coupled bilateral waist-aware IK
     # session -- same scale as the arms so a coupled-IK-derived joint delta

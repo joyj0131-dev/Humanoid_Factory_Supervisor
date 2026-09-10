@@ -332,3 +332,73 @@ line, and 1/2 focus a station. A accepts the current request and C requests
 verification: these are explicitly manual task-manager inputs, not G1 recovery.
 Neither key moves any part. At episode end the scene remains visible until R.
 Offscreen PNGs include the same status panel.
+
+## Phase 5 step 1 — grasping while standing on two feet
+
+The factory G1 stands on its own legs, but every grasp result in this project
+was measured with the pelvis **welded to the world**. Replaying the identical
+Expert commands with the base free makes the robot fall over: pelvis drops
+753 mm, rolls 179 deg, down at step 839 during the reach.
+
+`GraspEnvConfig.fixed_base` (default `True`, so nothing existing changes) selects
+the free-base build.
+
+### The cause is dynamic, not a balance margin
+
+A first measurement suggested the CoM only had 12 mm of forward margin and
+crossed the toe line during the reach. **That measurement was wrong**: it used
+`subtree_com[0]`, which includes the table and the object. Using the robot's own
+CoM (`subtree_com[pelvis]`):
+
+| | robot CoM x | toe line | margin |
+| --- | --- | --- | --- |
+| standing | +0.0030 | +0.1250 | **122 mm** |
+| peak during a successful grasp | +0.0484 | +0.1250 | **77 mm** |
+
+So the CoM never leaves the support polygon, and a wider or braced stance --
+which the wrong number would have led to -- fixes nothing. What actually happens
+is that the pelvis **rocks with growing amplitude** (pitch −0.4 → −3.2 → +5.6 →
+−3.9 deg) until the left foot's normal force reaches 0.00 N and it topples. The
+Expert's arm trajectories were tuned against a pelvis that silently absorbed
+their reaction torque.
+
+Leg gains are identical in the grasp and whole-body envs (kp 500), so the legs
+were never the difference; the arms are (kp 120 compliant vs 500).
+
+### Fix: a minimal ankle-strategy stabiliser
+
+`humanoid_learning/expert/stance_stabilizer.py` reads pelvis roll/pitch and
+their rates and commands the four ankle actuators to oppose them. It writes only
+the ankles -- arms, hands, waist and the env action are untouched.
+
+Gain sweep against the full grasp (seed 0):
+
+| pitch kp | result | peak pitch | pelvis drop |
+| --- | --- | --- | --- |
+| none | FAILURE, fell | 89.7 deg | 753 mm |
+| **1.0 (chosen)** | **SUCCESS** | **3.0 deg** | **0.3 mm** |
+| 2.0 | grasp gate failed (stood) | 3.0 deg | 0.5 mm |
+| 3.0 | grasp gate failed (stood) | 2.9 deg | 1.7 mm |
+| 4.0 | FAILURE, fell | 89.5 deg | 756 mm |
+| 5.0 | FAILURE, fell | 89.7 deg | 752 mm |
+
+Too much gain oscillates the robot over, which is why the value is low.
+
+### Result
+
+Seeds 0/1/2, free base, stabiliser at kp 1.0: **SUCCESS in all three**, object
+clearance 80.78 mm against the fixed-base 81.00 mm, peak pitch 3.02 deg, pelvis
+drop 0.33 mm. The grasp quality is essentially unchanged by standing free.
+
+`scripts/test_free_base_grasp.py` (4/4) locks all of it, including that the
+unstabilised case really does topple, so the stabiliser cannot be quietly
+removed.
+
+### Still missing for step 1
+
+**Place is not implemented.** The robot grasps and lifts while standing, but it
+still cannot put the block down at a commanded pose and let go -- releasing just
+drops it. That is the remaining half of step 1.
+
+The stabiliser cannot take a step, so it cannot recover from a disturbance that
+needs one. It is not a walking controller and must never be reported as one.
