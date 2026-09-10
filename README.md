@@ -103,9 +103,55 @@ hash, actuator 순서를 담는다. 이 중 하나라도 다르면 재생이 거
 observation만으로는 명령을 결정할 수 없다 — Expert는 접촉력 등 관측에 없는
 정보를 쓰는 상태 기계이므로, 그대로 BC에 넣는 것은 별도 설계 문제다.
 
+## 두 작업 공간 공장 환경
+
+감독 로봇이 실제로 일할 무대를 만들었다. **떨어져 있는 workcell 2개**가 각자
+scripted 자동화 팔과 부품을 갖고 돌아가고, seed가 정한 한쪽에서만 고장이 난다.
+반대쪽은 계속 정상 생산한다. 기존 고정 위치 grasp 환경은 그대로 두고 별도 환경으로
+추가했다.
+
+**아직 걷지 못한다.** 저장소에 보행 제어기가 없다(있는 것은 `PlanarDebugEnv`뿐이고
+그건 스스로 "gait이 아니다"라고 명시한 kinematic 디버그용이다). base는 자유롭게
+두었으므로 나중에 이동을 만들면 반드시 다리로 해야 한다. 실측: G1은 floating base
+위에서 2000 step(20초) 동안 pelvis drift 0.1mm로 서 있다 — 서 있기는 확실하고,
+걷기는 존재하지 않는다.
+
+workcell 간격은 3안을 수치로 비교해 골랐다(±35° 고정, 보행 0.5m/s 가정).
+
+| 안 | 이동거리 | 테이블 간격 | 이동 step | 4194-step grasp episode 대비 |
+| --- | --- | --- | --- | --- |
+| short | 1.50m | 1.36m | 401 | 9.6% |
+| **medium (선택)** | **2.50m** | **2.51m** | **601** | **14.3%** |
+| long | 4.00m | 4.23m | 901 | 21.5% |
+
+short는 두 셀이 한 덩어리로 보이고, long은 얻는 것 없이 tick만 50% 늘어난다.
+선택한 medium의 실측 manipulation pose 간격은 **2.868m**다.
+
+각 workcell은 검증된 canonical grasp 관계(테이블 0.30m 앞, 부품 0.27m)를 그대로
+rigid transform한 것이라, 두 셀은 자기 좌표계에서 완전히 동일하다.
+
+Navigation Gate는 **보행 정책이 생기기 전에 미리** 못박았다: 위치 0.10m, heading
+0.15rad, 1.0초 유지, 넘어짐/금지 접촉 없음, 올바른 셀 먼저, 1500 step 이내, 그리고
+step당 base 이동 0.05m 초과는 보행이 아니므로 실격. 테스트로 순간이동·엉뚱한 셀
+경유·넘어짐이 실제로 걸러지는 것을 확인했다.
+
+```bash
+DISPLAY=:0 python3 scripts/view_factory.py
+OPENBLAS_NUM_THREADS=1 python3 scripts/view_factory.py --offscreen \
+  --seed 0 --out results/factory/scene.png --steps 400 --capture 150 400
+OPENBLAS_NUM_THREADS=1 MUJOCO_GL=egl python3 scripts/test_factory.py
+```
+
+주의할 것 두 가지를 실측했다. (1) 기존 grasp Expert는 접근 목표를 **world 축**으로
+만들기 때문에 35° 돌아간 셀에서는 최대 169mm 어긋난다 — heading 좌표계로 고쳐야
+한다. (2) `envs/`에 파일이 추가되면서 hash가 바뀌어 **기존 데모 10개는 재생이
+거부된다**(설계된 안전장치이며 hash를 건드리지 않았다). 자세한 내용은
+[공장 환경](docs/FACTORY_ENVIRONMENT.md) 참고.
+
 ## 문서 안내
 
 - [현재 구조](docs/ARCHITECTURE.md)
+- [두 작업 공간 공장 환경](docs/FACTORY_ENVIRONMENT.md)
 - [Phase 0~13 로드맵](docs/PHASE_ROADMAP.md)
 - [Sharpa Wave 통합](docs/END_EFFECTOR_SHARPA_WAVE.md)
 - [Dex3 legacy 경계](docs/LEGACY_DEX3.md)

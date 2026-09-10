@@ -20,6 +20,12 @@ scripts/view_whole_body.py
   │              └─ timing.sim_time_to_steps
   └─ --sharpa-hand-demo
        └─ SharpaHandDemo + SharpaGraspEnv
+
+scripts/view_factory.py
+  └─ FactoryEnv (37 action, 113 observation, floating base)
+       ├─ factory_model.build_factory_model (G1 + 2 workcells)
+       ├─ ScriptedArm x2 (3-DoF, real position actuators)
+       └─ NavigationTracker (scores a trajectory; never moves the robot)
 ```
 
 `model_builder.py`는 bare `assets/robots/g1/g1.xml`에 Sharpa를
@@ -39,6 +45,9 @@ pre-hand-equipped base가 남기던 손목당 0.202839kg의 ghost hand mass도
 - Demo replay(schema 1): `SharpaGraspCommand` = action 25 + preshape 목표 16 +
   `noslip_iterations`. 이는 기존 action/observation 계약을 바꾸지 않고,
   action 밖에서 나가던 보조 명령을 명시적으로 포함시킨 것이다.
+- Factory supervisor: action 37(whole-body와 동일), observation 113
+  = WholeBodyEnv 83 + factory block 30. compiled `nq=100`, `nv=97`,
+  `nu=79`(= G1 73 + 자동화 팔 6). G1 73 계약은 불변이다.
 
 ## Source ownership
 
@@ -48,6 +57,11 @@ pre-hand-equipped base가 남기던 손목당 0.202839kg의 ghost hand mass도
 - `envs/sharpa_grasp_env.py`: fixed-base grasp physics/contact safety,
   `capture_command()` / `step_command()`
 - `envs/sharpa_command.py`: 검증되는 불변 완전 명령 dataclass
+- `envs/factory_config.py`: workcell layout, 자동화 팔 spec, fault, Navigation Gate
+- `envs/factory_model.py`: 2개 workcell scene 컴파일
+- `envs/factory_env.py`: FactoryEnv, ScriptedArm, NavigationTracker
+- `envs/whole_body_env.py`: `_build_model()` hook으로 FactoryEnv가 동일한
+  37차원 action 규약과 step 의미를 재구현 없이 공유한다
 - `data/sharpa_demo.py`: 기록/재생과 Expert flag를 보지 않는 `PhysicalMonitor`
 - `expert/sharpa_bimanual_grasp_expert.py`: 공식 양손 controller
 - `expert/sharpa_contact_lift.py`: 실제 양손 지지 및 물체-table 간격 기반 hold/lift
@@ -56,6 +70,7 @@ pre-hand-equipped base가 남기던 손목당 0.202839kg의 ghost hand mass도
 - `data/`, `imitation/`, `evaluation/`: Phase 2/3 및 이후 학습 기반
 - `scripts/sharpa_demos.py`: 파일럿 기록/재생 CLI
 - `scripts/test_sharpa_demo.py`: 명령 완전성·진단 격리·재생 부정 테스트
+- `scripts/view_factory.py`, `scripts/test_factory.py`: 공장 viewer/테스트
 
 과거 Dex3 runtime/planner/test는 활성 branch에서 제거됐다. 재현이 필요하면
 `phase4/dex3-grasp` branch 또는 `phase4-dex3-end` tag를 사용한다.
@@ -126,3 +141,29 @@ step한 뒤 qpos/qvel/ctrl만 되돌려서 시간, warm-start, controller target
 
 기록 파일에는 `learner_ready=False`, `quality_review_required=True`가 들어 있다.
 재생 성공과 학습 데모 품질 승인은 분리한다.
+
+## Factory environment (2026-09-10)
+
+두 workcell은 canonical grasp 관계(테이블 0.30m 앞, 부품 0.27m)를 rigid
+transform한 것이며, 자기 좌표계에서 서로 완전히 동일하다(round-trip 1e-12,
+base frame 재현 1e-6). manipulation pose 간격 2.868m.
+
+자동화 팔은 실제 joint/position actuator로 구동한다. cycle은 **tip 좌표로
+작성**하고 2-link closed-form IK로 관절각을 만든다 — 처음에 관절각을 직접
+하드코딩했다가 tip이 테이블을 0.43m 관통한 실패를 겪었기 때문이다. 현재 cycle의
+최소 테이블 여유는 +0.070m다.
+
+Fault는 seed만으로 결정되며, 해당 팔은 pick waypoint에서 정지하고 부품은 drop
+zone 0.05m 위에서 released되어 중력으로 낙하·정착한다(실측 rest z 0.8097m,
+|qvel|max 0.00000, 관통 0.34mm). 반대쪽 셀은 계속 돌아간다(정상 0.830rad vs
+정지 0.008rad).
+
+**보행 제어기는 없다.** base는 free로 유지되고 NavigationTracker는 외부에서 준
+궤적을 채점만 한다. step당 base 이동 0.05m 초과는 teleport로 실격 처리하므로
+kinematic oracle이 보행으로 둔갑할 수 없다.
+
+미해결 두 가지(실측):
+- grasp Expert의 접근 offset이 world 축 기반이라 35° 셀에서 최대 169mm 어긋난다.
+  또한 `object` 이름으로 물체를 찾는데 factory 모델에는 `wc0_part`/`wc1_part`뿐이다.
+- Navigation Gate 허용 오차 0.10m와 검증된 grasp 범위 ±0.010m 사이에 10배 격차가
+  있다. Gate를 통과해도 현재 grasp이 성공한다는 뜻이 아니다.

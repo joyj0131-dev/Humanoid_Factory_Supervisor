@@ -188,6 +188,18 @@ def part_geom_name(index: int) -> str:
     return f"wc{index}_part_geom"
 
 
+def beacon_body_name(index: int) -> str:
+    return f"wc{index}_status_beacon"
+
+
+def beacon_geom_name(index: int) -> str:
+    return f"wc{index}_status_beacon_geom"
+
+
+BEACON_RUNNING_RGBA = (0.15, 0.85, 0.25, 1.0)
+BEACON_FAULT_RGBA = (0.95, 0.15, 0.10, 1.0)
+
+
 def table_body_name(index: int) -> str:
     return f"wc{index}_table"
 

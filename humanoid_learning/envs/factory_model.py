@@ -178,6 +178,22 @@ def _add_workcell(spec, pose: fcfg.WorkcellPose, config: fcfg.FactoryConfig) -> 
         friction=list(config.part_friction),
     )
 
+    # Status beacon on top of the arm column. The viewer recolours this at
+    # runtime (green = producing, red = faulted) so the faulted cell is
+    # identifiable from the scene itself, not only from console text.
+    beacon = spec.worldbody.add_body(
+        name=fcfg.beacon_body_name(index),
+        pos=[float(pose.arm_base_xy[0]), float(pose.arm_base_xy[1]), 2.0 * fcfg.ARM_COLUMN_HALF_HEIGHT + 0.25],
+    )
+    beacon.add_geom(
+        name=fcfg.beacon_geom_name(index),
+        type=mujoco.mjtGeom.mjGEOM_SPHERE,
+        size=[0.09],
+        rgba=list(fcfg.BEACON_RUNNING_RGBA),
+        contype=0,
+        conaffinity=0,
+    )
+
     _add_automation_arm(spec, pose)
 
 
@@ -195,6 +211,11 @@ def build_factory_model(config: fcfg.FactoryConfig) -> mujoco.MjModel:
 
     for pose in config.workcells:
         _add_workcell(spec, pose, config)
+
+    # The two cells span ~2.9 m, so the stock 640x480 offscreen framebuffer is
+    # too narrow to show both at once when rendering headless.
+    spec.visual.global_.offwidth = 1280
+    spec.visual.global_.offheight = 720
 
     model = spec.compile()
     model_builder._restore_named_keyframe(model, config.g1_xml_path)
