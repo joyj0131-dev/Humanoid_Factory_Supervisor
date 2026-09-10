@@ -128,6 +128,85 @@ def mode_posture() -> None:
     _run_env(env, step, len(schedule))
 
 
+def mode_weight_shift(no_restart: bool) -> None:
+    """Watch the single-support blocker for walking (Phase 5).
+
+    Shifts the robot's centre of mass sideways over one foot with closed-loop
+    CoM feedback and ramps past the point where the other foot unloads. Weight
+    transfer up to ~84% is stable; full single support is not, and the robot
+    topples. Stepping needs full single support, so this is what blocks walking.
+    This mode exists so that claim is watchable, not just asserted.
+    """
+    import mujoco
+
+    from humanoid_learning.envs.whole_body_env import WholeBodyEnv
+
+    env = WholeBodyEnv()
+    env.reset(seed=0)
+    model, data = env.model, env.data
+    pelvis = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
+    feet = {s: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{s}_ankle_roll_link")
+            for s in ("left", "right")}
+    sole_half_y = max(model.geom_size[g][1] for g in range(model.ngeom)
+                      if model.geom_bodyid[g] == feet["right"])
+    print("Weight-shift probe: CoM is driven sideways over the RIGHT foot.")
+    print(f"  right sole half-width = {sole_half_y * 1000:.1f} mm -- the CoM must stay inside that "
+          "once the left foot leaves the ground.")
+    print("  Expect stable transfer to ~84%, then a fall when the left foot fully unloads.")
+    state = {"i": 0, "prev": 0.0, "done": False}
+
+    def foot_force():
+        out = {"left": 0.0, "right": 0.0}
+        for c in range(data.ncon):
+            contact = data.contact[c]
+            geoms = {contact.geom1, contact.geom2}
+            for side, body in feet.items():
+                if any(model.geom_bodyid[g] == body for g in geoms):
+                    value = np.zeros(6)
+                    mujoco.mj_contactForce(model, data, c, value)
+                    out[side] += float(np.linalg.norm(value[:3]))
+        return out
+
+    def restart():
+        env.reset(seed=0)
+        state.update(i=0, prev=0.0, done=False)
+
+    def step(tick: int, viewer=None) -> None:
+        if state["done"]:
+            return
+        mujoco.mj_comPos(model, data)
+        com_y = float(data.subtree_com[pelvis][1])
+        # Ramp the target past the foot centre so the failure point is reached.
+        target = float(data.xpos[feet["right"]][1]) * min(1.4, state["i"] / 400.0)
+        error = target - com_y
+        rate = (error - state["prev"]) / 0.01
+        state["prev"] = error
+        command = float(np.clip(8.0 * error + 0.2 * rate, -0.8, 0.8))
+        targets = {"left_hip_roll_joint": -command, "right_hip_roll_joint": -command,
+                   "left_ankle_roll_joint": command, "right_ankle_roll_joint": command}
+        action = np.zeros(ACTION_DIM)
+        current = env._leg_target
+        action[0:N_LEGS] = np.clip(
+            np.array([targets.get(n, 0.0) - current[k] for k, n in enumerate(wbc.LEG_JOINTS)])
+            / env.config.leg_action_scale, -1, 1)
+        env.step(action)
+        state["i"] += 1
+        if state["i"] % 100 == 0:
+            f = foot_force()
+            share = 100.0 * f["right"] / max(1e-6, f["left"] + f["right"])
+            print(f"  step {state['i']:5d} com_y={com_y:+.4f} left={f['left']:6.1f}N "
+                  f"right={f['right']:6.1f}N  weight on right = {share:5.1f}%  pelvis_z={data.xpos[pelvis][2]:.3f}")
+        if float(data.xpos[pelvis][2]) < 0.60:
+            print("  FELL -- full single support was not held. This is what blocks stepping.")
+            if no_restart:
+                state["done"] = True
+            else:
+                restart()
+
+    _run_env(env, step)
+    env.close()
+
+
 def mode_planar() -> None:
     env = PlanarDebugEnv(wbc.PlanarDebugConfig())
     env.reset(seed=0)
@@ -392,6 +471,8 @@ def main() -> None:
     modes.add_argument("--stand", action="store_true")
     modes.add_argument("--posture", action="store_true")
     modes.add_argument("--planar", action="store_true")
+    modes.add_argument("--weight-shift", action="store_true",
+                       help="watch the single-support blocker that prevents walking (Phase 5)")
     modes.add_argument("--grasp", action="store_true")
     modes.add_argument("--sharpa-hand-demo", action="store_true")
     parser.add_argument("--object-pos-x", type=float, default=0.27)
@@ -419,6 +500,8 @@ def main() -> None:
         mode_stand()
     elif args.posture:
         mode_posture()
+    elif args.weight_shift:
+        mode_weight_shift(args.no_restart)
     elif args.planar:
         mode_planar()
     elif args.grasp:

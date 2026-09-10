@@ -402,3 +402,45 @@ drops it. That is the remaining half of step 1.
 
 The stabiliser cannot take a step, so it cannot recover from a disturbance that
 needs one. It is not a walking controller and must never be reported as one.
+
+## Walking to the stations — attempted, BLOCKED (2026-09-10)
+
+Both stations sit at heading 0, the same as the G1's home pose, so reaching
+either one needs forward + sideways stepping and **no turning** -- the easy case.
+Distance is 2.02 m, and the Navigation Gate allows 1500 steps (15 s), so ~0.135
+m/s is required.
+
+It does not work, and the blocker is measured rather than guessed.
+
+**Stepping needs full single support.** Progress toward it:
+
+| approach | result |
+| --- | --- |
+| open-loop lateral lean | falls; the "single support" seen at 120 steps was a transient mid-topple, gone by 400 |
+| closed-loop CoM tracking | **does not fall**; weight transfers smoothly to ~84-90% on one foot |
+| pushing to 100% transfer | **falls every time**, at every gain and target tried |
+
+So the robot can put 90% of its weight on one foot and hold it, but the instant
+the other foot's normal force reaches 0.00 N it topples.
+
+**Why, from the model:** the robot is 35.8 kg (352 N) and the foot sole is only
+**37.8 mm half-width**. Ankle torque is NOT the limit -- a kp=500 position
+actuator delivers the required 13.3 N-m at 0.027 rad of tracking error. The limit
+is the support margin: in single support the CoM must stay inside +-37.8 mm while
+ankle roll is capped at +-0.262 rad. A single-axis CoM-y PD is not tight enough
+to hold that.
+
+**What walking actually needs** (none of it present): simultaneous CoM x and y
+regulation, a swing-leg trajectory that does not disturb the CoM, and ZMP or
+capture-point feedback -- or a learned policy. That is a controls project in its
+own right, not controller tuning.
+
+Watch it fail:
+
+```bash
+DISPLAY=:0 python3 scripts/view_whole_body.py --weight-shift --no-restart
+```
+
+Nothing here fakes the result. The Navigation Gate still rejects base
+teleportation, `PlanarDebugEnv` is still labelled a kinematic oracle, and no
+navigation result is claimed.
