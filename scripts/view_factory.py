@@ -159,7 +159,13 @@ def main() -> None:
     if args.offscreen:
         os.environ.setdefault("MUJOCO_GL", "egl")
     else:
-        os.environ.setdefault("MUJOCO_GL", "glx")
+        # Match scripts/view_whole_body.py exactly. On this project's PRIME /
+        # Optimus laptop BOTH variables are required: setting the NVIDIA GLX
+        # vendor without also enabling render offload makes GLX context
+        # creation fail with "BadValue (integer parameter out of range)".
+        # MUJOCO_GL is deliberately left unset here so MuJoCo picks its own
+        # windowed backend (glfw) -- "glx" is not a valid MUJOCO_GL value.
+        os.environ.setdefault("__NV_PRIME_RENDER_OFFLOAD", "1")
         os.environ.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
 
     from humanoid_learning.envs.factory_env import FactoryEnv
