@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive viewer for the two-workcell factory.
+"""Interactive viewer for the conveyor-line factory.
 
 A separate entry point rather than another branch inside view_whole_body.py:
 that script is already 5 modes and a dozen grasp-specific flags, and the factory
@@ -12,8 +12,9 @@ shares none of them.
 Headless machines should use --offscreen (it sets MUJOCO_GL=egl itself).
 
 The G1 only stands: there is no walking controller in this repository, so the
-supervisor does not travel between the cells here. What the viewer shows is the
-factory running, one cell faulting, and where the robot would have to stand.
+supervisor does not travel between the stations here. What the viewer shows is
+the line running, the arms picking parts off the belt, one station faulting, the
+line stopping, and where the robot would have to stand to recover it.
 """
 from __future__ import annotations
 
@@ -33,16 +34,18 @@ from humanoid_learning.envs import factory_config as fcfg
 def _describe(env, info) -> str:
     faulted = info["arm_faulted"]
     cells = " | ".join(
-        f"wc{k}: {'FAULT' if faulted[k] else 'running'} wp{info['arm_waypoint'][k]}"
+        f"st{k}: {'FAULT' if faulted[k] else 'running'} wp{info['arm_waypoint'][k]}"
         for k in range(fcfg.N_WORKCELLS)
     )
     target = info["target_workcell"]
-    return f"{cells} || target={'none yet' if target < 0 else f'wc{target}'}"
+    belt = "BELT RUNNING" if info["belt_running"] else "BELT STOPPED"
+    return (f"{belt} [{info['line_state']}] || {cells} || "
+            f"call={'none' if target < 0 else f'st{target}'}")
 
 
-CAMERA_DISTANCE = 6.2
-CAMERA_AZIMUTH = 180.0
-CAMERA_ELEVATION = -20.0
+CAMERA_DISTANCE = 6.4
+CAMERA_AZIMUTH = 143.0
+CAMERA_ELEVATION = -27.0
 
 
 def _camera_lookat(config) -> list[float]:
@@ -50,7 +53,7 @@ def _camera_lookat(config) -> list[float]:
     the robot and both workcells all fit in frame."""
     cells = config.workcells
     centre_x = float(np.mean([p.manipulation_xy[0] for p in cells]))
-    return [centre_x * 0.55, 0.0, 0.85]
+    return [centre_x * 0.75, 0.0, 0.85]
 
 
 def _camera(config):
@@ -108,7 +111,8 @@ def run_interactive(env, args) -> None:
     _, info = env.reset(seed=args.seed, options=_reset_options(args))
     zero = np.zeros(env.action_space.shape[0], dtype=np.float32)
     print(f"Factory viewer: layout={env.factory.layout}, seed={args.seed}, "
-          f"fault scheduled for wc{env.fault_workcell} at step {env.fault_step}.")
+          f"fault scheduled for station {env.fault_workcell} at step {env.fault_step}.")
+    print("Beacon green = producing, red = faulted. A fault stops the belt until the part is back.")
     print("The G1 stands (no walking controller exists). Close the viewer to exit.")
     target_dt = env.model.opt.timestep * env.config.frame_skip
     with mujoco.viewer.launch_passive(env.model, env.data) as viewer:

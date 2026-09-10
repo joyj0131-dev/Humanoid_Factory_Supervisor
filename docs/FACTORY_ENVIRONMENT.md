@@ -26,94 +26,119 @@ Measured baseline: the G1 stands on its floating base for 2000 steps (20 s) with
 0.1 mm of pelvis drift, both feet in contact, no fall. Standing is solid;
 walking does not exist.
 
-## Layout
+## Layout: one conveyor, two stations
 
-Each workcell is defined in a **local frame whose origin is the pelvis stand
-spot for canonical manipulation** and whose +x is the robot's heading. The table
-sits at `DEFAULT_TABLE_POS` = (0.30, 0, 0.70) and the part at x = 0.27 in that
-frame — exactly the relationship the existing grasp was validated against. Both
-cells are therefore the same scene under a rigid transform, and no world
-coordinate for a cell is written down twice.
+One straight conveyor runs along world +Y at x = 2.0 with its surface at
+z = 0.75 -- the same working height as the canonical grasp table. Two arm
+stations sit on it, **both facing world +X**, so the G1 approaches each of them
+exactly as it approaches the canonical fixed-base grasp scene.
 
-Three spacings were compared before choosing (bearing fixed at ±35° so the
-comparison isolates distance; walking speed 0.5 m/s and turn rate 0.6 rad/s for
-the tick estimate):
+That straight-line choice removed the previous layout's biggest blocker. Under
+the earlier +-35 degree workcell placement, the grasp Expert's world-axis
+approach offsets were wrong by up to 169 mm at a station. With both stations
+facing the same way they differ by a pure translation, and those offsets are now
+exact (`test_straight_line_layout_keeps_the_grasp_experts_world_axis_offsets_valid`).
 
-| preset | walk (m) | turn (deg) | gap between table edges (m) | gap between arm columns (m) | nav steps | vs 4194-step grasp episode |
-| --- | --- | --- | --- | --- | --- | --- |
-| short | 1.50 | 35 | 1.36 | 2.18 | 401 | 9.6% |
-| **medium (chosen)** | **2.50** | **35** | **2.51** | **3.29** | **601** | **14.3%** |
-| long | 4.00 | 35 | 4.23 | 4.98 | 901 | 21.5% |
+| preset | station spacing | home -> station | both face |
+| --- | --- | --- | --- |
+| short | 1.6 m | 1.88 m | +X |
+| **medium (default)** | **2.2 m** | **2.02 m** | **+X** |
+| long | 3.0 m | 2.27 m | +X |
 
-`medium` was selected. `short`'s 1.36 m gap leaves the two cells reading as one
-cluster and makes "which cell" nearly trivial; `long` costs 50% more ticks for
-no additional task content. Tick cost is not the binding constraint at any of
-the three — even `long` is a fifth of one grasp episode.
+Station-local geometry is the canonical grasp relationship verbatim: belt centre
+0.30 m ahead of the pelvis, part at 0.27 m. Both stations reproduce it to 1e-6.
 
-Measured world geometry for `medium`:
+## Automation stations
 
-- workcell 0 manipulation pose (2.048, −1.434), heading −35°
-- workcell 1 manipulation pose (2.048, +1.434), heading +35°
-- **separation between the two manipulation poses: 2.868 m**
+Each station has a 4-DoF arm (`base_yaw`, `shoulder_pitch`, `elbow_pitch`,
+`wrist_pitch`) on a static column across the belt from the robot, plus a **real
+two-jaw gripper** on slide joints with friction. `wrist_pitch` is solved so the
+three pitches always sum to pi/2, holding the gripper vertical so the jaws
+descend onto a part from above. The cycle is authored in tip space and converted
+by closed-form 2-link IK; the grasp pose lands within 0.005 m of the part centre.
 
-Everything else per cell is derived from that pose: table, part, arm column,
-drop zone, observation pose (0.80 m behind), and the floor marker.
+Compiled contract: `nq=106, nv=103, nu=85` -- 73 G1 actuators (unchanged) plus
+12 station actuators.
 
-## Automation cells
+The eight-step cycle is: approach, descend, grip, lift, traverse, lower,
+release, retract. Targets **ramp** between waypoints (smoothstep over the first
+60% of each dwell, then settle). Stepping the targets instead flung the gripped
+part off the line during the rotation to the outfeed.
 
-Each cell has a 3-DoF primitive arm (`base_yaw`, `shoulder_pitch`,
-`elbow_pitch`) on a static column, driven by real position actuators. Nothing
-teleports a geom per frame. Names are prefixed `wc0_` / `wc1_`, so the two cells
-cannot share state.
+### Three real bugs found here, all by measurement
 
-The scripted cycle is authored in **tip space** (`ARM_CYCLE_TIP_TARGETS`) and
-converted to joint angles by closed-form 2-link IK. This matters: the first
-version hard-coded joint angles and drove the tip 0.43 m *through* the tabletop.
+**1. The arm jammed against its own column.** MuJoCo's `filterparent` does not
+exclude an arm link from its column, because the column has no joint and is
+therefore welded to the world -- the pair reads as link-vs-world, which
+`filterparent` deliberately never filters. The turret collided with its own
+column at 2.6e17 N and pinned `base_yaw` at 0.50 rad while it was commanded to
+0. Fixed by putting every arm geom in `contype=2 / conaffinity=1`, so the arm's
+links are transparent to each other but still collide with the part, belt, floor
+and robot.
 
-The clearance that actually binds is against the **part**, not the tabletop, and
-it took three measurements to get right:
+**2. Gripper force is not what it looks like.** A position actuator's grip force
+is `kp x (target - actual)`, so a jaw that stalls 1 mm from its target pushes
+with barely 1 N no matter how deep the nominal squeeze looks. Measured sweep at
+kp = 1200:
 
-| pick tip z | arm/part contacts per 800 steps | part drift |
-| --- | --- | --- |
-| 0.82 | 98 | 62 mm |
-| 0.88 | 247 | 136 mm |
-| **0.95 (current)** | **0** | **0.000 mm** |
+| closed target | peak jaw force | contact penetration | result |
+| --- | --- | --- | --- |
+| 0.063 | 3.1 N | 3.6 mm | dropped |
+| **0.058 (current)** | **11.6 N** | **10.1 mm** | **lifted** |
+| 0.054 | 22.8 N | 12.2 mm | lifted |
+| 0.050 | 24.3 N | 15.3 mm | lifted |
 
-Raising the tip from 0.82 to 0.88 made it *worse*, because the assumed part-top
-height (0.81) was wrong — the part rests centred at 0.812 with half size 0.06, so
-its top is at **0.872**, and the forearm capsule reaches ~0.030 m below the tip.
-`mj_geomDistance` against the compiled model now shows **+48 mm** of minimum
-arm/part clearance over the whole cycle. The arm only *mimics* pick and place: it
-does not physically transport the part, and it must not disturb it.
-`test_arm_cycle_does_not_disturb_the_part` locks both the static clearance and
-the running drift.
+An earlier 18 mm squeeze at kp = 250 drove 9.3 mm of penetration, let the part
+slip 70 mm through the jaws during the lift, and then **ejected it upward** --
+the same soft-contact "squirt" failure this project already recorded for the
+Sharpa hand. Stiffening contact to `solref=(0.002, 1)` cut penetration but needed
+~59 N to still lift, which is worse. 10 mm of penetration on a 120 mm part is
+real and is not claimed to be a clean grasp; this is a scripted factory prop,
+held to a lower bar than the G1's own Sharpa grasp.
 
-Compiled contract: `nq=100, nv=97, nu=79` — 73 G1 actuators (the locked
-G1+Sharpa contract, unchanged) plus 6 automation-arm actuators.
+**3. The belt could not move anything.** The friction holding a part on the belt
+is mu*m*g = 1.5 * 0.1 * 9.81 = 1.47 N; the first drive gain produced 0.30 N, so
+parts simply never moved. The gain now produces up to 5 N (clipped), and the
+drive is applied with the matching `r x F` torque so it acts at the contact
+patch rather than the centre of mass -- applying it at the COM alone tipped the
+part and made it hop along the belt.
 
-## Dropped-Part fault
+Transport is functional but jerky: a part travels the 0.32 m from outfeed back to
+the stop blade in about 3 s, with velocity fluctuating over roughly 0 to 0.3 m/s.
+This is a viscous surface-drive approximation, not a simulated belt mechanism.
 
-One exception only, as specified.
+## Line loop and the Dropped-Part fault
 
-- The episode seed alone picks the faulting cell and (optionally) the fault
-  step. Same seed → same cell, same step, same drop pose, bitwise-identical
-  `qpos` after 260 steps.
-- At the fault step, that cell's arm stalls at its pick waypoint and its part is
-  **released 0.05 m above the drop zone** so it falls and settles under gravity.
-  The release itself is scripted fault injection; the landing is real physics
-  and is measured.
-- The other cell keeps producing. Measured after a fault: the healthy arm sweeps
-  0.534 rad while the stalled one sweeps 0.007 rad.
+A **physical stop blade** just downstream of each pick spot indexes parts, so
+the belt can keep running while a part waits. Normal production is a real closed
+loop: the arm picks the part off the belt, sets it down 0.32 m upstream, and the
+running belt carries it back against the blade.
 
-Measured settling (seed 0, 600 steps): rest z **0.8097 m** against an expected
-0.8100, `|qvel|max` **0.00000**, contact penetration **0.34 mm**, resting at the
-intended drop-zone local xy (0.27, 0.08). Not floating, not sunk, not fallen through.
+The task manager (`FactoryTaskManager`) is the signalling layer:
 
-The drop zone is on the **tabletop**, not the floor. Floor-level picking needs
-body lowering, balance under a reaching load, and probably a different grasp
-topology than the current two-handed side squeeze (the floor blocks one side).
-None of that exists. The zone is a config value so a floor preset can be
-evaluated later without another layout change.
+```
+RUNNING  --fault-->  FAULT_RAISED            RECOVERY_VERIFIED --> RUNNING
+                     belt STOPPED             belt + arm restart
+                     arm stalled
+                     G1 called (target set)
+```
+
+- The episode seed alone picks which station fails and when.
+- On fault the arm's jaws open, the part ends up past the stop blade where the
+  arm's own cycle never reaches, **the belt stops** (line stop), and the target
+  station is published to the observation.
+- Recovery is judged from the part's **measured pose** -- back at the pick spot,
+  settled, held for 0.5 s -- never from a flag the robot sets.
+- Only then does the manager signal back: belt restarts and the stalled arm
+  resumes.
+
+Measured (seed 0): fault at step 200 stopped the line; the line did **not**
+restart on its own through 150 further steps; after the part was restored the
+manager verified and restarted belt and arm at step 464.
+
+**Recovery cannot happen on its own.** No policy here can walk to a station and
+move a part. In tests the restoration is done by the test harness and is labelled
+as such. The loop exists so it closes once a policy can do it.
 
 ## Observation and action
 
@@ -121,14 +146,15 @@ Action is the existing **37-dim whole-body** command (legs 12, waist 3, arms 14,
 Sharpa groups 8) — real G1 actuator commands. There is no action that writes the
 base pose.
 
-Observation is `WholeBodyEnv`'s own 83 dims plus a **30-dim factory block**
-(113 total):
+Observation is `WholeBodyEnv`'s own 83 dims plus a **31-dim factory block**
+(114 total):
 
 - per cell (×2, 10 each): manipulation pose in base frame (x, y), heading error
   (cos, sin), part position in base frame (x, y, z), arm cycle phase (cos, sin),
   arm fault flag
 - then: `fault_active`, target one-hot (2), target part in base frame (x, y, z),
-  target manipulation pose in base frame (x, y), target heading error (cos, sin)
+  target manipulation pose in base frame (x, y), target heading error (cos, sin),
+  `belt_running`
 
 Before the fault fires the target one-hot and target block are all zero, so the
 answer cannot be read early.
@@ -157,29 +183,18 @@ robot. Tests confirm it rejects a one-shot base jump, a wrong-cell detour and a
 fall, and only scores a gradual kinematic oracle — which is labelled an oracle,
 not locomotion, and must never be reported as a walking result.
 
-## Two measured transfer blockers
+## Transfer status
 
-**1. The grasp Expert cannot run in a cell as written.**
-`SharpaBimanualGraspExpert._mirrored_targets` builds approach targets as
-`object_pos + [-standoff, ±y_offset, height]` — offsets along **world** axes,
-not along the robot's heading. At a 35° cell that is wrong by up to **169 mm**.
-It also looks up the object by the fixed name `object`, which does not exist in
-the factory model (`wc0_part` / `wc1_part` do). The scene geometry transfers
-exactly — both cells reproduce the canonical (0.27, 0) part offset and (0.30, 0)
-table offset to 1e-6 — but the Expert needs a heading-frame rewrite first.
+**The grasp Expert's world-axis problem is resolved** by the straight line: both
+stations face world +X, so `object_pos + [-standoff, +-y, h]` is correct at each.
+It still looks the object up by the fixed name `object`, which does not exist in
+the factory model (`wc0_part` / `wc1_part` do), so it needs that one change
+before it can run here.
 
-**2. The 10 recorded grasp demos are now refused on replay.**
-`environment_sha256` covers all of `humanoid_learning/envs/*.py`, so adding the
-factory modules changed it (`df5e1133…` → `98c410e8…`) and
-`replay_episode` now raises *"environment code differs from recording"*. This is
-the guard working as designed. The hash was **not** weakened and no demo file was
-edited. A **new dataset version** is required for any factory-era recording.
-
-Follow-up worth considering (not done here): narrow the hash to the modules the
-recorded env actually imports, so an unrelated new env file stops invalidating
-grasp demos. That is a precision improvement, not a weakening — but it would
-itself invalidate the current recordings once, so it should be done together
-with the next re-record.
+**The recorded grasp demos remain refused on replay.** `environment_sha256`
+covers all of `humanoid_learning/envs/*.py`, so the factory modules changed it
+and `replay_episode` raises *"environment code differs from recording"*. The hash
+was not weakened and no demo file was edited. A new dataset version is required.
 
 ## Gate gap worth knowing about
 
@@ -202,7 +217,7 @@ DISPLAY=:0 python3 scripts/view_factory.py --seed 1 --fault-workcell 0
 
 # headless stills (green beacon = producing, red = faulted)
 OPENBLAS_NUM_THREADS=1 python3 scripts/view_factory.py --offscreen \
-  --seed 0 --out results/factory/scene.png --steps 400 --capture 150 400
+  --seed 0 --out results/factory/line.png --steps 400 --capture 120 260
 
 # tests
 OPENBLAS_NUM_THREADS=1 MUJOCO_GL=egl python3 scripts/test_factory.py

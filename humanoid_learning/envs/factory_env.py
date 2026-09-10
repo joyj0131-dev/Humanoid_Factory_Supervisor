@@ -15,6 +15,7 @@ Gate; it never moves the robot, and reaching the gate is not claimed anywhere.
 
 from __future__ import annotations
 
+from enum import Enum, auto
 from typing import Any
 
 import mujoco
@@ -27,21 +28,25 @@ from humanoid_learning.envs import frames
 from humanoid_learning.envs import task_config as tc
 from humanoid_learning.envs.whole_body_env import ACTION_DIM, WholeBodyEnv
 
+# Fraction of each dwell spent ramping to the next waypoint; the rest is settle
+# time. See ScriptedArm.target().
+RAMP_FRACTION = 0.6
+
 # Observation block appended after WholeBodyEnv's own pieces.
 PER_WORKCELL_OBS = 10
-FACTORY_OBS_DIM = fcfg.N_WORKCELLS * PER_WORKCELL_OBS + 10
+FACTORY_OBS_DIM = fcfg.N_WORKCELLS * PER_WORKCELL_OBS + 11
 
 FACTORY_OBS_LAYOUT = (
     "per workcell k in 0..1: manipulation pose in base frame (x,y), heading error "
     "(cos,sin), part position in base frame (x,y,z), arm cycle phase (cos,sin), "
     "arm fault flag; then: fault_active, target one-hot (2), target part in base "
-    "frame (x,y,z), target manipulation pose in base frame (x,y) and heading "
-    "error (cos,sin)"
+    "frame (x,y,z), target manipulation pose in base frame (x,y), target heading "
+    "error (cos,sin), belt_running"
 )
 
 
 class ScriptedArm:
-    """Deterministic joint-space cycle for one automation arm.
+    """Deterministic joint-space cycle for one automation arm and its gripper.
 
     Drives real position actuators; it never writes geom or body poses. A
     faulted arm stops advancing its phase and holds the fault waypoint, so the
@@ -51,20 +56,23 @@ class ScriptedArm:
     def __init__(self, index: int, model: mujoco.MjModel):
         self.index = index
         self.waypoints = fcfg.arm_cycle_waypoints()
+        self.jaw_targets = fcfg.arm_cycle_jaw_targets()
         self.hold_steps = fcfg.ARM_CYCLE_HOLD_STEPS
-        self.act_ids = np.array(
-            [
-                mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, fcfg.arm_joint_name(index, s))
-                for s in fcfg.ARM_JOINT_SUFFIXES
-            ]
-        )
-        assert (self.act_ids >= 0).all(), f"automation arm {index} actuators not found"
-        self.qpos_adr = np.array(
-            [
-                model.jnt_qposadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, fcfg.arm_joint_name(index, s))]
-                for s in fcfg.ARM_JOINT_SUFFIXES
-            ]
-        )
+
+        def act(suffix):
+            aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, fcfg.arm_joint_name(index, suffix))
+            assert aid >= 0, f"actuator {suffix} missing on arm {index}"
+            return aid
+
+        def qadr(suffix):
+            jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, fcfg.arm_joint_name(index, suffix))
+            assert jid >= 0, f"joint {suffix} missing on arm {index}"
+            return model.jnt_qposadr[jid]
+
+        self.act_ids = np.array([act(s) for s in fcfg.ARM_JOINT_SUFFIXES])
+        self.qpos_adr = np.array([qadr(s) for s in fcfg.ARM_JOINT_SUFFIXES])
+        self.jaw_act_ids = np.array([act(s) for s in fcfg.GRIPPER_JOINT_SUFFIXES])
+        self.jaw_qpos_adr = np.array([qadr(s) for s in fcfg.GRIPPER_JOINT_SUFFIXES])
         self.reset()
 
     def reset(self, phase_offset: int = 0) -> None:
@@ -89,14 +97,178 @@ class ScriptedArm:
         return (self._tick % self.cycle_length) / self.cycle_length
 
     def target(self) -> np.ndarray:
-        return np.asarray(self.waypoints[self.waypoint_index], dtype=np.float64)
+        """Smoothly ramp from the previous waypoint, then dwell.
+
+        Holding each waypoint as a step change made the position actuators slam
+        toward it; that was survivable on the lift but flung the gripped part
+        off the line during the rotation to the outfeed. The ramp reaches the
+        waypoint at RAMP_FRACTION of the dwell and holds for the remainder, so
+        the arm still settles before the next stage begins.
+        """
+        current = np.asarray(self.waypoints[self.waypoint_index], dtype=np.float64)
+        if self.faulted:
+            return current
+        index = self.waypoint_index
+        previous = np.asarray(self.waypoints[(index - 1) % len(self.waypoints)], dtype=np.float64)
+        phase = (self._tick % self.hold_steps) / self.hold_steps
+        alpha = min(1.0, phase / RAMP_FRACTION)
+        alpha = alpha * alpha * (3.0 - 2.0 * alpha)  # smoothstep: zero velocity at both ends
+        return previous + alpha * (current - previous)
+
+    def jaw_target(self) -> float:
+        """A faulted arm releases: the jaws open, which is what dropped the part."""
+        if self.faulted:
+            return fcfg.GRIPPER_OPEN
+        return float(self.jaw_targets[self.waypoint_index])
 
     def apply(self, data: mujoco.MjData) -> None:
         data.ctrl[self.act_ids] = self.target()
+        data.ctrl[self.jaw_act_ids] = self.jaw_target()
 
     def advance(self) -> None:
         if not self.faulted:
             self._tick += 1
+
+
+class ConveyorBelt:
+    """Friction-drive model of a running belt.
+
+    MuJoCo has no conveyor primitive. Parts resting on the belt are pushed
+    toward the belt velocity with a viscous force; parts the arm has lifted are
+    out of contact and therefore undriven, which falls out of the physics rather
+    than needing a special case. Stopping the line simply stops applying the
+    drive -- the parts then coast to a halt against friction.
+    """
+
+    def __init__(self, model: mujoco.MjModel):
+        self.belt_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, fcfg.BELT_GEOM)
+        assert self.belt_geom >= 0, "conveyor belt geom missing"
+        self.running = True
+
+    def parts_on_belt(self, env) -> set[int]:
+        touching = set()
+        for i in range(env.data.ncon):
+            contact = env.data.contact[i]
+            geoms = {contact.geom1, contact.geom2}
+            if self.belt_geom not in geoms:
+                continue
+            other = (geoms - {self.belt_geom}).pop()
+            body = env.model.geom_bodyid[other]
+            if body in env._part_body_ids:
+                touching.add(int(body))
+        return touching
+
+    def drive(self, env) -> None:
+        env.data.xfrc_applied[:] = 0.0
+        if not self.running:
+            return
+        target_velocity = fcfg.BELT_SPEED * fcfg.BELT_DIRECTION
+        on_belt = self.parts_on_belt(env)
+        for index, body in enumerate(env._part_body_ids):
+            if body not in on_belt:
+                continue
+            dof = env._part_dof_adr[index]
+            velocity_y = float(env.data.qvel[dof + 1])
+            mass = float(env.model.body_mass[body])
+            force = float(
+                np.clip(
+                    fcfg.BELT_DRIVE_GAIN * mass * (target_velocity - velocity_y),
+                    -fcfg.BELT_MAX_DRIVE_N,
+                    fcfg.BELT_MAX_DRIVE_N,
+                )
+            )
+            env.data.xfrc_applied[body, 1] = force
+            # A surface drive acts at the contact patch, not the centre of mass.
+            # Applying it at the COM alone tipped the part and made it hop along
+            # the belt (z wandering 0.809-0.832); the matching torque r x F, with
+            # r the COM-to-underside offset, puts the push back where the belt
+            # actually touches it.
+            env.data.xfrc_applied[body, 3] = env.factory.part_half_size * force
+
+
+class LineState(Enum):
+    """Task-manager states for the line."""
+
+    RUNNING = auto()
+    FAULT_RAISED = auto()   # line stopped, humanoid called, waiting for recovery
+    RECOVERY_VERIFIED = auto()  # part is back; the line is about to restart
+
+
+class FactoryTaskManager:
+    """The signalling layer between the automation and the supervisor.
+
+    Fault  -> stop the belt, stall the faulted arm, raise a call for the G1.
+    Recovery -> judged from the part's MEASURED pose (never a flag the G1 sets),
+                then the line restarts and the arm resumes.
+
+    Recovery cannot happen on its own: no policy in this repository can move the
+    part back. The state machine exists so the loop is closed once one does, and
+    so it can be exercised deliberately in tests.
+    """
+
+    def __init__(self, config: fcfg.FactoryConfig):
+        self.config = config
+        self.reset(0, config.fault.fixed_step)
+
+    def reset(self, fault_station: int, fault_step: int) -> None:
+        self.state = LineState.RUNNING
+        self.fault_station = int(fault_station)
+        self.fault_step = int(fault_step)
+        self.fault_triggered_step: int | None = None
+        self.recovered_step: int | None = None
+        self._recovery_hold = 0
+
+    @property
+    def fault_active(self) -> bool:
+        return self.state is LineState.FAULT_RAISED
+
+    @property
+    def belt_should_run(self) -> bool:
+        return self.state is not LineState.FAULT_RAISED
+
+    @property
+    def target_station(self) -> int:
+        """Which station the G1 is being called to, or -1 when none."""
+        return self.fault_station if self.fault_active else -1
+
+    def recovery_progress(self, env) -> float:
+        return self._recovery_hold / max(1, fcfg.RECOVERY_HOLD_STEPS)
+
+    def update(self, env, step_count: int) -> None:
+        if self.state is LineState.RUNNING:
+            if env.factory.fault.enabled and self.fault_triggered_step is None and step_count >= self.fault_step:
+                env._trigger_fault(self.fault_station)
+                self.state = LineState.FAULT_RAISED
+                self.fault_triggered_step = step_count
+            return
+
+        if self.state is LineState.FAULT_RAISED:
+            if self._part_is_back(env):
+                self._recovery_hold += 1
+                if self._recovery_hold >= fcfg.RECOVERY_HOLD_STEPS:
+                    self.state = LineState.RECOVERY_VERIFIED
+                    self.recovered_step = step_count
+            else:
+                self._recovery_hold = 0
+            return
+
+        if self.state is LineState.RECOVERY_VERIFIED:
+            # Signal back: restart the belt and let the stalled arm resume.
+            env.arms[self.fault_station].faulted = False
+            self.state = LineState.RUNNING
+
+    def _part_is_back(self, env) -> bool:
+        """Measured: the part sits at its pick spot and has stopped moving."""
+        index = self.fault_station
+        pose = env.poses[index]
+        part = env.part_position(index)
+        local = pose.to_local_xy(part[:2])
+        if float(np.linalg.norm(local - np.asarray(fcfg.LOCAL_CANONICAL_PART_XY))) > fcfg.RECOVERY_POSITION_TOLERANCE_M:
+            return False
+        if abs(float(part[2]) - env._part_rest_pos(index, fcfg.LOCAL_CANONICAL_PART_XY)[2]) > 0.05:
+            return False
+        dof = env._part_dof_adr[index]
+        return float(np.abs(env.data.qvel[dof : dof + 6]).max()) < fcfg.RECOVERY_SETTLE_SPEED
 
 
 class NavigationTracker:
@@ -207,6 +379,8 @@ class FactoryEnv(WholeBodyEnv):
         super()._resolve_indices()
         model = self.model
         self.arms = [ScriptedArm(k, model) for k in range(fcfg.N_WORKCELLS)]
+        self.belt = ConveyorBelt(model)
+        self.task_manager = FactoryTaskManager(self.factory)
         self._part_qpos_adr = []
         self._part_dof_adr = []
         self._part_body_ids = []
@@ -226,8 +400,6 @@ class FactoryEnv(WholeBodyEnv):
         # base class's constructor-time reset, before reset() draws a scenario.
         self.fault_workcell = 0
         self.fault_step = int(self.factory.fault.fixed_step)
-        self.fault_active = False
-        self.fault_triggered_step = None
         self.drop_local_xy = np.asarray(fcfg.LOCAL_DROP_ZONE_XY, dtype=float)
 
     # ------------------------------------------------------------------
@@ -278,10 +450,12 @@ class FactoryEnv(WholeBodyEnv):
             arm.reset(phase_offset=k * arm.cycle_length // 3)
             arm.apply(self.data)
             self.data.qpos[arm.qpos_adr] = arm.target()
+            self.data.qpos[arm.jaw_qpos_adr] = arm.jaw_target()
             self._set_part(k, self._part_rest_pos(k, fcfg.LOCAL_CANONICAL_PART_XY))
 
-        self.fault_active = False
-        self.fault_triggered_step: int | None = None
+        self.task_manager.reset(self.fault_workcell, self.fault_step)
+        self.belt.running = True
+        self.data.xfrc_applied[:] = 0.0
         self.navigation = NavigationTracker(self.factory, self.fault_workcell, self.poses)
 
         mujoco.mj_forward(self.model, self.data)
@@ -291,22 +465,28 @@ class FactoryEnv(WholeBodyEnv):
         return obs, info
 
     # ------------------------------------------------------------------
-    def _trigger_fault(self) -> None:
-        """Release the part above the drop zone so it falls and settles under
-        gravity. The release itself is scripted fault injection (the arms are
-        fault-generation devices, not research subjects); the landing is real
-        physics and is measured, not assumed."""
-        index = self.fault_workcell
+    @property
+    def fault_active(self) -> bool:
+        return self.task_manager.fault_active
+
+    @property
+    def line_state(self) -> "LineState":
+        return self.task_manager.state
+
+    def _trigger_fault(self, index: int) -> None:
+        """Pick failure: the arm's jaws open and the part ends up past the stop
+        blade, where the arm's own cycle never reaches. The release point is
+        scripted fault injection (the arms are fault-generation devices, not
+        research subjects); the landing is real physics and is measured."""
         position = self._part_rest_pos(index, self.drop_local_xy)
         position[2] += self.factory.fault.release_height_m
         self._set_part(index, position)
         self.arms[index].faulted = True
-        self.fault_active = True
-        self.fault_triggered_step = self._step_count
 
     def step(self, action: np.ndarray):
-        if self.factory.fault.enabled and not self.fault_active and self._step_count >= self.fault_step:
-            self._trigger_fault()
+        self.task_manager.update(self, self._step_count)
+        self.belt.running = self.task_manager.belt_should_run
+        self.belt.drive(self)
 
         for arm in self.arms:
             arm.apply(self.data)
@@ -387,7 +567,14 @@ class FactoryEnv(WholeBodyEnv):
             target_heading = np.zeros(2)
         pieces.append(
             np.concatenate(
-                [[1.0 if self.fault_active else 0.0], target_onehot, target_part, target_manip, target_heading]
+                [
+                    [1.0 if self.fault_active else 0.0],
+                    target_onehot,
+                    target_part,
+                    target_manip,
+                    target_heading,
+                    [1.0 if self.belt.running else 0.0],
+                ]
             )
         )
         return np.concatenate([base, *pieces]).astype(np.float32)
@@ -399,8 +586,11 @@ class FactoryEnv(WholeBodyEnv):
                 "fault_active": bool(getattr(self, "fault_active", False)),
                 "fault_workcell": int(getattr(self, "fault_workcell", -1)),
                 "fault_step": int(getattr(self, "fault_step", -1)),
-                "fault_triggered_step": getattr(self, "fault_triggered_step", None),
-                "target_workcell": int(self.fault_workcell) if getattr(self, "fault_active", False) else -1,
+                "fault_triggered_step": self.task_manager.fault_triggered_step,
+                "recovered_step": self.task_manager.recovered_step,
+                "line_state": self.task_manager.state.name,
+                "belt_running": bool(self.belt.running),
+                "target_workcell": self.task_manager.target_station,
             }
         )
         if hasattr(self, "arms"):
@@ -408,5 +598,7 @@ class FactoryEnv(WholeBodyEnv):
             info["arm_waypoint"] = [int(a.waypoint_index) for a in self.arms]
             info["arm_faulted"] = [bool(a.faulted) for a in self.arms]
             info["part_position"] = [self.part_position(k) for k in range(fcfg.N_WORKCELLS)]
+            info["jaw_opening"] = [float(self.data.qpos[a.jaw_qpos_adr[0]]) for a in self.arms]
+            info["recovery_progress"] = self.task_manager.recovery_progress(self)
             info["forbidden_contact"] = self._forbidden_contact()
         return info

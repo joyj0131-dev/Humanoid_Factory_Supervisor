@@ -26,52 +26,83 @@ from humanoid_learning.envs import whole_body_config as wbc
 N_WORKCELLS = 2
 
 # ---------------------------------------------------------------------------
-# Workcell-local geometry, in the local frame described in the module docstring
-# (+x = robot heading, +y = robot left, z = world up, origin on the floor at the
-# pelvis stand spot). The table entry is DEFAULT_TABLE_POS verbatim so that a
-# G1 standing at the local origin sees exactly the canonical grasp scene.
+# Conveyor line geometry.
+#
+# One straight conveyor running along world +Y at x = CONVEYOR_CENTRE_X, with
+# two arm stations on it. Both stations face the same way, so the G1 approaches
+# each of them facing world +X exactly as in the canonical fixed-base grasp.
+# That is the point of the straight-line layout: the grasp Expert's world-axis
+# approach offsets stay valid, instead of being wrong by 169 mm as they were
+# under the earlier +-35 degree workcell placement.
+#
+# Belt top sits at 0.75 m, the same working height as the canonical grasp
+# table, so the validated table-height relationship carries over unchanged.
 # ---------------------------------------------------------------------------
-LOCAL_TABLE_POS = tc.DEFAULT_TABLE_POS  # (0.30, 0.0, 0.70)
-LOCAL_TABLE_HALF_SIZE = tc.DEFAULT_TABLE_HALF_SIZE  # (0.15, 0.35, 0.05)
-TABLE_TOP_Z = LOCAL_TABLE_POS[2] + LOCAL_TABLE_HALF_SIZE[2]  # 0.75
+CONVEYOR_CENTRE_X = 2.0
+BELT_HALF_SIZE = (0.25, 2.5, 0.05)  # 0.5 m wide, 5 m long
+BELT_BODY_Z = 0.70
+TABLE_TOP_Z = BELT_BODY_Z + BELT_HALF_SIZE[2]  # 0.75, the belt surface
+BELT_SPEED = 0.25  # m/s while the line is running
+# MuJoCo has no conveyor primitive. The belt is modelled by pushing parts that
+# rest on it toward the belt velocity -- a viscous surface-drive model, not a
+# simulated belt mechanism. Stated so the fidelity is not overread.
+#
+# The gain has to beat the friction holding the part down, not just look
+# plausible: mu*m*g = 1.5 * 0.1 * 9.81 = 1.47 N. A gain of 12 gave 0.3 N and the
+# part simply never moved. The drive is clipped so a part that is briefly
+# pinched or jammed cannot be shoved through anything.
+BELT_DRIVE_GAIN = 200.0
+BELT_MAX_DRIVE_N = 5.0
+BELT_DIRECTION = 1.0  # parts flow toward +Y
 
-# Canonical grasp spot: GraspEnvConfig.object_pos default is (0.27, 0.0).
-LOCAL_CANONICAL_PART_XY = (0.27, 0.0)
-
-# Where the G1 supervises the cell from before stepping in to manipulate.
+# Station-local frame: origin on the floor at the pelvis stand spot, +x = robot
+# heading (world +X), +y = robot left. Identical to the canonical grasp
+# relationship, so both stations are the same scene under a pure translation.
+LOCAL_TABLE_POS = tc.DEFAULT_TABLE_POS  # (0.30, 0.0, 0.70) -> belt centre ahead
+LOCAL_CANONICAL_PART_XY = (0.27, 0.0)  # GraspEnvConfig.object_pos default
 LOCAL_OBSERVATION_XY = (-0.80, 0.0)
+# The arm column stands on the far side of the belt, facing the G1 across it,
+# so the robot and the automation never contend for the same floor space.
+LOCAL_ARM_BASE_XY = (0.85, 0.0)
+# Where the arm sets a finished part down: upstream of the pick spot, so the
+# running belt carries it back and the line forms a real repeating loop.
+LOCAL_OUTFEED_XY = (0.27, -0.32)
 
-# Automation arm column, clear of the table's 0.35 lateral half-width
-# (column radius 0.07 -> its edge sits 0.10 m outside the table edge).
-LOCAL_ARM_BASE_XY = (0.30, 0.55)
+# Physical stop blade just downstream of the pick spot. Real lines index parts
+# against a stop like this; having one means the belt can keep running while a
+# part waits to be picked, with no scripted "hold the part still" logic.
+LOCAL_STOPPER_XY = (0.27, 0.09)
+STOPPER_HALF_SIZE = (0.06, 0.015, 0.05)
 
-# Dropped-part zone: still on the tabletop, laterally offset from the canonical
-# grasp spot. Deliberately NOT on the floor -- floor-level picking needs body
-# lowering and a different grasp topology, neither of which exists yet (see
-# docs/FACTORY_ENVIRONMENT.md). Kept configurable so a floor preset can be
-# evaluated later without another layout change.
-LOCAL_DROP_ZONE_XY = (0.27, 0.08)
+# Dropped-part zone: past the stop blade, where the arm's cycle never reaches.
+# The line stops, and only the G1 can put the part back. Deliberately still ON
+# the belt, not on the floor -- floor-level picking needs body lowering and a
+# different grasp topology, neither of which exists yet.
+LOCAL_DROP_ZONE_XY = (0.27, 0.28)
 DROP_ZONE_JITTER_XY = (0.03, 0.03)
+
+# Recovery is judged on the part's measured pose, never on a flag the G1 sets.
+RECOVERY_POSITION_TOLERANCE_M = 0.06
+RECOVERY_SETTLE_SPEED = 0.02
+RECOVERY_HOLD_STEPS = 50
 
 
 @dataclass(frozen=True)
 class LayoutPreset:
-    """Polar placement of the two workcells around the G1 home pose.
+    """Spacing of the two arm stations along the conveyor.
 
-    ``bearing_deg`` is measured from world +X; workcell 0 sits at -bearing and
-    workcell 1 at +bearing, each facing outward along its own bearing, so the
-    robot must both turn and translate to reach either one.
+    Station 0 sits upstream at -spacing/2 and station 1 downstream at
+    +spacing/2, both facing world +X.
     """
 
     name: str
-    home_to_cell_m: float
-    bearing_deg: float
+    station_spacing_m: float
 
 
 LAYOUT_PRESETS: dict[str, LayoutPreset] = {
-    "short": LayoutPreset("short", 1.5, 35.0),
-    "medium": LayoutPreset("medium", 2.5, 35.0),
-    "long": LayoutPreset("long", 4.0, 35.0),
+    "short": LayoutPreset("short", 1.6),
+    "medium": LayoutPreset("medium", 2.2),
+    "long": LayoutPreset("long", 3.0),
 }
 DEFAULT_LAYOUT = "medium"
 
@@ -105,8 +136,17 @@ class WorkcellPose:
 
     @property
     def table_pos(self) -> np.ndarray:
+        """Belt centre in front of this station (the canonical table position)."""
         xy = self.to_world_xy(LOCAL_TABLE_POS[:2])
         return np.array([xy[0], xy[1], LOCAL_TABLE_POS[2]])
+
+    @property
+    def outfeed_xy(self) -> np.ndarray:
+        return self.to_world_xy(LOCAL_OUTFEED_XY)
+
+    @property
+    def stopper_xy(self) -> np.ndarray:
+        return self.to_world_xy(LOCAL_STOPPER_XY)
 
     @property
     def arm_base_xy(self) -> np.ndarray:
@@ -126,20 +166,18 @@ class WorkcellPose:
 
 
 def workcell_poses(layout: str | LayoutPreset = DEFAULT_LAYOUT) -> list[WorkcellPose]:
+    """Both stations face world +X; only their Y along the belt differs."""
     preset = LAYOUT_PRESETS[layout] if isinstance(layout, str) else layout
-    poses = []
-    for index in range(N_WORKCELLS):
-        # workcell 0 -> -bearing, workcell 1 -> +bearing
-        bearing = math.radians(preset.bearing_deg) * (1.0 if index == 1 else -1.0)
-        distance = preset.home_to_cell_m
-        poses.append(
-            WorkcellPose(
-                index=index,
-                manipulation_xy=(distance * math.cos(bearing), distance * math.sin(bearing)),
-                heading_rad=bearing,
-            )
+    half = preset.station_spacing_m / 2.0
+    pelvis_x = CONVEYOR_CENTRE_X - LOCAL_TABLE_POS[0]
+    return [
+        WorkcellPose(
+            index=index,
+            manipulation_xy=(pelvis_x, -half if index == 0 else +half),
+            heading_rad=0.0,
         )
-    return poses
+        for index in range(N_WORKCELLS)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -148,18 +186,43 @@ def workcell_poses(layout: str | LayoutPreset = DEFAULT_LAYOUT) -> list[Workcell
 # subject (PROJECT_CONTEXT.md "Factory simplicity rule"), but it is driven by
 # real joints and position actuators rather than per-frame geom teleportation.
 # ---------------------------------------------------------------------------
-ARM_JOINT_SUFFIXES = ("base_yaw", "shoulder_pitch", "elbow_pitch")
-# Column top (2 * half height = 1.20 m) must clear the 0.75 m tabletop by more
-# than the arm needs to fold down, and the two link lengths must reach from the
-# column to the table centre: horizontal 0.55, vertical 0.45 -> 0.711 m, inside
-# the 0.75 m total reach. These numbers are checked in scripts/test_factory.py.
+ARM_JOINT_SUFFIXES = ("base_yaw", "shoulder_pitch", "elbow_pitch", "wrist_pitch")
+GRIPPER_JOINT_SUFFIXES = ("jaw_left", "jaw_right")
+
+# Column top (2 * half height = 1.20 m) must clear the 0.75 m belt by more than
+# the arm needs to fold down, and the links must reach from the column across
+# the belt. Checked in scripts/test_factory.py against the compiled model.
 ARM_COLUMN_HALF_HEIGHT = 0.60
 ARM_UPPER_LENGTH = 0.40
 ARM_FORE_LENGTH = 0.35
 ARM_LINK_RADIUS = 0.035
 ARM_TURRET_Z = 2.0 * ARM_COLUMN_HALF_HEIGHT
 
-ARM_JOINT_RANGES = ((-3.1416, 3.1416), (-1.8, 1.8), (-2.4, 2.4))
+# wrist_pitch keeps the gripper pointing straight DOWN whatever the shoulder and
+# elbow are doing, so the jaws descend onto a part from above instead of raking
+# at it sideways. GRIPPER_LENGTH is wrist joint -> jaw centre.
+GRIPPER_LENGTH = 0.10
+# Half-opening per jaw, measured from the jaw body centre. The part is a 0.12 m
+# cube and the jaw is 0.008 m thick, so the jaws first touch at 0.068.
+#
+# Squeeze depth was measured, not guessed. Commanding 0.050 (18 mm of squeeze)
+# drove 9.3 mm of contact penetration, let the part slip 70 mm through the jaws
+# during the lift, and then EJECTED it upward -- the same soft-contact "squirt"
+# failure this project already documented for the Sharpa hand. A light squeeze
+# against a stiff actuator holds far better than a deep one.
+GRIPPER_CONTACT_HALF_OPENING = 0.068
+GRIPPER_OPEN = 0.11
+GRIPPER_CLOSED = 0.058  # 10 mm of squeeze; see the sweep in docs/FACTORY_ENVIRONMENT.md
+GRIPPER_JOINT_RANGE = (0.03, 0.12)
+GRIPPER_JAW_HALF_SIZE = (0.030, 0.008, 0.045)
+GRIPPER_FRICTION = (2.0, 0.02, 0.001)
+# MuJoCo's default contact softness. Stiffening it to (0.002, 1) did cut
+# penetration but needed ~59 N of jaw force to still lift, which is worse.
+GRIPPER_SOLREF = (0.02, 1.0)
+GRIPPER_KP = 1200.0
+GRIPPER_KV = 30.0
+
+ARM_JOINT_RANGES = ((-3.1416, 3.1416), (-1.8, 1.8), (-2.4, 2.4), (-3.1416, 3.1416))
 ARM_KP = 300.0
 ARM_KV = 30.0
 
@@ -188,6 +251,26 @@ def part_geom_name(index: int) -> str:
     return f"wc{index}_part_geom"
 
 
+def table_body_name(index: int) -> str:
+    return "conveyor_belt"
+
+
+def table_geom_name(index: int) -> str:
+    return "conveyor_belt_geom"
+
+
+BELT_BODY = "conveyor_belt"
+BELT_GEOM = "conveyor_belt_geom"
+
+
+def stopper_body_name(index: int) -> str:
+    return f"wc{index}_stopper"
+
+
+def stopper_geom_name(index: int) -> str:
+    return f"wc{index}_stopper_geom"
+
+
 def beacon_body_name(index: int) -> str:
     return f"wc{index}_status_beacon"
 
@@ -200,23 +283,27 @@ BEACON_RUNNING_RGBA = (0.15, 0.85, 0.25, 1.0)
 BEACON_FAULT_RGBA = (0.95, 0.15, 0.10, 1.0)
 
 
-def table_body_name(index: int) -> str:
-    return f"wc{index}_table"
+def arm_polar_from_station_local(local_xy) -> tuple[float, float]:
+    """Convert a station-local (x, y) into the arm's (base_yaw, tip_radius).
+
+    The arm column sits at LOCAL_ARM_BASE_XY facing back across the belt, so its
+    own +x is station-local -x and its +y is station-local -y. Deriving the
+    cycle this way means the waypoints follow the layout instead of being
+    re-tuned by hand whenever the belt or column moves.
+    """
+    dx = float(local_xy[0]) - LOCAL_ARM_BASE_XY[0]
+    dy = float(local_xy[1]) - LOCAL_ARM_BASE_XY[1]
+    x_arm, y_arm = -dx, -dy
+    return math.atan2(y_arm, x_arm), math.hypot(x_arm, y_arm)
 
 
-def table_geom_name(index: int) -> str:
-    return f"wc{index}_table_geom"
+def arm_joint_targets(base_yaw: float, tip_radius: float, tip_z: float) -> tuple[float, float, float, float]:
+    """Closed-form 2-link IK for the wrist position, plus the wrist_pitch that
+    holds the gripper vertical.
 
-
-def arm_joint_targets(base_yaw: float, tip_radius: float, tip_z: float) -> tuple[float, float, float]:
-    """Closed-form 2-link IK for the automation arm, elbow-down solution.
-
-    Waypoints are authored in tip space (how far out and how high the gripper
-    should be) rather than as raw joint angles, so a change to the link lengths
-    or column height cannot silently drive the arm through the tabletop -- the
-    first attempt at this file hard-coded joint angles and did exactly that.
-    ``tip_radius`` is measured horizontally from the turret axis and ``tip_z``
-    in world height.
+    Waypoints are authored in tip space (how far out and how high the wrist
+    should be) rather than as raw joint angles: an early version hard-coded
+    joint angles and drove the arm straight through the work surface.
     """
     l1, l2 = ARM_UPPER_LENGTH, ARM_FORE_LENGTH
     drop = ARM_TURRET_Z - tip_z
@@ -226,42 +313,50 @@ def arm_joint_targets(base_yaw: float, tip_radius: float, tip_z: float) -> tuple
     cos_elbow = (reach * reach - l1 * l1 - l2 * l2) / (2.0 * l1 * l2)
     elbow = math.acos(max(-1.0, min(1.0, cos_elbow)))
     shoulder = math.atan2(drop, tip_radius) - math.atan2(l2 * math.sin(elbow), l1 + l2 * math.cos(elbow))
-    return (base_yaw, shoulder, elbow)
+    # Positive pitch tips a link downward, so the gripper points straight down
+    # when the three pitches sum to +pi/2.
+    wrist = math.pi / 2.0 - (shoulder + elbow)
+    return (base_yaw, shoulder, elbow, wrist)
 
 
-# Scripted normal-production cycle in TIP space: (base_yaw, tip_radius, tip_z).
-# base_yaw 0 points the arm from its column toward the table centre; the table
-# centre sits at tip_radius = 0.55 (LOCAL_ARM_BASE_XY[1]) and the tabletop at
-# z = 0.75.
-#
-# The "down" waypoints must clear the PART, not just the tabletop. Measured
-# geometry (mj_geomDistance against the compiled model, not arithmetic -- two
-# earlier guesses at this number were both wrong):
-#   part rests centred at z = 0.812, half size 0.06  ->  top at 0.872
-#   the forearm is a capsule reaching ARM_LINK_RADIUS*0.85 (~0.030 m) below the
-#   tip, so a tip at z clears the part by roughly (z - 0.90)
-# tip_z = 0.82 gave 98 arm/part contacts and 62 mm of part drift per 800 steps
-# of "normal" production; tip_z = 0.88 was worse (247 contacts, 136 mm). The arm
-# only mimics pick/place, so it must not disturb the part at all.
-# tip_z = 0.95 leaves ~0.05 m of measured clearance.
-ARM_CYCLE_TIP_TARGETS: tuple[tuple[float, float, float], ...] = (
-    (0.00, 0.45, 1.08),  # home, raised
-    (0.00, 0.55, 0.95),  # reach down over the table (pick)
-    (0.00, 0.50, 1.04),  # lift clear
-    (0.60, 0.50, 1.04),  # traverse to the outfeed side
-    (0.60, 0.55, 0.95),  # place
-    (0.00, 0.45, 1.08),  # return home
+# Scripted indexing cycle. Each entry is (station-local xy of the wrist target,
+# wrist height, jaw half-opening). The belt indexes a part into the pick spot,
+# the line pauses, the arm picks and places, and the belt resumes.
+PICK_APPROACH_Z = 1.05
+PART_CENTRE_Z = TABLE_TOP_Z + 0.06 + tc.OBJECT_TABLE_GAP  # 0.812
+GRASP_WRIST_Z = PART_CENTRE_Z + GRIPPER_LENGTH  # wrist height that centres the jaws
+
+# Jaw state is symbolic ("open"/"closed") and resolved at call time, so the
+# open/closed half-openings stay tunable in one place instead of being frozen
+# into this table at import.
+ARM_CYCLE_STEPS: tuple[tuple[tuple[float, float], float, str], ...] = (
+    (LOCAL_CANONICAL_PART_XY, PICK_APPROACH_Z, "open"),    # 0 above the part
+    (LOCAL_CANONICAL_PART_XY, GRASP_WRIST_Z, "open"),      # 1 descend around it
+    (LOCAL_CANONICAL_PART_XY, GRASP_WRIST_Z, "closed"),    # 2 grip
+    (LOCAL_CANONICAL_PART_XY, PICK_APPROACH_Z, "closed"),  # 3 lift
+    (LOCAL_OUTFEED_XY, PICK_APPROACH_Z, "closed"),         # 4 traverse
+    (LOCAL_OUTFEED_XY, GRASP_WRIST_Z, "closed"),           # 5 lower
+    (LOCAL_OUTFEED_XY, GRASP_WRIST_Z, "open"),             # 6 release
+    (LOCAL_OUTFEED_XY, PICK_APPROACH_Z, "open"),           # 7 retract
 )
-
-
-def arm_cycle_waypoints() -> tuple[tuple[float, float, float], ...]:
-    """The scripted cycle as joint targets, derived from the tip targets."""
-    return tuple(arm_joint_targets(*target) for target in ARM_CYCLE_TIP_TARGETS)
 ARM_CYCLE_HOLD_STEPS = 60
 
-# Where in the cycle a faulted arm freezes: the "pick" waypoint, so a stalled
-# arm visibly sits over the table with its part missing.
-ARM_FAULT_WAYPOINT_INDEX = 1
+# Where a faulted arm freezes: just after it should have closed on the part, so
+# a stalled arm sits over the belt with its jaws open and the part not taken.
+ARM_FAULT_WAYPOINT_INDEX = 2
+
+
+def arm_cycle_waypoints() -> tuple[tuple[float, float, float, float], ...]:
+    """The scripted cycle as arm joint targets, derived from the layout."""
+    out = []
+    for local_xy, wrist_z, _jaw in ARM_CYCLE_STEPS:
+        base_yaw, radius = arm_polar_from_station_local(local_xy)
+        out.append(arm_joint_targets(base_yaw, radius, wrist_z))
+    return tuple(out)
+
+
+def arm_cycle_jaw_targets() -> tuple[float, ...]:
+    return tuple(GRIPPER_OPEN if step[2] == "open" else GRIPPER_CLOSED for step in ARM_CYCLE_STEPS)
 
 
 @dataclass
