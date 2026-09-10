@@ -65,7 +65,7 @@ class WholeBodyEnv(gym.Env):
         self.include_object = include_object
         self.render_mode = render_mode
 
-        self.model = model_builder.build_whole_body_model(self.config, include_object=include_object)
+        self.model = self._build_model()
         self.data = mujoco.MjData(self.model)
         self._resolve_indices()
 
@@ -81,6 +81,14 @@ class WholeBodyEnv(gym.Env):
         self.reset(seed=0)
         obs_dim = self._get_obs().shape[0]
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    def _build_model(self) -> mujoco.MjModel:
+        """Subclass hook: FactoryEnv builds the same G1 inside a two-workcell
+        scene. Overriding this is the only model-side change a subclass needs;
+        the action convention, index resolution and step semantics below are
+        then shared rather than reimplemented."""
+        return model_builder.build_whole_body_model(self.config, include_object=self.include_object)
 
     # ------------------------------------------------------------------
     def _resolve_indices(self) -> None:
