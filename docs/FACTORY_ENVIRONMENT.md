@@ -509,3 +509,54 @@ DISPLAY=:0 python3 scripts/view_whole_body.py --weight-shift --no-restart
 Nothing here fakes the result. The Navigation Gate still rejects base
 teleportation, `PlanarDebugEnv` is still labelled a kinematic oracle, and no
 navigation result is claimed.
+
+## Grasping at the station — BLOCKED by the grasp's workspace window
+
+Walking works, but "walk there, then grasp" does not, and the reason is measured.
+
+The walking policy arrives **35-47 mm** from the stand spot. The grasp needs the
+part far closer to its canonical position than that. Sweeping the part offset
+(`scripts/audit_grasp_workspace_window.py`):
+
+| offset from the canonical spot | result |
+| --- | --- |
+| 0 | SUCCESS |
+| −30 mm fore/aft (nearer) | SUCCESS |
+| **+20 mm lateral** | **FAILURE** (OBJECT_MOVED_TOO_MUCH) |
+| ±35 mm lateral | FAILURE (TIMEOUT) |
+| +35 mm fore/aft (further) | FAILURE (CONTACT_LOST) |
+| −50 mm or more (too near) | FAILURE (FORWARD_REACH_NOT_ACHIEVED) |
+
+Usable window: roughly **dx −30…+10 mm, dy −10…+10 mm**. Arrival error is 3-5x
+outside it laterally.
+
+**This is the grasp's limit, not the free base's.** A welded pelvis fails at the
+same offsets, so the stabiliser and the walking are not implicated.
+
+**Why it is so narrow.** The approach targets already follow the object
+(`_mirrored_targets` is object-relative), so this is not a framing bug. The
+Expert's own notes record that a single solve to the approach pose "drove
+waist_pitch to its hard limit ... a real reachability property". The bimanual
+grasp is already operating at the edge of the arm's reachable workspace, so it
+has no lateral slack to spend on positioning error.
+
+**Standing closer does not buy slack** — tested, because it was the obvious
+guess: at −30 mm a lateral 30 mm still fails, and at −50 mm the approach cannot
+be executed at all.
+
+### What this rules out
+
+Loosening the Navigation Gate is the wrong direction: more arrival slack makes
+this worse, not better. Something has to close the 35-47 mm gap:
+
+1. **Widen the grasp's lateral tolerance.** The right kind of work for this
+   project, and squarely in the area it studies. Largest effort.
+2. **Fine positioning after arrival** — translate the pelvis with both feet
+   planted. A first attempt at this collapsed the robot into a squat (pelvis
+   0.79 → 0.59 m): translating the pelvis while keeping it upright and the feet
+   flat needs coordinated hip/knee/ankle, not a two-joint lean.
+3. **Corrective side-steps** — the walking policy can side-step, but with the
+   same ~50 mm precision, so this may not converge.
+
+No option is implemented. Walking and grasping both work; they do not yet
+compose.
