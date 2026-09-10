@@ -69,8 +69,24 @@ cannot share state.
 The scripted cycle is authored in **tip space** (`ARM_CYCLE_TIP_TARGETS`) and
 converted to joint angles by closed-form 2-link IK. This matters: the first
 version hard-coded joint angles and drove the tip 0.43 m *through* the tabletop.
-With the tip-space form the worst clearance over the whole cycle is **+0.070 m**
-and the pick waypoint lands on the table centre in both cells.
+
+The clearance that actually binds is against the **part**, not the tabletop, and
+it took three measurements to get right:
+
+| pick tip z | arm/part contacts per 800 steps | part drift |
+| --- | --- | --- |
+| 0.82 | 98 | 62 mm |
+| 0.88 | 247 | 136 mm |
+| **0.95 (current)** | **0** | **0.000 mm** |
+
+Raising the tip from 0.82 to 0.88 made it *worse*, because the assumed part-top
+height (0.81) was wrong — the part rests centred at 0.812 with half size 0.06, so
+its top is at **0.872**, and the forearm capsule reaches ~0.030 m below the tip.
+`mj_geomDistance` against the compiled model now shows **+48 mm** of minimum
+arm/part clearance over the whole cycle. The arm only *mimics* pick and place: it
+does not physically transport the part, and it must not disturb it.
+`test_arm_cycle_does_not_disturb_the_part` locks both the static clearance and
+the running drift.
 
 Compiled contract: `nq=100, nv=97, nu=79` — 73 G1 actuators (the locked
 G1+Sharpa contract, unchanged) plus 6 automation-arm actuators.
@@ -87,11 +103,11 @@ One exception only, as specified.
   The release itself is scripted fault injection; the landing is real physics
   and is measured.
 - The other cell keeps producing. Measured after a fault: the healthy arm sweeps
-  0.830 rad while the stalled one sweeps 0.008 rad.
+  0.534 rad while the stalled one sweeps 0.007 rad.
 
 Measured settling (seed 0, 600 steps): rest z **0.8097 m** against an expected
-0.8100, `|qvel|max` **0.00000**, contact penetration **0.34 mm**, resting on the
-tabletop at the intended local xy. Not floating, not sunk, not fallen through.
+0.8100, `|qvel|max` **0.00000**, contact penetration **0.34 mm**, resting at the
+intended drop-zone local xy (0.27, 0.08). Not floating, not sunk, not fallen through.
 
 The drop zone is on the **tabletop**, not the floor. Floor-level picking needs
 body lowering, balance under a reaching load, and probably a different grasp

@@ -151,12 +151,15 @@ base frame 재현 1e-6). manipulation pose 간격 2.868m.
 자동화 팔은 실제 joint/position actuator로 구동한다. cycle은 **tip 좌표로
 작성**하고 2-link closed-form IK로 관절각을 만든다 — 처음에 관절각을 직접
 하드코딩했다가 tip이 테이블을 0.43m 관통한 실패를 겪었기 때문이다. 현재 cycle의
-최소 테이블 여유는 +0.070m다.
+최소 테이블 여유는 +0.070m이고, 더 빡빡한 제약인 부품과의 최소 거리는 +48mm다
+(0.82/0.88 tip에서는 각각 98/247회 접촉과 62/136mm 부품 이동이 발생했다 —
+부품 윗면이 0.872m라는 것을 실측하고서야 잡혔다). 팔은 pick/place를 흉내만 내며
+부품을 실제로 옮기지 않고, 건드려서도 안 된다.
 
 Fault는 seed만으로 결정되며, 해당 팔은 pick waypoint에서 정지하고 부품은 drop
 zone 0.05m 위에서 released되어 중력으로 낙하·정착한다(실측 rest z 0.8097m,
 |qvel|max 0.00000, 관통 0.34mm). 반대쪽 셀은 계속 돌아간다(정상 0.830rad vs
-정지 0.008rad).
+정지 0.007rad).
 
 **보행 제어기는 없다.** base는 free로 유지되고 NavigationTracker는 외부에서 준
 궤적을 채점만 한다. step당 base 이동 0.05m 초과는 teleport로 실격 처리하므로

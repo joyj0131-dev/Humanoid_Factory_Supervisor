@@ -232,14 +232,25 @@ def arm_joint_targets(base_yaw: float, tip_radius: float, tip_z: float) -> tuple
 # Scripted normal-production cycle in TIP space: (base_yaw, tip_radius, tip_z).
 # base_yaw 0 points the arm from its column toward the table centre; the table
 # centre sits at tip_radius = 0.55 (LOCAL_ARM_BASE_XY[1]) and the tabletop at
-# z = 0.75, so every "down" waypoint stays a few cm clear of the surface.
+# z = 0.75.
+#
+# The "down" waypoints must clear the PART, not just the tabletop. Measured
+# geometry (mj_geomDistance against the compiled model, not arithmetic -- two
+# earlier guesses at this number were both wrong):
+#   part rests centred at z = 0.812, half size 0.06  ->  top at 0.872
+#   the forearm is a capsule reaching ARM_LINK_RADIUS*0.85 (~0.030 m) below the
+#   tip, so a tip at z clears the part by roughly (z - 0.90)
+# tip_z = 0.82 gave 98 arm/part contacts and 62 mm of part drift per 800 steps
+# of "normal" production; tip_z = 0.88 was worse (247 contacts, 136 mm). The arm
+# only mimics pick/place, so it must not disturb the part at all.
+# tip_z = 0.95 leaves ~0.05 m of measured clearance.
 ARM_CYCLE_TIP_TARGETS: tuple[tuple[float, float, float], ...] = (
-    (0.00, 0.45, 1.05),  # home, raised
-    (0.00, 0.55, 0.82),  # reach down over the table (pick)
-    (0.00, 0.50, 1.00),  # lift clear
-    (0.60, 0.50, 1.00),  # traverse to the outfeed side
-    (0.60, 0.55, 0.82),  # place
-    (0.00, 0.45, 1.05),  # return home
+    (0.00, 0.45, 1.08),  # home, raised
+    (0.00, 0.55, 0.95),  # reach down over the table (pick)
+    (0.00, 0.50, 1.04),  # lift clear
+    (0.60, 0.50, 1.04),  # traverse to the outfeed side
+    (0.60, 0.55, 0.95),  # place
+    (0.00, 0.45, 1.08),  # return home
 )
 
 

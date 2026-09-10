@@ -102,6 +102,68 @@ def test_arm_cycle_never_drives_the_tip_through_the_table():
     print(f"    worst tabletop clearance over the cycle = {worst:+.3f} m; pick tip local = {np.round(pick_local, 3)}")
 
 
+def test_arm_cycle_does_not_disturb_the_part():
+    """The scripted arm only MIMICS pick/place -- it must never touch the part.
+
+    This got the wrong answer twice before it was measured: tip_z = 0.82 gave
+    98 arm/part contacts and 62 mm of part drift per 800 steps, and raising it
+    to 0.88 made it worse (247 contacts, 136 mm), because the part's top is at
+    0.872 rather than the 0.81 that was assumed. Both the static clearance and
+    the running drift are locked here.
+    """
+    config = fcfg.FactoryConfig()
+    model = build_factory_model(config)
+    data = mujoco.MjData(model)
+    mujoco.mj_resetDataKeyframe(model, data, mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "stand"))
+    worst = math.inf
+    for k in range(fcfg.N_WORKCELLS):
+        part_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, fcfg.part_geom_name(k))
+        arm_geoms = [
+            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, fcfg.arm_body_name(k, f"{part}_geom"))
+            for part in ("column", "turret", "upper", "fore")
+        ]
+        adr = [
+            model.jnt_qposadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, fcfg.arm_joint_name(k, s))]
+            for s in fcfg.ARM_JOINT_SUFFIXES
+        ]
+        for waypoint in fcfg.arm_cycle_waypoints():
+            for a, v in zip(adr, waypoint):
+                data.qpos[a] = v
+            mujoco.mj_forward(model, data)
+            worst = min(worst, min(float(mujoco.mj_geomDistance(model, data, g, part_geom, 2.0, None)) for g in arm_geoms))
+    assert worst > 0.02, f"arm passes within {worst * 1000:.1f} mm of the part"
+
+    env = FactoryEnv()
+    try:
+        # Disable the fault so this measures normal production only.
+        env.reset(seed=0, options={"fault_step": 10 ** 9})
+        start = [env.part_position(k).copy() for k in range(fcfg.N_WORKCELLS)]
+        arm_bodies = {
+            mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, fcfg.arm_body_name(k, part))
+            for k in range(fcfg.N_WORKCELLS)
+            for part in ("column", "turret", "upper", "fore")
+        }
+        contacts = 0
+        drift = [0.0] * fcfg.N_WORKCELLS
+        for _ in range(800):
+            env.step(ZERO)
+            for k in range(fcfg.N_WORKCELLS):
+                drift[k] = max(drift[k], float(np.linalg.norm(env.part_position(k)[:2] - start[k][:2])))
+            for c in range(env.data.ncon):
+                bodies = {
+                    env.model.geom_bodyid[env.data.contact[c].geom1],
+                    env.model.geom_bodyid[env.data.contact[c].geom2],
+                }
+                if (bodies & set(env._part_body_ids)) and (bodies & arm_bodies):
+                    contacts += 1
+        assert contacts == 0, f"{contacts} arm/part contacts during normal production"
+        assert max(drift) < 0.002, f"part drifted {max(drift) * 1000:.1f} mm during normal production"
+        print(f"    static clearance {worst * 1000:.1f} mm; 800 steps of production -> "
+              f"{contacts} arm/part contacts, {max(drift) * 1000:.3f} mm drift")
+    finally:
+        env.close()
+
+
 def test_two_arms_move_independently():
     env = FactoryEnv()
     try:
@@ -437,6 +499,7 @@ def main() -> int:
         test_model_compiles_with_two_independent_workcells,
         test_workcell_poses_are_one_rigid_transform_of_the_canonical_scene,
         test_arm_cycle_never_drives_the_tip_through_the_table,
+        test_arm_cycle_does_not_disturb_the_part,
         test_two_arms_move_independently,
         test_seed_reproduces_the_same_scenario_and_physics,
         test_different_seeds_select_both_workcells,
