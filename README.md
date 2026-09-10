@@ -38,6 +38,14 @@ python3 scripts/test_sharpa_bimanual_grasp.py
 OPENBLAS_NUM_THREADS=1 python3 scripts/test_sharpa_grasp_lift.py --seeds 0 1 2
 ```
 
+Phase 5: 몸통을 고정하지 않고 **두 발로 선 채** 잡는 것도 볼 수 있다.
+`--free-base`가 없으면 기존과 동일한 고정 몸통이다.
+
+```bash
+DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --free-base --no-restart
+OPENBLAS_NUM_THREADS=1 MUJOCO_GL=egl python3 scripts/test_free_base_grasp.py
+```
+
 `test_sharpa_grasp_lift.py`는 실제 상승·연속 공중 유지·양손 지지·놓았을 때
 낙하를 검사한다. 기존 bimanual 테스트에는 미달성 엄지 Gate A 및 과거
 실패 상태를 고정한 낡은 assertion들이 남아 있으므로 별도로 보고한다.

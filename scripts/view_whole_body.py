@@ -213,6 +213,7 @@ def mode_grasp(
     object_pos_y: float = 0.0,
     object_size: list[float] | None = None,
     object_yaw_deg: float = 0.0,
+    free_base: bool = False,
 ) -> None:
     from humanoid_learning.envs.grasp_config import GraspEnvConfig
     from humanoid_learning.envs.sharpa_grasp_env import SharpaGraspEnv
@@ -220,6 +221,7 @@ def mode_grasp(
         BimanualGraspState,
         SharpaBimanualGraspExpert,
     )
+    from humanoid_learning.expert.stance_stabilizer import StanceGains, StanceStabilizer
 
     kwargs = {
         "object_pos": (object_pos_x, object_pos_y, 0.0),
@@ -229,16 +231,28 @@ def mode_grasp(
         "sharpa_mount": mount,
         "sharpa_visual_style": visual_style,
         "max_episode_steps": 8000,
+        "fixed_base": not free_base,
     }
     if object_half_size is not None:
         kwargs["object_half_size"] = object_half_size
     if object_size is not None:
         kwargs["object_half_extents"] = tuple(v / 2 for v in object_size)
     env = SharpaGraspEnv(GraspEnvConfig(**kwargs))
+    # Phase 5: with a free base the ankles must reject the arms' reaction
+    # torques or the robot rocks itself over. Gains are the tuned values from
+    # scripts/test_free_base_grasp.py.
+    stabilizer = (
+        StanceStabilizer(env, StanceGains(pitch_kp=1.0, pitch_kd=0.1, roll_kp=0.7, roll_kd=0.07))
+        if free_base
+        else None
+    )
     state = {"expert": SharpaBimanualGraspExpert(env), "terminal": False, "last": None}
     env.reset(seed=0)
     print("Sharpa bilateral contact -> hold -> lift -> 5-second air hold. "
           "Historical thumb-topology Gate A is reported separately.")
+    if free_base:
+        print("  --free-base ON: pelvis is FREE, the G1 balances on its own legs while grasping. "
+              "The ankle stabiliser is active; it is not a walking controller.")
     if show_hand_axes:
         print("  --show-hand-axes ON: red/green/blue=palm local XYZ, yellow=inside normal, "
               "magenta=empirical closing direction, cyan=ulnar-edge-down direction, white=to-object direction")
@@ -253,7 +267,10 @@ def mode_grasp(
         if state["terminal"]:
             return
         expert = state["expert"]
-        env.step(expert.step())
+        action = expert.step()
+        if stabilizer is not None:
+            stabilizer.apply()
+        env.step(action)
         if expert.state != state["last"]:
             print(f"  -> {expert.state.name}, reason={expert.failure_reason}")
             state["last"] = expert.state
@@ -384,6 +401,9 @@ def main() -> None:
     sizes.add_argument("--object-size", type=float, nargs=3, metavar=("X", "Y", "Z"),
                        help="Full box dimensions in metres, not half-extents.")
     parser.add_argument("--object-yaw-deg", type=float, default=0.0)
+    parser.add_argument("--free-base", action="store_true",
+                        help="grasp with the pelvis FREE, balancing on both legs (Phase 5). "
+                             "Without it the pelvis is welded, as in every historical grasp result.")
     parser.add_argument("--no-restart", action="store_true")
     parser.add_argument("--sharpa-mount", choices=["wrist", "flange"], default="wrist")
     parser.add_argument("--sharpa-visual-style", choices=["upstream", "g1"], default="g1")
@@ -404,7 +424,7 @@ def main() -> None:
     elif args.grasp:
         mode_grasp(args.object_pos_x, args.object_half_size, args.no_restart,
                    args.sharpa_mount, args.sharpa_visual_style, args.show_hand_axes, args.fps_log,
-                   args.object_pos_y, args.object_size, args.object_yaw_deg)
+                   args.object_pos_y, args.object_size, args.object_yaw_deg, args.free_base)
     else:
         mode_hand_demo(args.no_restart, args.sharpa_visual_style)
 
