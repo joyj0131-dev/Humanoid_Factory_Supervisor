@@ -34,14 +34,14 @@ RAMP_FRACTION = 0.6
 
 # Observation block appended after WholeBodyEnv's own pieces.
 PER_WORKCELL_OBS = 10
-FACTORY_OBS_DIM = fcfg.N_WORKCELLS * PER_WORKCELL_OBS + 11
+FACTORY_OBS_DIM = fcfg.N_WORKCELLS * PER_WORKCELL_OBS + 19
 
 FACTORY_OBS_LAYOUT = (
     "per workcell k in 0..1: manipulation pose in base frame (x,y), heading error "
     "(cos,sin), part position in base frame (x,y,z), arm cycle phase (cos,sin), "
     "arm fault flag; then: fault_active, target one-hot (2), target part in base "
     "frame (x,y,z), target manipulation pose in base frame (x,y), target heading "
-    "error (cos,sin), belt_running"
+    "error (cos,sin), belt_running; mission state one-hot (4), verification progress, completion requested; active fault type one-hot (drop, misplaced)"
 )
 
 
@@ -78,6 +78,8 @@ class ScriptedArm:
     def reset(self, phase_offset: int = 0) -> None:
         self._tick = int(phase_offset)
         self.faulted = False
+        self.release_override = False
+        self.park_target = None
 
     @property
     def cycle_length(self) -> int:
@@ -85,14 +87,14 @@ class ScriptedArm:
 
     @property
     def waypoint_index(self) -> int:
-        if self.faulted:
+        if self.faulted and self.park_target is None:
             return fcfg.ARM_FAULT_WAYPOINT_INDEX
         return (self._tick // self.hold_steps) % len(self.waypoints)
 
     @property
     def phase(self) -> float:
         """Position in the cycle, 0..1. Frozen while faulted."""
-        if self.faulted:
+        if self.faulted and self.park_target is None:
             return fcfg.ARM_FAULT_WAYPOINT_INDEX / len(self.waypoints)
         return (self._tick % self.cycle_length) / self.cycle_length
 
@@ -105,8 +107,10 @@ class ScriptedArm:
         waypoint at RAMP_FRACTION of the dwell and holds for the remainder, so
         the arm still settles before the next stage begins.
         """
+        if self.park_target is not None:
+            return self.park_target.copy()
         current = np.asarray(self.waypoints[self.waypoint_index], dtype=np.float64)
-        if self.faulted:
+        if self.faulted or self.release_override:
             return current
         index = self.waypoint_index
         previous = np.asarray(self.waypoints[(index - 1) % len(self.waypoints)], dtype=np.float64)
@@ -116,17 +120,21 @@ class ScriptedArm:
         return previous + alpha * (current - previous)
 
     def jaw_target(self) -> float:
-        """A faulted arm releases: the jaws open, which is what dropped the part."""
-        if self.faulted:
+        """Ramp jaw motion with the arm to reduce closure and release impulses."""
+        if self.faulted or self.release_override:
             return fcfg.GRIPPER_OPEN
-        return float(self.jaw_targets[self.waypoint_index])
+        index = self.waypoint_index
+        alpha = min(1.0, (self._tick % self.hold_steps) / (self.hold_steps * RAMP_FRACTION))
+        alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+        previous = self.jaw_targets[(index - 1) % len(self.jaw_targets)]
+        return float(previous + alpha * (self.jaw_targets[index] - previous))
 
     def apply(self, data: mujoco.MjData) -> None:
         data.ctrl[self.act_ids] = self.target()
         data.ctrl[self.jaw_act_ids] = self.jaw_target()
 
     def advance(self) -> None:
-        if not self.faulted:
+        if not self.faulted and not self.release_override:
             self._tick += 1
 
 
@@ -191,6 +199,7 @@ class LineState(Enum):
 
     RUNNING = auto()
     FAULT_RAISED = auto()   # line stopped, humanoid called, waiting for recovery
+    RECOVERING = auto()     # supervisor accepted this station's request
     RECOVERY_VERIFIED = auto()  # part is back; the line is about to restart
 
 
@@ -198,8 +207,8 @@ class FactoryTaskManager:
     """The signalling layer between the automation and the supervisor.
 
     Fault  -> stop the belt, stall the faulted arm, raise a call for the G1.
-    Recovery -> judged from the part's MEASURED pose (never a flag the G1 sets),
-                then the line restarts and the arm resumes.
+    Supervisor accepts the request, performs recovery, then requests verification.
+    The measured part pose must pass before the line and arm resume.
 
     Recovery cannot happen on its own: no policy in this repository can move the
     part back. The state machine exists so the loop is closed once one does, and
@@ -217,14 +226,39 @@ class FactoryTaskManager:
         self.fault_triggered_step: int | None = None
         self.recovered_step: int | None = None
         self._recovery_hold = 0
+        self.completion_requested = False
+        self.events: list[dict[str, Any]] = []
+
+    def _event(self, name: str, step: int) -> None:
+        self.events.append({"step": int(step), "station": self.fault_station, "event": name})
+
+    def signal(self, name: str, station: int, step: int) -> bool:
+        """Explicit supervisor messages; a completion request still needs physics verification.
+
+        This discrete mission command is separate from the 37 motor commands.
+        Record it alongside actions in any future factory demonstration.
+        """
+        if station != self.target_station or station < 0:
+            return False
+        if name == "accept" and self.state is LineState.FAULT_RAISED:
+            self.state = LineState.RECOVERING
+            self._event("request_accepted", step)
+            return True
+        if name == "complete" and self.state is LineState.RECOVERING:
+            if not self.completion_requested:
+                self.completion_requested = True
+                self._recovery_hold = 0
+                self._event("verification_requested", step)
+            return True
+        return False
 
     @property
     def fault_active(self) -> bool:
-        return self.state is LineState.FAULT_RAISED
+        return self.state is not LineState.RUNNING
 
     @property
     def belt_should_run(self) -> bool:
-        return self.state is not LineState.FAULT_RAISED
+        return self.state is LineState.RUNNING
 
     @property
     def target_station(self) -> int:
@@ -237,25 +271,39 @@ class FactoryTaskManager:
     def update(self, env, step_count: int) -> None:
         if self.state is LineState.RUNNING:
             if env.factory.fault.enabled and self.fault_triggered_step is None and step_count >= self.fault_step:
-                env._trigger_fault(self.fault_station)
-                self.state = LineState.FAULT_RAISED
-                self.fault_triggered_step = step_count
+                if env._scenario_update():
+                    env.arms[self.fault_station].faulted = True
+                    self.state = LineState.FAULT_RAISED
+                    self.fault_triggered_step = step_count
+                    self._event("fault_raised", step_count)
             return
 
-        if self.state is LineState.FAULT_RAISED:
-            if self._part_is_back(env):
+        if self.state in (LineState.FAULT_RAISED, LineState.RECOVERING):
+            if self.completion_requested and self._part_is_back(env):
                 self._recovery_hold += 1
                 if self._recovery_hold >= fcfg.RECOVERY_HOLD_STEPS:
                     self.state = LineState.RECOVERY_VERIFIED
                     self.recovered_step = step_count
+                    self._event("recovery_verified", step_count)
             else:
                 self._recovery_hold = 0
             return
 
         if self.state is LineState.RECOVERY_VERIFIED:
+            # Recheck at the restart boundary; verification is not a latch that
+            # permits restart after the part has moved away again.
+            if not self._part_is_back(env):
+                self.state = LineState.RECOVERING
+                self._recovery_hold = 0
+                self.recovered_step = None
+                self._event("verification_lost", step_count)
+                return
             # Signal back: restart the belt and let the stalled arm resume.
-            env.arms[self.fault_station].faulted = False
+            # Start a fresh approach, not the interrupted grip/transfer phase.
+            env.arms[self.fault_station].reset()
             self.state = LineState.RUNNING
+            env.scenario_status = "resolved"
+            self._event("line_restarted", step_count)
 
     def _part_is_back(self, env) -> bool:
         """Measured: the part sits at its pick spot and has stopped moving."""
@@ -266,6 +314,15 @@ class FactoryTaskManager:
         if float(np.linalg.norm(local - np.asarray(fcfg.LOCAL_CANONICAL_PART_XY))) > fcfg.RECOVERY_POSITION_TOLERANCE_M:
             return False
         if abs(float(part[2]) - env._part_rest_pos(index, fcfg.LOCAL_CANONICAL_PART_XY)[2]) > 0.05:
+            return False
+        rotation = env.data.xmat[env._part_body_ids[index]].reshape(3, 3)
+        if rotation[2, 2] < np.cos(0.15):
+            return False
+        yaw = np.arctan2(rotation[1, 0], rotation[0, 0])
+        # A cube's quarter-turns are equivalent for this parallel gripper.
+        if abs((yaw + np.pi / 4) % (np.pi / 2) - np.pi / 4) > 0.15:
+            return False
+        if env._part_body_ids[index] not in env.belt.parts_on_belt(env):
             return False
         dof = env._part_dof_adr[index]
         return float(np.abs(env.data.qvel[dof : dof + 6]).max()) < fcfg.RECOVERY_SETTLE_SPEED
@@ -400,7 +457,9 @@ class FactoryEnv(WholeBodyEnv):
         # base class's constructor-time reset, before reset() draws a scenario.
         self.fault_workcell = 0
         self.fault_step = int(self.factory.fault.fixed_step)
-        self.drop_local_xy = np.asarray(fcfg.LOCAL_DROP_ZONE_XY, dtype=float)
+        self.scenario = self.factory.fault.scenario
+        self.scenario_status = "waiting"
+        self.release_position = None
 
     # ------------------------------------------------------------------
     def _part_rest_pos(self, index: int, local_xy) -> np.ndarray:
@@ -426,6 +485,11 @@ class FactoryEnv(WholeBodyEnv):
         # only on the episode seed, never on how many physics steps have run.
         scenario_rng = np.random.default_rng(0 if seed is None else int(seed))
         fault_cfg = self.factory.fault
+        self.scenario = options.get("scenario", fault_cfg.scenario)
+        if self.scenario not in ("dropped_part", "misplaced_part"):
+            raise ValueError("scenario must be dropped_part or misplaced_part")
+        self.scenario_status = "waiting"
+        self.release_position = None
 
         self.fault_workcell = int(options.get("fault_workcell", scenario_rng.integers(0, fcfg.N_WORKCELLS)))
         if not 0 <= self.fault_workcell < fcfg.N_WORKCELLS:
@@ -437,21 +501,27 @@ class FactoryEnv(WholeBodyEnv):
         else:
             self.fault_step = int(fault_cfg.fixed_step)
 
-        jitter = np.zeros(2)
-        if fault_cfg.randomize_drop_xy:
-            jitter = scenario_rng.uniform(-1.0, 1.0, size=2) * np.asarray(fcfg.DROP_ZONE_JITTER_XY)
-        self.drop_local_xy = np.asarray(fcfg.LOCAL_DROP_ZONE_XY, dtype=float) + jitter
-
         obs, info = super().reset(seed=seed, options=options)
 
         for k, arm in enumerate(self.arms):
             # Offset the two cells so they are visibly out of phase and a test
             # cannot pass by accidentally comparing two synchronised arms.
-            arm.reset(phase_offset=k * arm.cycle_length // 3)
+            offset = k * arm.cycle_length // 3
+            if fault_cfg.enabled and self.fault_step < self.factory.whole_body.max_episode_steps:
+                offset = 0 if k == self.fault_workcell else arm.cycle_length // 3
+            arm.reset(phase_offset=offset)
             arm.apply(self.data)
             self.data.qpos[arm.qpos_adr] = arm.target()
             self.data.qpos[arm.jaw_qpos_adr] = arm.jaw_target()
             self._set_part(k, self._part_rest_pos(k, fcfg.LOCAL_CANONICAL_PART_XY))
+
+        if fault_cfg.enabled and self.scenario == "misplaced_part":
+            k = self.fault_workcell
+            local = np.asarray(fcfg.LOCAL_CANONICAL_PART_XY) + [0., fault_cfg.misplaced_offset_y]
+            self._set_part(k, self._part_rest_pos(k, local))
+            adr = self._part_qpos_adr[k]
+            yaw = fault_cfg.misplaced_yaw_rad
+            self.data.qpos[adr + 3:adr + 7] = [np.cos(yaw / 2), 0., 0., np.sin(yaw / 2)]
 
         self.task_manager.reset(self.fault_workcell, self.fault_step)
         self.belt.running = True
@@ -473,17 +543,53 @@ class FactoryEnv(WholeBodyEnv):
     def line_state(self) -> "LineState":
         return self.task_manager.state
 
-    def _trigger_fault(self, index: int) -> None:
-        """Pick failure: the arm's jaws open and the part ends up past the stop
-        blade, where the arm's own cycle never reaches. The release point is
-        scripted fault injection (the arms are fault-generation devices, not
-        research subjects); the landing is real physics and is measured."""
-        position = self._part_rest_pos(index, self.drop_local_xy)
-        position[2] += self.factory.fault.release_height_m
-        self._set_part(index, position)
-        self.arms[index].faulted = True
+    def _jaw_contacts(self, index: int) -> int:
+        part = self.model.geom(fcfg.part_geom_name(index)).id
+        jaws = {self.model.geom(fcfg.arm_body_name(index, f"{s}_geom")).id
+                for s in fcfg.GRIPPER_JOINT_SUFFIXES}
+        touching = set()
+        for contact in self.data.contact:
+            pair = {contact.geom1, contact.geom2}
+            if part in pair and contact.dist <= 0:
+                touching.update(pair & jaws)
+        return len(touching)
 
-    def step(self, action: np.ndarray):
+    def _scenario_update(self) -> bool:
+        """Inject actuator release, detect the physical outcome; never teleport a part."""
+        k = self.fault_workcell
+        arm = self.arms[k]
+        part = self.part_position(k)
+        contacts = self._jaw_contacts(k)
+        rest_z = fcfg.TABLE_TOP_Z + self.factory.part_half_size
+        if self.scenario == "misplaced_part":
+            missed = (arm.waypoint_index == 3 and contacts == 0
+                      and abs(part[2] - rest_z) < 0.015
+                      and np.linalg.norm(part[:2] - self.poses[k].canonical_part_xy) > 0.10)
+            if missed:
+                self.scenario_status = "pick_failed"
+                arm.park_target = self.data.qpos[arm.qpos_adr].copy()
+            return bool(missed)
+        if self.release_position is None:
+            transfer = np.linalg.norm(part[:2] - self.poses[k].canonical_part_xy)
+            if (arm.waypoint_index == 4 and contacts == 2
+                    and part[2] - rest_z > self.factory.fault.drop_min_lift_m
+                    and transfer > self.factory.fault.drop_min_transfer_m):
+                self.release_position = part.copy()
+                arm.park_target = self.data.qpos[arm.qpos_adr].copy()
+                arm.release_override = True
+                self.scenario_status = "jaws_released"
+            return False
+        fell = (contacts == 0 and self.release_position[2] - part[2]
+                > self.factory.fault.detection_fall_m)
+        if fell:
+            self.scenario_status = "drop_detected"
+        return bool(fell)
+
+    def step(self, action: np.ndarray, *, supervisor_signal: tuple[str, int] | None = None):
+        signal_accepted = None
+        if supervisor_signal is not None:
+            name, station = supervisor_signal
+            signal_accepted = self.task_manager.signal(name, station, self._step_count)
         self.task_manager.update(self, self._step_count)
         self.belt.running = self.task_manager.belt_should_run
         self.belt.drive(self)
@@ -499,6 +605,7 @@ class FactoryEnv(WholeBodyEnv):
             info = self._get_info()
             self._update_navigation(info)
             obs = self._get_obs()
+        info["supervisor_signal_accepted"] = signal_accepted
         return obs, reward, terminated, truncated, info
 
     # ------------------------------------------------------------------
@@ -513,6 +620,9 @@ class FactoryEnv(WholeBodyEnv):
         return False
 
     def _update_navigation(self, info: dict[str, Any]) -> None:
+        # Waiting for a fault must not consume the supervisor's travel budget.
+        if not self.fault_active:
+            return
         pelvis_quat = self.data.xquat[self._pelvis_body_id]
         self.navigation.update(
             base_xy=info["pelvis_pos"][:2],
@@ -577,6 +687,14 @@ class FactoryEnv(WholeBodyEnv):
                 ]
             )
         )
+        mission = np.zeros(4)
+        mission[self.task_manager.state.value - 1] = 1.0
+        pieces.append(np.r_[mission, self.task_manager.recovery_progress(self),
+                            float(self.task_manager.completion_requested)])
+        fault_type = np.zeros(2)
+        if self.fault_active:
+            fault_type[0 if self.scenario == "dropped_part" else 1] = 1.
+        pieces.append(fault_type)
         return np.concatenate([base, *pieces]).astype(np.float32)
 
     def _get_info(self) -> dict[str, Any]:
@@ -591,6 +709,18 @@ class FactoryEnv(WholeBodyEnv):
                 "line_state": self.task_manager.state.name,
                 "belt_running": bool(self.belt.running),
                 "target_workcell": self.task_manager.target_station,
+                "completion_requested": self.task_manager.completion_requested,
+                "scenario": self.scenario,
+                "scenario_status": self.scenario_status,
+                "release_position": None if self.release_position is None else self.release_position.copy(),
+                "mission_events": [dict(event) for event in self.task_manager.events],
+                "recovery_task": None if not self.fault_active else {
+                    "station": self.fault_workcell, "fault_type": self.scenario,
+                    "part_body": fcfg.part_body_name(self.fault_workcell),
+                    "part_position": self.part_position(self.fault_workcell),
+                    "target_position": self._part_rest_pos(self.fault_workcell, fcfg.LOCAL_CANONICAL_PART_XY),
+                    "target_yaw_rad": 0.0, "instruction": "return_part_to_pick_pose",
+                },
             }
         )
         if hasattr(self, "arms"):

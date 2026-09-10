@@ -137,6 +137,9 @@ step당 base 이동 0.05m 초과는 보행이 아니므로 실격. 테스트로 
 
 ```bash
 DISPLAY=:0 python3 scripts/view_factory.py
+DISPLAY=:0 python3 scripts/view_factory.py --scenario dropped_part
+DISPLAY=:0 python3 scripts/view_factory.py --scenario misplaced_part --fault-workcell 0
+DISPLAY=:0 python3 scripts/view_factory.py --no-fault
 OPENBLAS_NUM_THREADS=1 python3 scripts/view_factory.py --offscreen \
   --seed 0 --out results/factory/scene.png --steps 400 --capture 150 400
 OPENBLAS_NUM_THREADS=1 MUJOCO_GL=egl python3 scripts/test_factory.py

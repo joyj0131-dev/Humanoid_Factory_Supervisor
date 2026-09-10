@@ -364,17 +364,18 @@ class FaultConfig:
     """Deterministic Dropped-Part / pick-failure injection."""
 
     enabled: bool = True
+    scenario: str = "dropped_part"  # or misplaced_part
+    misplaced_offset_y: float = 0.24
+    misplaced_yaw_rad: float = 0.30
+    drop_min_lift_m: float = 0.025
+    drop_min_transfer_m: float = 0.10
+    detection_fall_m: float = 0.02
     # Env step at which the chosen workcell faults. Sampled in
     # [min_step, max_step] from the episode seed when randomize_time is on.
     min_step: int = 120
     max_step: int = 360
     randomize_time: bool = False
     fixed_step: int = 200
-    randomize_drop_xy: bool = False
-    # Height above the support surface the part is released from, so it
-    # actually falls and settles under gravity rather than being pasted onto
-    # the surface at its final resting pose.
-    release_height_m: float = 0.05
 
 
 @dataclass

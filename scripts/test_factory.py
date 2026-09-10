@@ -23,6 +23,14 @@ from humanoid_learning.envs.factory_model import build_factory_model
 
 ZERO = np.zeros(ACTION_DIM)
 
+
+def wait_for_fault(env, limit=900):
+    for _ in range(limit):
+        info = env.step(ZERO)[4]
+        if info["fault_active"]:
+            return info
+    raise AssertionError(f"physical fault not detected: {env.scenario_status}")
+
 # The compiled G1+Sharpa actuator contract this project has locked in.
 G1_ACTUATOR_COUNT = 73
 
@@ -219,8 +227,7 @@ def test_belt_stops_on_fault_and_restarts_only_after_verified_recovery():
         healthy = 1 - station
         assert info["line_state"] == "RUNNING" and info["belt_running"]
 
-        while not env.step(ZERO)[4]["fault_active"]:
-            pass
+        wait_for_fault(env)
         _, _, _, _, info = env.step(ZERO)
         assert info["line_state"] == "FAULT_RAISED"
         assert not info["belt_running"], "the line kept running through a fault"
@@ -236,6 +243,18 @@ def test_belt_stops_on_fault_and_restarts_only_after_verified_recovery():
         # --- TEST HARNESS: stand in for the missing recovery policy ---
         env._set_part(station, env._part_rest_pos(station, fcfg.LOCAL_CANONICAL_PART_XY))
         mujoco.mj_forward(env.model, env.data)
+        # Position alone must not restart the line; the supervisor must reply.
+        for _ in range(fcfg.RECOVERY_HOLD_STEPS * 2):
+            info = env.step(ZERO)[4]
+        assert info["line_state"] == "FAULT_RAISED" and not info["belt_running"]
+        info = env.step(ZERO, supervisor_signal=("accept", healthy))[4]
+        assert info["supervisor_signal_accepted"] is False
+        info = env.step(ZERO, supervisor_signal=("complete", station))[4]
+        assert info["supervisor_signal_accepted"] is False
+        info = env.step(ZERO, supervisor_signal=("accept", station))[4]
+        assert info["supervisor_signal_accepted"] is True
+        info = env.step(ZERO, supervisor_signal=("complete", station))[4]
+        assert info["supervisor_signal_accepted"] is True
         for _ in range(fcfg.RECOVERY_HOLD_STEPS * 4):
             _, _, _, _, info = env.step(ZERO)
             if info["line_state"] == "RUNNING":
@@ -245,6 +264,9 @@ def test_belt_stops_on_fault_and_restarts_only_after_verified_recovery():
         assert not any(info["arm_faulted"]), "the stalled arm did not resume"
         assert info["target_workcell"] == -1, "the G1 is still being called after recovery"
         assert info["recovered_step"] is not None
+        assert [e["event"] for e in info["mission_events"]] == [
+            "fault_raised", "request_accepted", "verification_requested",
+            "recovery_verified", "line_restarted"]
         print(f"    fault at step {info['fault_triggered_step']} stopped the line; "
               f"verified recovery at step {info['recovered_step']} restarted belt and arm")
     finally:
@@ -270,13 +292,73 @@ def test_two_arms_move_independently():
         env.close()
 
 
+def test_completion_signal_cannot_fake_recovery_and_reset_clears_messages():
+    env = FactoryEnv()
+    try:
+        env.reset(seed=1, options={"fault_step": 5})
+        for _ in range(5):
+            env.step(ZERO)
+        assert env.navigation.steps == 0
+        info = wait_for_fault(env)
+        station = info["target_workcell"]
+        assert env.navigation.steps == 1
+        env.step(ZERO, supervisor_signal=("accept", station))
+        env.step(ZERO, supervisor_signal=("complete", station))
+        for _ in range(fcfg.RECOVERY_HOLD_STEPS * 2):
+            obs, _, _, _, info = env.step(ZERO)
+        assert info["line_state"] == "RECOVERING" and not info["belt_running"]
+        assert info["recovery_progress"] == 0 and info["recovered_step"] is None
+        assert obs[-3] == 1.0 and obs[-4] == 0.0
+        assert obs[-8:-4].sum() == 1
+        assert len(info["mission_events"]) == 3
+        # Duplicate complete requests must neither duplicate events nor reset progress.
+        env.step(ZERO, supervisor_signal=("complete", station))
+        assert len(env.task_manager.events) == 3
+        env.reset(seed=1)
+        info = env._get_info()
+        assert info["mission_events"] == [] and not info["completion_requested"]
+        assert env.navigation.steps == 0
+    finally:
+        env.close()
+
+
+def test_verification_is_rechecked_before_restart():
+    from humanoid_learning.envs.factory_env import LineState
+    env = FactoryEnv()
+    try:
+        env.reset(seed=0, options={"fault_step": 0})
+        info = wait_for_fault(env)
+        station = info["target_workcell"]
+        manager = env.task_manager
+        manager.signal("accept", station, 1)
+        manager.signal("complete", station, 1)
+        # Test-only restoration; this is not a G1 recovery controller.
+        env._set_part(station, env._part_rest_pos(station, fcfg.LOCAL_CANONICAL_PART_XY))
+        mujoco.mj_forward(env.model, env.data)
+        for _ in range(250):
+            env.step(ZERO)
+            if manager.state is LineState.RECOVERY_VERIFIED:
+                break
+        assert manager.state is LineState.RECOVERY_VERIFIED
+        assert not manager.belt_should_run and manager.target_station == station
+        env._set_part(station, env._part_rest_pos(station, fcfg.LOCAL_DROP_ZONE_XY))
+        mujoco.mj_forward(env.model, env.data)
+        manager.update(env, 100)
+        assert manager.state is LineState.RECOVERING
+        assert not manager.belt_should_run
+        assert manager.recovered_step is None
+        assert manager.events[-1]["event"] == "verification_lost"
+    finally:
+        env.close()
+
+
 def test_seed_reproduces_the_same_scenario_and_physics():
     def rollout(seed):
         env = FactoryEnv()
         try:
             _, info = env.reset(seed=seed)
-            scenario = (info["fault_workcell"], info["fault_step"], tuple(np.round(env.drop_local_xy, 12)))
-            for _ in range(260):
+            scenario = (info["fault_workcell"], info["fault_step"], info["scenario"])
+            for _ in range(600):
                 env.step(ZERO)
             return scenario, env.data.qpos.copy(), env.navigation_result()
         finally:
@@ -309,8 +391,7 @@ def test_fault_stalls_only_its_own_cell():
         _, info = env.reset(seed=0)
         faulted = info["fault_workcell"]
         healthy = 1 - faulted
-        while not env.step(ZERO)[4]["fault_active"]:
-            pass
+        wait_for_fault(env)
         # Let the stalled arm finish parking first: when the fault fires it
         # steps from wherever it was in the cycle to the stall waypoint, and
         # that one-off transient is real motion (~0.6 rad) that would otherwise
@@ -366,7 +447,8 @@ def test_dropped_part_settles_on_a_real_surface():
         assert penetration < 0.005, f"dropped part is sunk into its support by {penetration * 1000:.2f} mm"
 
         local = env.poses[faulted].to_local_xy(part[:2])
-        assert np.allclose(local, env.drop_local_xy, atol=0.02), (local, env.drop_local_xy)
+        assert env.scenario_status == "drop_detected"
+        assert env.release_position[2] - part[2] > env.factory.fault.detection_fall_m
         print(f"    dropped part rest z={part[2]:.4f} (expected {resting_z:.4f}), |qvel|max={velocity:.5f}, "
               f"penetration={penetration * 1000:.2f} mm, local xy={np.round(local, 3)}")
     finally:
@@ -386,8 +468,7 @@ def test_observation_exposes_target_workcell_relative_pose():
         assert block[fcfg.N_WORKCELLS * 10] == 0.0, "fault_active set before the fault"
         assert np.all(block[fcfg.N_WORKCELLS * 10 + 1 : fcfg.N_WORKCELLS * 10 + 3] == 0.0), "target leaked early"
 
-        while not env.step(ZERO)[4]["fault_active"]:
-            pass
+        wait_for_fault(env)
         obs = env._get_obs()
         block = obs[base_dim:]
         target = env.fault_workcell
@@ -423,7 +504,7 @@ def test_reset_clears_fault_and_leaks_no_state():
         _, info = env.reset(seed=0)
         assert not env.fault_active and info["fault_triggered_step"] is None
         assert not any(info["arm_faulted"]), info["arm_faulted"]
-        assert env.navigation.steps == 1, "navigation tracker carried over"
+        assert env.navigation.steps == 0, "waiting must not consume navigation budget"
         for k in range(fcfg.N_WORKCELLS):
             expected = env._part_rest_pos(k, fcfg.LOCAL_CANONICAL_PART_XY)
             np.testing.assert_allclose(env.part_position(k), expected, atol=1e-9)
@@ -581,6 +662,60 @@ def test_straight_line_layout_keeps_the_grasp_experts_world_axis_offsets_valid()
           "are exact (was up to 169 mm wrong under the +-35 deg layout)")
 
 
+def test_two_physical_faults_both_stations_and_recovery():
+    for scenario in ("dropped_part", "misplaced_part"):
+        for station in (0, 1):
+            env = FactoryEnv()
+            try:
+                obs, info = env.reset(seed=station, options={"scenario": scenario, "fault_workcell": station})
+                assert np.all(obs[-2:] == 0), "fault label exposed before detection"
+                setter = env._set_part
+                def forbid_teleport(*args, **kwargs):
+                    raise AssertionError("runtime scenario teleported the part")
+                env._set_part = forbid_teleport
+                info = wait_for_fault(env)
+                assert info["recovery_task"]["fault_type"] == scenario
+                assert info["recovery_task"]["station"] == station
+                assert not info["belt_running"]
+                assert env._get_obs()[-2:].sum() == 1
+                if scenario == "dropped_part":
+                    assert info["scenario_status"] == "drop_detected"
+                    assert info["release_position"][2] > fcfg.TABLE_TOP_Z + .06 + .025
+                    assert env._jaw_contacts(station) == 0
+                else:
+                    assert info["scenario_status"] == "pick_failed"
+                    assert env._jaw_contacts(station) == 0
+                for _ in range(120):
+                    info = env.step(ZERO)[4]
+                assert info["line_state"] == "FAULT_RAISED"
+                # Test harness restores the part; G1 has no recovery controller.
+                env._set_part = setter
+                setter(station, env._part_rest_pos(station, fcfg.LOCAL_CANONICAL_PART_XY))
+                adr = env._part_qpos_adr[station]
+                env.data.qpos[adr + 3:adr + 7] = [np.cos(.15), 0, 0, np.sin(.15)]
+                mujoco.mj_forward(env.model, env.data)
+                env.step(ZERO, supervisor_signal=("accept", station))
+                env.step(ZERO, supervisor_signal=("complete", station))
+                for _ in range(120):
+                    info = env.step(ZERO)[4]
+                assert not info["belt_running"], "misaligned returned part restarted the line"
+                setter(station, env._part_rest_pos(station, fcfg.LOCAL_CANONICAL_PART_XY))
+                mujoco.mj_forward(env.model, env.data)
+                for _ in range(300):
+                    info = env.step(ZERO)[4]
+                    if info["line_state"] == "RUNNING":
+                        break
+                assert info["line_state"] == "RUNNING", (scenario, station, info["recovery_progress"])
+                assert info["belt_running"] and info["recovery_task"] is None
+                assert not any(info["arm_faulted"])
+                assert env.arms[station].park_target is None
+                assert not env.arms[station].release_override
+                print(f"    {scenario} station={station}: fault={info['fault_triggered_step']}, "
+                      f"verified={info['recovered_step']}, restarted (test-harness restoration)")
+            finally:
+                env.close()
+
+
 def main() -> int:
     tests = [
         test_model_compiles_with_one_belt_and_two_independent_stations,
@@ -590,6 +725,9 @@ def main() -> int:
         test_arm_actually_picks_the_part_up_and_places_it,
         test_running_belt_carries_a_part_to_the_stop_blade,
         test_belt_stops_on_fault_and_restarts_only_after_verified_recovery,
+        test_completion_signal_cannot_fake_recovery_and_reset_clears_messages,
+        test_verification_is_rechecked_before_restart,
+        test_two_physical_faults_both_stations_and_recovery,
         test_two_arms_move_independently,
         test_seed_reproduces_the_same_scenario_and_physics,
         test_different_seeds_select_both_workcells,

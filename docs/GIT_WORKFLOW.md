@@ -12,6 +12,7 @@
 | Phase 3 | (누적) | `849e1b0` | `archive/phase3-complete` | 완료 | BC pipeline foundation 스냅샷 |
 | Phase 4 (Dex3) | `b46fe3b` | `bce1dec` | `phase4/dex3-grasp` | 실패로 종료·대체 | Dex3-1(3-finger) fixed-base bimanual grasp 연구 최종 스냅샷 |
 | Phase 4.5 (Sharpa Wave) | `d038c5b` | `69276b3`(최신 controller checkpoint) | `phase4.5/sharpa-wave` | 활성, 미완료 | Sharpa Wave(5-finger) 전환 및 grasp 연구 |
+| Phase 5 (Factory env) | `28c7364` | (진행 중) | `phase5/factory-environment` | 활성, 미완료 | 컨베이어 라인 + scripted 자동화 팔 2대 + 고장 주입 + 복구 신호 |
 | Phase 4.5 single-hand prototype | — | `a0d286d` | `experiment/phase4.5-sharpa-single-hand` | 진단용 보존 | 공식 목표 아님, self-collision-avoidance geometry 참고용 |
 | Phase 4.5 구 rectangular 실험 | `69276b3` 기반 | (폐기) | 없음 | patch만 보관 | 공식 Sharpa 구현으로 대체된 로컬 WIP |
 
@@ -77,8 +78,11 @@ git log --oneline bce1dec..69276b3
    없다면 새 worktree를 만들지 않는다.
 4. Gate 실패 상태를 성공으로 태그하거나 문서화하지 않는다("Stage/Phase
    완료"는 해당 acceptance criteria를 전부 만족했을 때만 사용).
-5. **Phase 5(whole-body 이동, IL/BC/PPO 등)는 Phase 4.5의 Gate
+5. **Phase 5의 whole-body 이동과 IL/BC/PPO는 Phase 4.5의 Gate
    A→B→C→D를 전부 통과하기 전까지 시작하지 않는다.**
+   (2026-09-10, 사용자 지시) Phase 5의 **scripted factory 환경**은 이 gate
+   앞에서 먼저 구축했다. 이 규칙이 막는 대상인 보행/IL/BC/PPO는 시작하지
+   않았고, Phase 4.5의 grasp Gate는 그대로 미통과 상태로 남아 있다.
 6. 공식 브랜치에 병합하기 전 반드시: 회귀 테스트 실행 → 결과 보고 →
    실패 시 수정 → 성공 확인 후에만 다음 단계 진행 (project skill의
    Verification rule과 동일).

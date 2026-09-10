@@ -104,3 +104,4 @@ results/sharpa_lift_verified/
 results/sharpa_workspace/
 results/sharpa_demos/
 results/factory/
+MUJOCO_LOG.TXT

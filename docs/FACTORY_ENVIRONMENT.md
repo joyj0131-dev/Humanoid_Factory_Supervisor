@@ -1,9 +1,24 @@
-# Two-workcell factory environment — 2026-09-10
+# Phase 5 — Scripted factory automation environment
+
+Conveyor line with two automation stations. Last updated 2026-09-10.
+
+**Phase status: active, NOT complete.** The environment, the fault scenarios and
+the recovery signalling are built and tested (21/21). Contact quality is not
+resolved (see the full-cycle audit below), and no recovery skill, walking
+controller or IL/PPO work has started -- those are Phase 6 and later.
+
+> Sequencing note, recorded so it is not mistaken for an oversight:
+> `docs/GIT_WORKFLOW.md` rule 5 says Phase 5 does not begin until Phase 4.5's
+> Gate A→D all pass, and Gate A (thumb opposition) still does not. The user
+> directed this environment work explicitly. What that rule guards -- whole-body
+> locomotion and IL/BC/PPO -- has **not** been started here; only the scripted
+> factory scene the later phases will need. Phase 4.5's grasp gates are
+> unchanged and still open.
 
 ## What this is
 
 The environment the future supervisor data will live in: a floating-base
-G1 + Sharpa standing between **two separated automation cells**, each with its
+G1 + Sharpa beside **one conveyor with two stations**, each with its
 own scripted arm and its own part. One cell can fail while the other keeps
 producing, and which one fails is decided by the episode seed alone.
 
@@ -67,6 +82,9 @@ part off the line during the rotation to the outfeed.
 
 ### Three real bugs found here, all by measurement
 
+The values in this historical tuning section cover the original experiments.
+The full-cycle audit below supersedes them for current contact-quality claims.
+
 **1. The arm jammed against its own column.** MuJoCo's `filterparent` does not
 exclude an arm link from its column, because the column has no joint and is
 therefore welded to the world -- the pair reads as link-vs-world, which
@@ -107,7 +125,77 @@ Transport is functional but jerky: a part travels the 0.32 m from outfeed back t
 the stop blade in about 3 s, with velocity fluctuating over roughly 0 to 0.3 m/s.
 This is a viscous surface-drive approximation, not a simulated belt mechanism.
 
+### Current full-cycle contact audit and smoother jaws
+
+Jaw targets now follow smoothstep over 60% of each dwell, like the arm joints,
+instead of changing instantaneously. No mass, friction, contact stiffness,
+actuator strength or collision mask changed. Measured over 960 steps (two
+cycles), seed 0, both stations reached the outfeed:
+
+| metric | previous step jaws | smooth jaws |
+| --- | --- | --- |
+| station 0 peak jaw/part force | 54.42 N | 45.26 N |
+| station 1 peak jaw/part force | 66.14 N | 53.83 N |
+| station 0 peak penetration | 47.80 mm | 43.31 mm |
+| station 1 peak penetration | 48.85 mm | 46.25 mm |
+
+These are samples after every environment step across ALL phases, not substep
+maxima or hold-only values. The old approximately 10 mm figure is not a bound
+over production cycles. Contact quality remains poor despite lower force;
+outfeed reach does not establish reliable production or clean grasping.
+Higher-priority stiffer contact candidates reduced penetration to 13–17 mm but
+raised peak force to 85–97 N and were rejected. Belt jerk is unchanged.
+
+Reproduce the comparison (each prints JSON):
+
+```bash
+OPENBLAS_NUM_THREADS=1 python3 scripts/audit_factory_grip.py --step-jaws
+OPENBLAS_NUM_THREADS=1 python3 scripts/audit_factory_grip.py
+```
+
 ## Line loop and the Dropped-Part fault
+
+### Two factory-only scenarios (current)
+
+The user explicitly selected two environment scenarios before any humanoid
+controller work. Recovery skill training remains separate and has not started.
+
+- `dropped_part`: wait for both jaws to contact the selected part, measured lift
+  above 25 mm and transfer over 100 mm; hold the arm and open its jaws. Raise a
+  fault only after jaw contacts disappear and the part falls over 20 mm.
+  No runtime object qpos/velocity rewrite is used. It lands on the conveyor.
+- `misplaced_part`: at reset place the selected part 240 mm downstream of the
+  pick pose with yaw 0.30 rad. The belt transports it normally. After the arm's
+  nominal grip attempt, a supported part over 100 mm from the pick position and
+  zero jaw contacts triggers `pick_failed`. This is initial scene placement,
+  not runtime teleportation. It tests combined position/yaw error, not every
+  possible yaw-only failure.
+
+`fault_step` is the earliest eligible detection/injection step, not a promise
+that the fault occurs at that exact time. If a physical prerequisite is not met,
+the scenario stays waiting rather than fabricating an event. Reset aligns the
+selected station with the beginning of its cycle, with the other station offset.
+
+`info['recovery_task']` contains station, fault_type, part_body, actual position,
+target position and target yaw. Both request returning the part to its nominal
+pick pose. Recovery checks position, orientation (cube quarter-turn symmetry),
+belt support and settled velocity before restart. The faulted arm restarts a
+fresh approach cycle instead of resuming the interrupted grip command.
+
+Both scenarios × both stations passed physical detection and the task-manager
+recovery loop. Test code restores the part and sends the handshake; **G1 does
+not perform that restoration**. Tests prohibit `_set_part` during scenario
+execution and reject a returned-but-still-rotated part. A large-angle/no-contact
+pick miss is detected; arbitrary real-world fault detection is not claimed.
+
+```bash
+DISPLAY=:0 python3 scripts/view_factory.py --scenario dropped_part
+DISPLAY=:0 python3 scripts/view_factory.py --scenario misplaced_part --fault-workcell 0
+DISPLAY=:0 python3 scripts/view_factory.py --no-fault
+```
+
+The following loop description applies to both faults. Older references to
+placing a part above a preselected drop zone are superseded by physical release.
 
 A **physical stop blade** just downstream of each pick spot indexes parts, so
 the belt can keep running while a part waits. Normal production is a real closed
@@ -117,24 +205,29 @@ running belt carries it back against the blade.
 The task manager (`FactoryTaskManager`) is the signalling layer:
 
 ```
-RUNNING  --fault-->  FAULT_RAISED            RECOVERY_VERIFIED --> RUNNING
-                     belt STOPPED             belt + arm restart
-                     arm stalled
-                     G1 called (target set)
+RUNNING -> FAULT_RAISED -> RECOVERING -> RECOVERY_VERIFIED -> RUNNING
+           request         accept +      measured pose       restart
+           line stopped    complete      stable 0.5 s
 ```
 
 - The episode seed alone picks which station fails and when.
-- On fault the arm's jaws open, the part ends up past the stop blade where the
-  arm's own cycle never reaches, **the belt stops** (line stop), and the target
+- On measured fault **the belt stops** (line stop), and the target
   station is published to the observation.
+- The supervisor must accept the correct station's request, then submit a
+  completion request. Position alone and a completion request alone cannot restart.
 - Recovery is judged from the part's **measured pose** -- back at the pick spot,
-  settled, held for 0.5 s -- never from a flag the robot sets.
+  settled, held for 0.5 s after completion was requested. It is checked again at
+  the restart boundary; the belt stays stopped throughout verification.
 - Only then does the manager signal back: belt restarts and the stalled arm
   resumes.
 
-Measured (seed 0): fault at step 200 stopped the line; the line did **not**
-restart on its own through 150 further steps; after the part was restored the
-manager verified and restarted belt and arm at step 464.
+The earlier automatic pose-only restart has been replaced by the explicit
+handshake. `env.step(action, supervisor_signal=("accept", station))` accepts a
+request; `("complete", station)` requests verification. Incorrect stations and
+out-of-order messages return `info["supervisor_signal_accepted"]=False`.
+`info["mission_events"]` records request, acceptance, verification and restart.
+These messages belong in future factory demos alongside the motor commands;
+the 37 motor commands alone do not describe the full mission.
 
 **Recovery cannot happen on its own.** No policy here can walk to a station and
 move a part. In tests the restoration is done by the test harness and is labelled
@@ -146,8 +239,8 @@ Action is the existing **37-dim whole-body** command (legs 12, waist 3, arms 14,
 Sharpa groups 8) — real G1 actuator commands. There is no action that writes the
 base pose.
 
-Observation is `WholeBodyEnv`'s own 83 dims plus a **31-dim factory block**
-(114 total):
+Observation is `WholeBodyEnv`'s own 83 dims plus a **39-dim factory block**
+(122 total, revised factory schema):
 
 - per cell (×2, 10 each): manipulation pose in base frame (x, y), heading error
   (cos, sin), part position in base frame (x, y, z), arm cycle phase (cos, sin),
@@ -155,6 +248,8 @@ Observation is `WholeBodyEnv`'s own 83 dims plus a **31-dim factory block**
 - then: `fault_active`, target one-hot (2), target part in base frame (x, y, z),
   target manipulation pose in base frame (x, y), target heading error (cos, sin),
   `belt_running`
+- mission state one-hot (4), verification progress, completion-request flag (6)
+- detected fault type one-hot (2), all zero before detection
 
 Before the fault fires the target one-hot and target block are all zero, so the
 answer cannot be read early.
@@ -182,6 +277,11 @@ cannot be relaxed later to manufacture a pass:
 robot. Tests confirm it rejects a one-shot base jump, a wrong-cell detour and a
 fall, and only scores a gradual kinematic oracle — which is labelled an oracle,
 not locomotion, and must never be reported as a walking result.
+
+The environment starts navigation timing only when a fault is raised. Waiting
+for production to fail does not consume the travel budget. The displacement
+check detects large jumps; it cannot prove that a smooth trajectory is physical
+walking (a gradual kinematic oracle also satisfies it).
 
 ## Transfer status
 
@@ -224,3 +324,11 @@ OPENBLAS_NUM_THREADS=1 MUJOCO_GL=egl python3 scripts/test_factory.py
 ```
 
 Renders go to `results/factory/`, which is git-ignored.
+
+The viewer now shows a live status panel, station phases, target and verification
+progress. Green beacons mean production; red means a pending request; amber
+means accepted recovery/verification. SPACE pauses, R resets, 0 shows the whole
+line, and 1/2 focus a station. A accepts the current request and C requests
+verification: these are explicitly manual task-manager inputs, not G1 recovery.
+Neither key moves any part. At episode end the scene remains visible until R.
+Offscreen PNGs include the same status panel.

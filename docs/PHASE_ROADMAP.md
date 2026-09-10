@@ -11,7 +11,7 @@
 | 3 | 완료 | 50-demo dataset, BC pipeline, evaluation smoke test |
 | 4 | 미완료 | Whole-body G1 foundation과 grasp/lift 검증 |
 | 4.5 | 활성·미완료 | Sharpa Wave fixed-base bimanual grasp Gate A→D |
-| 5 | 미착수 | Scripted Factory Automation Environment |
+| 5 | 활성·미완료 | Scripted Factory Automation Environment — 컨베이어+팔2대+고장2종+복구 신호 구축, 접촉 품질 미해결 ([문서](FACTORY_ENVIRONMENT.md)) |
 | 6 | 미착수 | Recovery #1 Dropped Part expert |
 | 7 | 미착수 | Recovery #1 demonstrations + BC |
 | 8 | 미착수 | Recovery #1 evaluation + PPO fine-tuning |

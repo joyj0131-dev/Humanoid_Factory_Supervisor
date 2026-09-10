@@ -23,8 +23,17 @@ import os
 from pathlib import Path
 import sys
 import time
+from queue import SimpleQueue
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+# envs package imports MuJoCo while loading factory_config. Select the backend
+# before that import, not later in main(), when the GL backend is already cached.
+if "--offscreen" in sys.argv:
+    os.environ["MUJOCO_GL"] = "egl"
+else:
+    os.environ.setdefault("__NV_PRIME_RENDER_OFFLOAD", "1")
+    os.environ.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
 
 import numpy as np
 
@@ -77,13 +86,33 @@ def _update_beacons(env) -> None:
         gid = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_GEOM, fcfg.beacon_geom_name(k))
         if gid >= 0:
             env.model.geom_rgba[gid] = (
-                fcfg.BEACON_FAULT_RGBA if arm.faulted else fcfg.BEACON_RUNNING_RGBA
+                (1.0, 0.65, 0.05, 1.0) if arm.faulted and env.line_state.name != "FAULT_RAISED"
+                else fcfg.BEACON_FAULT_RGBA if arm.faulted else fcfg.BEACON_RUNNING_RGBA
             )
+
+
+def _panel(env, info, paused=False) -> tuple[str, str]:
+    target = info["target_workcell"]
+    labels = ["FACTORY SUPERVISOR", "Simulation", "Line", "Belt", "Request",
+              "Verification", "G1", "Station 0", "Station 1", "Controls", "Manual signals"]
+    values = [f"t={env.data.time:.1f}s", "PAUSED" if paused else "RUNNING",
+              info["line_state"], "ON" if info["belt_running"] else "STOPPED",
+              "none" if target < 0 else f"Station {target}",
+              f"{info['recovery_progress']:.0%}", "standing / walking not implemented",
+              *[f"{'FAULT' if info['arm_faulted'][k] else 'CYCLE'} / phase {info['arm_waypoint'][k]}"
+                for k in range(2)], "SPACE pause | R reset | 0/1/2 cameras",
+              "A accept | C request verification (no physical recovery)"]
+    if info["mission_events"]:
+        labels.append("Last event")
+        values.append(info["mission_events"][-1]["event"])
+    labels.extend(["Scenario", "Detection"])
+    values.extend([info["scenario"], info["scenario_status"]])
+    return "\n".join(labels), "\n".join(values)
 
 
 def run_offscreen(env, args) -> None:
     import mujoco
-    from PIL import Image
+    from PIL import Image, ImageDraw
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -99,7 +128,13 @@ def run_offscreen(env, args) -> None:
             with mujoco.Renderer(env.model, height=720, width=1280) as renderer:
                 renderer.update_scene(env.data, camera)
                 path = out if len(args.capture) == 1 else out.with_name(f"{out.stem}_{step + 1:04d}{out.suffix}")
-                Image.fromarray(renderer.render()).save(path)
+                frame = Image.fromarray(renderer.render())
+                draw = ImageDraw.Draw(frame)
+                labels, values = _panel(env, info)
+                draw.rectangle((8, 8, 675, 240), fill=(20, 24, 30))
+                draw.multiline_text((16, 16), labels, fill="white", spacing=3)
+                draw.multiline_text((160, 16), values, fill="white", spacing=3)
+                frame.save(path)
                 print(f"step {step + 1:5d}  {_describe(env, info)}  -> {path}")
     if not shots:
         print("no frames captured; check --capture against --steps")
@@ -111,26 +146,57 @@ def run_interactive(env, args) -> None:
     _, info = env.reset(seed=args.seed, options=_reset_options(args))
     zero = np.zeros(env.action_space.shape[0], dtype=np.float32)
     print(f"Factory viewer: layout={env.factory.layout}, seed={args.seed}, "
-          f"fault scheduled for station {env.fault_workcell} at step {env.fault_step}.")
-    print("Beacon green = producing, red = faulted. A fault stops the belt until the part is back.")
+          f"scenario={env.scenario}, station={env.fault_workcell}, eligible after step {env.fault_step}.")
+    print("Green = producing, red = requested, amber = recovery/verification.")
+    print("SPACE pause | R reset | 0 overview | 1/2 station camera | A accept | C verify.")
+    print("A/C are manual task-manager messages only: they do not move G1 or restore the part.")
     print("The G1 stands (no walking controller exists). Close the viewer to exit.")
     target_dt = env.model.opt.timestep * env.config.frame_skip
-    with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
+    keys = SimpleQueue()
+    with mujoco.viewer.launch_passive(env.model, env.data, key_callback=keys.put) as viewer:
         viewer.cam.lookat[:] = _camera_lookat(env.factory)
         viewer.cam.distance = CAMERA_DISTANCE
         viewer.cam.azimuth = CAMERA_AZIMUTH
         viewer.cam.elevation = CAMERA_ELEVATION
-        announced = False
+        paused = False
+        finished = False
+        event_count = 0
         while viewer.is_running():
             started = time.time()
-            _, _, _, truncated, info = env.step(zero)
-            _update_beacons(env)
-            if info["fault_active"] and not announced:
-                announced = True
-                print(f"  step {info['step_count']:5d}  FAULT injected -> {_describe(env, info)}")
-            if truncated:
-                env.reset(seed=args.seed, options=_reset_options(args))
-                announced = False
+            signal = None
+            while not keys.empty():
+                key = keys.get()
+                if key == 32 and not finished:
+                    paused = not paused
+                elif key == ord("R"):
+                    _, info = env.reset(seed=args.seed, options=_reset_options(args))
+                    paused = finished = False
+                    event_count = 0
+                    signal = None
+                elif key in (ord("A"), ord("C")):
+                    signal = ("accept" if key == ord("A") else "complete", info["target_workcell"])
+                elif key in (ord("0"), ord("1"), ord("2")):
+                    with viewer.lock():
+                        if key == ord("0"):
+                            viewer.cam.lookat[:] = _camera_lookat(env.factory)
+                            viewer.cam.distance = CAMERA_DISTANCE
+                        else:
+                            pose = env.poses[key - ord("1")]
+                            viewer.cam.lookat[:] = [*pose.canonical_part_xy, 0.95]
+                            viewer.cam.distance = 2.3
+            if not paused:
+                _, _, terminated, truncated, info = env.step(zero, supervisor_signal=signal)
+                if signal is not None:
+                    print(f"Manual signal {signal}: accepted={info['supervisor_signal_accepted']}")
+                if terminated or truncated:
+                    paused = finished = True
+                    print("Episode finished; scene retained. Press R to reset.")
+            for event in info["mission_events"][event_count:]:
+                print(f"  step {event['step']:5d} station {event['station']}: {event['event']}")
+            event_count = len(info["mission_events"])
+            with viewer.lock():
+                _update_beacons(env)
+            viewer.set_texts((None, None, *_panel(env, info, paused)))
             viewer.sync()
             remaining = target_dt - (time.time() - started)
             if remaining > 0:
@@ -138,7 +204,7 @@ def run_interactive(env, args) -> None:
 
 
 def _reset_options(args) -> dict:
-    options = {}
+    options = {"scenario": args.scenario}
     if args.fault_workcell is not None:
         options["fault_workcell"] = args.fault_workcell
     if args.fault_step is not None:
@@ -150,9 +216,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--layout", choices=sorted(fcfg.LAYOUT_PRESETS), default=fcfg.DEFAULT_LAYOUT)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--scenario", choices=["dropped_part", "misplaced_part"],
+                        default="dropped_part")
+    parser.add_argument("--no-fault", action="store_true", help="normal production only")
     parser.add_argument("--fault-workcell", type=int, choices=range(fcfg.N_WORKCELLS), default=None,
                         help="override the seed's choice of which cell fails")
-    parser.add_argument("--fault-step", type=int, default=None)
+    parser.add_argument("--fault-step", type=int, default=None,
+                        help="earliest eligible step; fault requires the physical event")
     parser.add_argument("--offscreen", action="store_true", help="render PNGs instead of opening a window")
     parser.add_argument("--out", default="results/factory/factory.png")
     parser.add_argument("--steps", type=int, default=400)
@@ -174,7 +244,9 @@ def main() -> None:
 
     from humanoid_learning.envs.factory_env import FactoryEnv
 
-    env = FactoryEnv(fcfg.FactoryConfig(layout=args.layout))
+    config = fcfg.FactoryConfig(layout=args.layout)
+    config.fault.enabled = not args.no_fault
+    env = FactoryEnv(config)
     try:
         (run_offscreen if args.offscreen else run_interactive)(env, args)
     finally:
