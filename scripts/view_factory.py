@@ -174,7 +174,9 @@ def run_interactive(env, args) -> None:
     print("Green = producing, red = requested, amber = recovery/verification.")
     print("SPACE pause | R reset | 0 overview | 1/2 station camera | A accept | C verify.")
     print("A/C are manual task-manager messages only: they do not move G1 or restore the part.")
-    print("The G1 stands (no walking controller exists). Close the viewer to exit.")
+    if args.walk_to is None:
+        print("The G1 stands still; pass --walk-to 0 or --walk-to 1 to make it walk there.")
+    print("Close the viewer to exit.")
     target_dt = env.model.opt.timestep * env.config.frame_skip
     keys = SimpleQueue()
     with mujoco.viewer.launch_passive(env.model, env.data, key_callback=keys.put) as viewer:
@@ -185,6 +187,8 @@ def run_interactive(env, args) -> None:
         paused = False
         finished = False
         event_count = 0
+        bundle = _make_walker(env, args.walk_to) if args.walk_to is not None else None
+        walk_announced: dict = {}
         while viewer.is_running():
             started = time.time()
             signal = None
@@ -197,6 +201,10 @@ def run_interactive(env, args) -> None:
                     paused = finished = False
                     event_count = 0
                     signal = None
+                    # Rebuild the walker: reset restored the stand pose, and the
+                    # old one still holds the previous run's leg targets.
+                    bundle = _make_walker(env, args.walk_to) if args.walk_to is not None else None
+                    walk_announced = {}
                 elif key in (ord("A"), ord("C")):
                     signal = ("accept" if key == ord("A") else "complete", info["target_workcell"])
                 elif key in (ord("0"), ord("1"), ord("2")):
@@ -209,6 +217,8 @@ def run_interactive(env, args) -> None:
                             viewer.cam.lookat[:] = [*pose.canonical_part_xy, 0.95]
                             viewer.cam.distance = 2.3
             if not paused:
+                if bundle is not None:
+                    _drive_walker(env, bundle, walk_announced)
                 _, _, terminated, truncated, info = env.step(zero, supervisor_signal=signal)
                 if signal is not None:
                     print(f"Manual signal {signal}: accepted={info['supervisor_signal_accepted']}")
@@ -220,7 +230,7 @@ def run_interactive(env, args) -> None:
             event_count = len(info["mission_events"])
             with viewer.lock():
                 _update_beacons(env)
-            viewer.set_texts((None, None, *_panel(env, info, paused)))
+            viewer.set_texts((None, None, *_panel(env, info, paused, walk=bundle)))
             viewer.sync()
             remaining = target_dt - (time.time() - started)
             if remaining > 0:
@@ -260,6 +270,11 @@ def _reset_options(args) -> dict:
     options = {"scenario": args.scenario}
     if args.fault_workcell is not None:
         options["fault_workcell"] = args.fault_workcell
+    elif getattr(args, "walk_to", None) is not None:
+        # "--walk-to 0" means "go deal with station 0", so fault that station.
+        # Otherwise the seed may fault the other one and the Navigation Gate
+        # would score the walk against a station the robot was never sent to.
+        options["fault_workcell"] = args.walk_to
     if args.fault_step is not None:
         options["fault_step"] = args.fault_step
     return options
