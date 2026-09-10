@@ -92,6 +92,27 @@ class NavigationGains:
     # oscillating around the target.
     slowdown_radius_m: float = 0.5
     min_speed_fraction: float = 0.25
+    # A zero forward command does NOT hold position: this policy walks BACKWARD
+    # at 0.039 m/s when told to stand. Measured command -> achieved velocity on
+    # this robot: 0.00 -> -0.0392, 0.02 -> -0.0217, 0.05 -> +0.0034,
+    # 0.12 -> +0.0602, 0.25 -> +0.1648. The zero crossing is at about 0.047, so
+    # that much command is simply the price of standing still in x.
+    #
+    # Without compensating it, the forward command shrinks to zero as the goal is
+    # approached, the backward drift takes over, and the robot stalls 39-84 mm
+    # short -- which is exactly the fore/aft gap that keeps the block outside the
+    # grasp window.
+    forward_command_bias: float = 0.047
+    # Even with that bias the closed loop settles SHORT of its goal, and does so
+    # very repeatably: measured +49.7/+47.6 mm at the two stations, and still
+    # +37/+36 mm when the near-goal speed floor is raised to 0.6 (raising it
+    # further makes it worse again). So this is a systematic offset of the
+    # policy-plus-navigator loop, not noise or gait granularity -- the ripple
+    # around the stall point is only about +-5 mm.
+    #
+    # Compensating it by shifting the goal forward was tried and reverted; see
+    # WalkToPose.__init__.
+    fore_stall_compensation_m: float = 0.0
     # Once inside this band, stop commanding motion and let the policy simply
     # stand. Without it the robot reaches the pose, holds, then walks itself
     # back out -- it met the gate's 1 s hold but did not settle, which is no use
@@ -284,11 +305,17 @@ class WalkToPose:
         self.gains = gains or NavigationGains()
         self.integral = np.zeros(2)
         self.arrived = False
+        # A goal shifted forward by the measured stall was tried and reverted: it
+        # interacts with the distance-based arrival latch, which then fires at a
+        # different point on the approach. Station 1's lateral error went from
+        # +7 to +36 mm. Compensating the stall needs the arrival criterion fixed
+        # first, not a shifted target bolted onto the existing one.
+        self.commanded_goal_xy = self.goal_xy
 
     def command(self) -> np.ndarray:
         g = self.gains
         position, yaw = self.walker.base_pose()
-        error_world = self.goal_xy - position
+        error_world = self.commanded_goal_xy - position
         cos, sin = np.cos(-yaw), np.sin(-yaw)
         error = np.array([
             cos * error_world[0] - sin * error_world[1],
@@ -313,8 +340,12 @@ class WalkToPose:
         if distance < g.integral_radius_m:
             self.integral = np.clip(self.integral + error * 0.02, -g.integral_clamp, g.integral_clamp)
         speed = g.max_linear * min(1.0, max(g.min_speed_fraction, distance / g.slowdown_radius_m))
+        # Bias first, then clip: the bias is what "hold still" costs, so the
+        # controller's own output rides on top of it rather than being eaten by
+        # it.
+        forward = g.kp_linear * error[0] + g.ki_linear * self.integral[0] + g.forward_command_bias
         return np.array([
-            float(np.clip(g.kp_linear * error[0] + g.ki_linear * self.integral[0], -speed, speed)),
+            float(np.clip(forward, -speed, speed)),
             float(np.clip(g.kp_linear * error[1] + g.ki_linear * self.integral[1], -speed, speed)),
             float(np.clip(g.kp_yaw * yaw_error, -g.max_yaw, g.max_yaw)),
         ])

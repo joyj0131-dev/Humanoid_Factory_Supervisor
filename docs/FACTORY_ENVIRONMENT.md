@@ -610,3 +610,57 @@ this worse, not better. Something has to close the 35-47 mm gap:
 
 No option is implemented. Walking and grasping both work; they do not yet
 compose.
+
+## (a) Fore/aft precision — characterised, NOT solved
+
+Attempted the precise final approach that would put the block inside the grasp
+window. It is not solved. What was measured:
+
+**The window is never entered.** Tracing the approach with latching disabled,
+the fore/aft error bottoms out at +83.9 mm (station 0) and +38.6 mm (station 1)
+against a +10 mm upper bound. Zero ticks out of 1600 land inside the window, so
+opportunistic latching cannot work either.
+
+**A zero velocity command does not hold position.** Measured command versus
+achieved forward velocity on this robot:
+
+| commanded vx | achieved m/s |
+| --- | --- |
+| 0.00 | **−0.0392** (walks backward) |
+| 0.02 | −0.0217 |
+| 0.05 | +0.0034 |
+| 0.08 | +0.0275 |
+| 0.12 | +0.0602 |
+| 0.25 | +0.1648 |
+| 0.35 | +0.1722 (saturating) |
+
+The zero crossing is at about **0.047**: that much command is simply the price of
+standing still. As the goal is approached the command shrinks toward zero, the
+backward drift takes over, and the robot stalls short. `forward_command_bias`
+now compensates it, though near the goal the command is pinned at the speed
+floor so the bias is currently inert there.
+
+**The stall is systematic, not gait noise.** It sits at +49.7/+47.6 mm with only
+about ±5 mm of ripple, and raising the near-goal speed floor moves it to
++37/+36 mm before getting worse again at a floor of 1.0.
+
+| near-goal speed floor | station 0 | station 1 |
+| --- | --- | --- |
+| 0.25 (default) | +49.7 mm | +47.6 mm |
+| 0.40 | +42.9 mm | +40.9 mm |
+| 0.60 | +37.4 mm | +36.2 mm |
+| 1.00 | +36.6 mm | +45.4 mm |
+
+**What was tried and reverted.** Shifting the goal forward by the measured stall
+looked obvious given how repeatable it is, but it fires the distance-based
+arrival latch at a different point on the approach: station 1's lateral error
+went from +7 mm to +36 mm. Compensating the stall needs the arrival criterion
+reworked first, not a shifted target bolted onto the existing one. Likewise a
+per-axis arrival test was reverted earlier because this controller cannot meet
+it and then never latches at all.
+
+**Where this leaves it.** Roughly 36-50 mm of fore/aft has to come from
+somewhere other than the current walk-and-latch loop. The three candidates are
+a redesigned final-approach phase with its own arrival criterion, a non-stepping
+fine adjustment, or letting the grasp absorb a further +40 mm (it currently
+fails at +35 mm). Walking itself is unaffected and still passes 5/5.
