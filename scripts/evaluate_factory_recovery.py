@@ -24,6 +24,7 @@ def main():
     parser.add_argument('--max-steps', type=int, default=12000)
     parser.add_argument('--squeeze', type=float, default=0.006)
     parser.add_argument('--forward-bias', type=float, default=-0.08)
+    parser.add_argument('--motion-profile', choices=('baseline', 'compact', 'direct'), default='baseline')
     parser.add_argument('--out', default='results/factory/recovery.json')
     parser.add_argument('--render', action='store_true')
     args = parser.parse_args()
@@ -32,16 +33,20 @@ def main():
         env.reset(seed=args.seed, options={'fault_workcell': args.station, 'scenario': args.scenario})
         recovery = FactoryRecovery(env, RecoveryConfig(stand_off_m=args.stand_off, max_steps=args.max_steps,
                                                        hold_squeeze_m=args.squeeze,
+                                                       motion_profile=args.motion_profile,
                                                        forward_command_bias=args.forward_bias))
         peak_step = 0.0
         previous = env.data.qpos[:3].copy()
         last_state = None
+        phase_events = []
         for step in range(args.max_steps):
             info = recovery.step()
             peak_step = max(peak_step, float(np.linalg.norm(env.data.qpos[:3] - previous)))
             previous = env.data.qpos[:3].copy()
             state = (recovery.state, getattr(getattr(recovery, 'expert', None), 'state', None))
             if state != last_state:
+                phase_events.append({'step': step, 'phase': recovery.state,
+                                     'grasp_state': state[1].name if state[1] is not None else None})
                 print(step, *state, 'base', np.round(previous, 4), flush=True)
                 last_state = state
             if recovery.state in recovery.TERMINAL:
@@ -58,6 +63,8 @@ def main():
             'forbidden_contact_pairs': recovery.forbidden_contact_pairs,
             'collision_free_lift_success': recovery.state == 'LIFTED' and recovery.forbidden_contact_ticks == 0,
             'events': recovery.events, 'config': vars(recovery.config),
+            'phase_events': phase_events,
+            'used_direct_approach': recovery.used_direct_approach,
         }
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)

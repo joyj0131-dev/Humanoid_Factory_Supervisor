@@ -21,6 +21,7 @@ from humanoid_learning.expert.stance_stabilizer import StanceGains, StanceStabil
 
 @dataclass
 class RecoveryConfig:
+    motion_profile: str = 'baseline'
     stand_off_m: float = 0.27
     arrival_radius_m: float = 0.03
     settle_steps: int = 200
@@ -79,6 +80,9 @@ class FactoryRecovery:
 
     def __init__(self, env, config: RecoveryConfig | None = None):
         self.env, self.config = env, config or RecoveryConfig()
+        self.used_direct_approach = None
+        if self.config.motion_profile not in ('baseline', 'compact', 'direct'):
+            raise ValueError('motion_profile must be baseline, compact or direct')
         gain, bias = env.model.actuator_gainprm.copy(), env.model.actuator_biasprm.copy()
         self._original_gain, self._original_bias = gain, bias
         self._original_noslip = env.model.opt.noslip_iterations
@@ -188,6 +192,13 @@ class FactoryRecovery:
                 self.expert.config.palm_first_closure = self.config.palm_first_closure
                 self.expert.config.hold_squeeze_m = self.config.hold_squeeze_m
                 self.expert.config.contact_settle_grace_seconds = self.config.contact_settle_grace_seconds
+                if self.config.motion_profile == 'compact':
+                    self.expert.resume_prepared_approach()
+                elif self.config.motion_profile == 'direct':
+                    # From the pose walking left the arms in, straight at the
+                    # block. Falls back to the full entry if the arms are not
+                    # settled, and that fallback is recorded rather than hidden.
+                    self.used_direct_approach = self.expert.begin_direct_approach()
                 self._transition('GRASP')
         elif self.state == 'GRASP':
             action = self.expert.step()

@@ -3,6 +3,7 @@
 from pathlib import Path
 import sys
 from unittest.mock import patch
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -13,7 +14,37 @@ from humanoid_learning.envs.factory_env import FactoryEnv
 from humanoid_learning.envs import factory_config as fc
 from humanoid_learning.expert.factory_recovery import FactoryRecovery
 from humanoid_learning.expert.sharpa_contact_lift import SharpaContactLift
-from humanoid_learning.expert.sharpa_bimanual_grasp_expert import BimanualGraspConfig
+from humanoid_learning.expert.sharpa_bimanual_grasp_expert import (
+    BimanualGraspConfig, BimanualGraspState, SharpaBimanualGraspExpert,
+)
+
+
+def test_prepared_resume_guard_without_physics_writes():
+    # Synthetic state tests the transition guard only, not physical reachability.
+    expert = object.__new__(SharpaBimanualGraspExpert)
+    expert.config = BimanualGraspConfig()
+    target = np.r_[expert._clearance_arm_vector('left'),
+                   expert._clearance_arm_vector('right')]
+    data = SimpleNamespace(qpos=target.copy(), qvel=np.zeros(17))
+    expert.env = SimpleNamespace(
+        data=data, _waist_target=np.zeros(3), _arm_qpos_adr=np.arange(14),
+        _arm_dof_adr=np.arange(14), _waist_dof_adr=np.arange(14, 17),
+        _torso_arm_collision_force=lambda: 0., _hand_hand_contact_force=lambda: 0.)
+    before = data.qpos.copy()
+    with patch.object(expert, '_advance') as advance:
+        assert expert.resume_prepared_approach()
+        advance.assert_called_once_with(BimanualGraspState.FOREARM_FORWARD_REACH)
+        np.testing.assert_array_equal(data.qpos, before)
+        advance.reset_mock()
+        data.qvel[0] = 0.1
+        assert not expert.resume_prepared_approach()
+        data.qvel[0] = 0.
+        data.qpos[0] += 1.
+        assert not expert.resume_prepared_approach()
+        data.qpos[:] = before
+        expert.env._torso_arm_collision_force = lambda: 100.
+        assert not expert.resume_prepared_approach()
+        advance.assert_not_called()
 
 
 def test_shared_view_is_read_only_at_construction():

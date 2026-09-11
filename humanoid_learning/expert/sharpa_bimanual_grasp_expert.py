@@ -1335,6 +1335,89 @@ class SharpaBimanualGraspExpert:
             require_orientation=require_orientation, ori_task_weight=ori_task_weight, **kwargs,
         )
 
+    def resume_prepared_approach(self) -> bool:
+        """Reuse a physically settled clearance pose after walking, if valid.
+
+        This skips only the repeated start/clearance motion, not approach or
+        contact gates. A different/unsettled pose retains the normal entry.
+        """
+        target = np.r_[self.env._waist_target,
+                       self._clearance_arm_vector('left'), self._clearance_arm_vector('right')]
+        error = np.max(np.abs(self.env.data.qpos[self.env._arm_qpos_adr] - target[3:]))
+        velocity = np.max(np.abs(self.env.data.qvel[np.r_[self.env._arm_dof_adr,
+                                                         self.env._waist_dof_adr]]))
+        if (error > self.config.clearance_joint_tol_rad or velocity >= 0.05
+                or self.env._torso_arm_collision_force() > self.config.hand_hand_force_limit_n
+                or self.env._hand_hand_contact_force() > self.config.hand_hand_force_limit_n):
+            return False
+        self._clearance_target = target.copy()
+        self._arm_ik_target = target[3:].copy()
+        self._advance(BimanualGraspState.FOREARM_FORWARD_REACH)
+        return True
+
+    def begin_direct_approach(self) -> bool:
+        """Go to the object from wherever the arms are now, skipping the spread.
+
+        The baseline reaches the object through ARM_LATERAL_CLEARANCE (palms
+        driven 920 mm apart, up from 470 mm standing, for a 120 mm block) and
+        then FOREARM_FORWARD_REACH, which swings that width back in. After
+        walking, the arms are already parked in the clearance pose, so the
+        factory pipeline pays for that spread twice.
+
+        WRIST_SIDE_GRASP_ALIGN already does what is actually wanted: it reads the
+        MEASURED palm poses as its start, targets an object-relative side-grasp
+        pose, and waypoints position and orientation together while ramping
+        finger curl -- its own docstring records that reorienting at a fixed
+        position self-collides but reorienting while translating does not. So a
+        direct approach is that state entered from the current pose, with the
+        preshape opened up front so the hand is shaping during the move rather
+        than in a separate stop.
+
+        Returns False and leaves the state machine alone if the arms are still
+        moving or already in collision, so a bad starting pose is never treated
+        as "ready". Physics is not written here.
+        """
+        arm_qpos = self.env.data.qpos[self.env._arm_qpos_adr].copy()
+        velocity = np.max(np.abs(self.env.data.qvel[np.r_[self.env._arm_dof_adr,
+                                                          self.env._waist_dof_adr]]))
+        if (velocity >= 0.05
+                or self.env._torso_arm_collision_force() > self.config.hand_hand_force_limit_n
+                or self.env._hand_hand_contact_force() > self.config.hand_hand_force_limit_n):
+            return False
+        # Seed the IK from the measured pose, not from the previous state's
+        # ideal target, so the first action is not a jump.
+        self._arm_ik_target = arm_qpos
+        self._clearance_target = np.r_[self.env._waist_target, arm_qpos]
+        # The align path is LONGER here than in the baseline, which enters it
+        # from the post-forward-reach pose. Keeping the stock waypoint count
+        # makes each interpolation step bigger, and the align then finishes
+        # loose: measured at station 1, palms ended 9 mm wider (+-0.265 vs
+        # +-0.256 from the object) with the approach axes splayed further out
+        # (0.471 vs 0.435), and the lift lost contact. Scale the waypoints with
+        # the actual path length so the per-step motion stays the size the state
+        # was tuned for -- the same lesson FOREARM_FORWARD_REACH already records.
+        start = {side: self.env.palm_pose(side)[0].copy() for side in SIDES}
+        goal = self._mirrored_targets(self.config.approach_standoff_m,
+                                      self.config.approach_height_m,
+                                      self.config.approach_y_offset_m)
+        travel = max(float(np.linalg.norm(goal[side] - start[side])) for side in SIDES)
+        self._direct_align_travel_m = travel
+        stock_travel = 0.18  # measured baseline align path, post-forward-reach
+        scale = max(1.0, travel / stock_travel)
+        self.config.side_align_waypoints = int(round(self.config.side_align_waypoints * scale))
+        # The state budget has to grow with the waypoints or the align is cut
+        # off mid-path (measured: SIDE_GRASP_ALIGN_NOT_ACHIEVED at both
+        # stations). This is budgeting for a genuinely longer path at the same
+        # tracking speed, not relaxing a gate -- the align's own convergence
+        # test is unchanged, and the extra ticks are verified to be spent
+        # advancing waypoints rather than stalled.
+        self.config.side_align_max_steps = int(round(self.config.side_align_max_steps * scale)) + 120
+        # Open the hands now: shaping happens during the reach, not as a pause.
+        self.env.set_preshape("left", 1.0)
+        self.env.set_preshape("right", 1.0)
+        self._advance(BimanualGraspState.WRIST_SIDE_GRASP_ALIGN)
+        return True
+
     def _clearance_arm_vector(self, side: str) -> np.ndarray:
         """[Session 41] ARM_LATERAL_CLEARANCE's per-side 7-dim joint
         target, in task_config.py's LEFT/RIGHT_ARM_JOINTS order

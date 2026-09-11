@@ -31,6 +31,63 @@ these episodes for imitation learning. Place/verification/restart is not built;
 the task remains RECOVERING after lifting. The misplaced scenario is not verified
 for this new controller. Default `--walk-to` navigation is unchanged.
 
+## Approach posture: direct instead of a clearance spread (2026-09-11)
+
+The baseline reached the block through `ARM_LATERAL_CLEARANCE`, which drives the
+palms **920 mm apart** (up from 470 mm standing) to grasp a **120 mm** block, and
+then `FOREARM_FORWARD_REACH`, which swings that width back in. The factory
+pipeline paid for it **twice**: once before walking, and again because the GRASP
+phase constructed a fresh expert that restarted from `STABLE_START`. Measured at
+station 0, arrival at step 1188 was followed by 412 ticks of re-preparation
+before the object-relative align even began.
+
+`--recovery-motion direct` enters `WRIST_SIDE_GRASP_ALIGN` straight from the
+pose walking left the arms in. That state was already the right machinery: it
+reads the **measured** palm poses as its start, targets an object-relative
+side-grasp pose, and waypoints position and orientation together while ramping
+finger curl. Its own docstring records that reorienting at a fixed position
+self-collides while reorienting *during* translation does not. The preshape is
+opened up front so the hand shapes during the reach rather than in a separate
+stop.
+
+| station 1 layout, seed 0 | baseline st0 | direct st0 | baseline st1 | direct st1 |
+| --- | --- | --- | --- | --- |
+| Functional lift | PASS | PASS | PASS | PASS |
+| Episode steps | 5359 | **5179** | 5672 | **5292** |
+| Max vertical clearance | 67.69 mm | **79.92 mm** | 59.96 mm | **73.08 mm** |
+| Airborne bilateral support | 5.00 s | 5.00 s | 5.00 s | 5.00 s |
+| Clearance-spread entries | 2 | **1** | 2 | **1** |
+| Arrival to first contact | 2383 | 2357 | 2508 | 2357 |
+| Max hand/object penetration | 4.88 mm | 5.31 mm | 5.02 mm | 6.19 mm |
+| Forbidden-body contact ticks | 838 | 938 | 823 | 840 |
+| Fell | no | no | no | no |
+
+Lift height improved by 12-13 mm at both stations and the 5 s hold is unchanged
+-- the success criterion was **not** relaxed to buy speed. Contact quality moved
+the wrong way slightly (penetration +0.4/+1.2 mm, forbidden ticks +100 at
+station 0); that is on top of an already-unapproved contact baseline, not a new
+clean result.
+
+### What it took to work on both stations
+
+The first direct attempt lifted at station 0 but lost contact during the lift at
+station 1. Measured cause, not guessed: the align finished **loose**, leaving
+the palms 9 mm wider (±0.265 vs ±0.256 from the object) with the approach axes
+splayed further out (0.471 vs 0.435). The direct align path is **0.362 m**
+against the baseline's ~0.18 m, so the stock 14 waypoints made each
+interpolation step twice as large. Scaling the waypoints with the measured path
+length (to 28) and the align's step budget with it fixes both stations. The
+align's own convergence test is unchanged.
+
+`--recovery-motion baseline` still runs the original path and is kept as the
+comparison point. `compact`, the earlier experiment that only skipped the
+duplicated preparation, is also still selectable.
+
+**The pre-walk spread is NOT removed.** `PREPARE_HANDS` still opens the arms
+before walking, and the walking gait bias was tuned for that raised-hand pose,
+so narrowing it needs walking re-verification. Only the second, post-arrival
+spread is gone.
+
 ## Run
 
 ```bash

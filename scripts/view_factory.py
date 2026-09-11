@@ -144,6 +144,12 @@ def run_offscreen(env, args) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     _, info = env.reset(seed=args.seed, options=_reset_options(args))
     camera = _camera(env.factory)
+    if getattr(args, "camera", "overview") != "overview":
+        # Same framing the interactive 1/2 keys use, so before/after close-ups
+        # are comparable with what the window shows.
+        pose = env.poses[int(args.camera[-1])]
+        camera.lookat[:] = [*pose.canonical_part_xy, 0.95]
+        camera.distance = 2.3
     zero = np.zeros(env.action_space.shape[0], dtype=np.float32)
     bundle = _make_walker(env, args.walk_to) if args.walk_to is not None else None
     recovery = _make_recovery(env, args)
@@ -266,7 +272,9 @@ def _make_recovery(env, args):
     if not getattr(args, 'recover', False):
         return None
     from humanoid_learning.expert.factory_recovery import FactoryRecovery, RecoveryConfig
-    return FactoryRecovery(env, RecoveryConfig(stand_off_m=getattr(args, 'recovery_stand_off', 0.27)))
+    return FactoryRecovery(env, RecoveryConfig(
+        stand_off_m=getattr(args, 'recovery_stand_off', 0.27),
+        motion_profile=getattr(args, 'recovery_motion', 'baseline')))
 
 
 def _make_walker(env, station: int):
@@ -331,9 +339,13 @@ def main() -> None:
     parser.add_argument('--recover', action='store_true',
                         help='experimental live fault-to-lift controller; does not yet place/restart')
     parser.add_argument('--recovery-stand-off', type=float, default=0.27)
+    parser.add_argument('--recovery-motion', choices=('baseline', 'compact', 'direct'), default='direct',
+                        help='compact reuses settled arm preparation; direct reaches the block from the current arm pose with no clearance spread')
     parser.add_argument("--offscreen", action="store_true", help="render PNGs instead of opening a window")
     parser.add_argument("--out", default="results/factory/factory.png")
     parser.add_argument("--steps", type=int, default=400)
+    parser.add_argument("--camera", choices=("overview", "station0", "station1"), default="overview",
+                        help="offscreen viewpoint; the station cameras match the interactive 1/2 keys")
     parser.add_argument("--capture", type=int, nargs="+", default=[150, 400],
                         help="steps at which to save a frame in --offscreen mode")
     args = parser.parse_args()
