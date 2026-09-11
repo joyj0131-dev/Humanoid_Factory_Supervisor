@@ -531,6 +531,7 @@ class BimanualGraspConfig:
     # closing code, just by not over-squeezing with the arm. See
     # PROJECT_CONTEXT.md for the full sweep table.
     hold_squeeze_m: float = 0.003
+    contact_settle_grace_seconds: float = 0.5
     enveloping_acquire_min_seconds: float = 3.0
     enveloping_acquire_support_seconds: float = 0.3
     lift_speed_m_s: float = 0.01
@@ -1001,6 +1002,9 @@ class BimanualGraspConfig:
     # 0.00N immediately after) pass as "palm contacted" and start curling
     # before the palm was really resting against the object.
     palm_press_stable_ticks: int = 15
+    # A corner-first factory grasp may acquire finger support before the palm
+    # plate. This changes acquisition order, never contact/success measurements.
+    palm_first_closure: bool = True
     target_force_band_n: tuple[float, float] = (1.0, 6.0)
     force_settle_hold_steps: int = 10
     tabletop_hold_seconds: float = 2.0
@@ -1903,7 +1907,9 @@ class SharpaBimanualGraspExpert:
         if not np.isfinite(self.env.data.qpos).all() or not np.isfinite(self.env.data.qvel).all():
             self._fail(BimanualFailureReason.NUMERICAL_ERROR)
             return action
-        if self._lost_support_steps > sim_time_to_steps(self.env, 0.5):
+        loss_timeout = (cfg.contact_settle_grace_seconds
+                        if self.state == BimanualGraspState.FORCE_SETTLE else 0.5)
+        if self._lost_support_steps > sim_time_to_steps(self.env, loss_timeout):
             self._fail(BimanualFailureReason.CONTACT_LOST)
             return action
         if self.state == BimanualGraspState.ENVELOPING_CLOSE:
@@ -2864,7 +2870,7 @@ class SharpaBimanualGraspExpert:
             for side in SIDES:
                 for group in ("index", "middle", "wrap"):
                     touched = self._group_contact_now(side, group)
-                    if self._palm_ever_contacted[side] and not touched:
+                    if (self._palm_ever_contacted[side] or not cfg.palm_first_closure) and not touched:
                         deltas[side][group] = cfg.close_rate_per_step
             action[17:25] = self._group_action(deltas)
 

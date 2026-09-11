@@ -22,10 +22,16 @@ scripts/view_whole_body.py
        └─ SharpaHandDemo + SharpaGraspEnv
 
 scripts/view_factory.py
-  └─ FactoryEnv (37 action, 113 observation, floating base)
-       ├─ factory_model.build_factory_model (G1 + 2 workcells)
-       ├─ ScriptedArm x2 (3-DoF, real position actuators)
-       └─ NavigationTracker (scores a trajectory; never moves the robot)
+  └─ FactoryEnv (37 action, 122 observation, floating base)
+       ├─ factory_model.build_factory_model (G1 + conveyor + 2 stations)
+       ├─ ScriptedArm x2 (4-DoF + two-jaw gripper)
+       ├─ NavigationTracker (nominal station gate)
+       ├─ --walk-to: G1WalkPolicy + WalkToPose (existing navigation)
+       └─ --recover: FactoryRecovery
+            ├─ fault -> prepare hands clear of the rail
+            ├─ G1WalkPolicy + actual-part PrecisionApproach
+            ├─ measured leg-target handoff + ankle feedback
+            └─ shared-model/data SharpaGraspEnv -> grasp expert -> physical lift
 ```
 
 `model_builder.py`는 bare `assets/robots/g1/g1.xml`에 Sharpa를
@@ -45,9 +51,10 @@ pre-hand-equipped base가 남기던 손목당 0.202839kg의 ghost hand mass도
 - Demo replay(schema 1): `SharpaGraspCommand` = action 25 + preshape 목표 16 +
   `noslip_iterations`. 이는 기존 action/observation 계약을 바꾸지 않고,
   action 밖에서 나가던 보조 명령을 명시적으로 포함시킨 것이다.
-- Factory supervisor: action 37(whole-body와 동일), observation 113
-  = WholeBodyEnv 83 + factory block 30. compiled `nq=100`, `nv=97`,
-  `nu=79`(= G1 73 + 자동화 팔 6). G1 73 계약은 불변이다.
+- Factory supervisor: action 37, observation 122 = WholeBodyEnv 83 + factory 39.
+  compiled `nq=106`, `nv=103`, `nu=85`(G1 73 + 자동화 팔/그리퍼 12).
+- Recovery supervisor 내부에서는 다리 목표와 grasp 25-dim/부가 손 명령을 함께
+  구동한다. 이 복합 명령의 공장 데모 기록·재생/학습 인터페이스는 아직 미검증이다.
 
 ## Source ownership
 
@@ -65,6 +72,9 @@ pre-hand-equipped base가 남기던 손목당 0.202839kg의 ghost hand mass도
 - `data/sharpa_demo.py`: 기록/재생과 Expert flag를 보지 않는 `PhysicalMonitor`
 - `expert/sharpa_bimanual_grasp_expert.py`: 공식 양손 controller
 - `expert/sharpa_contact_lift.py`: 실제 양손 지지 및 물체-table 간격 기반 hold/lift
+- `expert/factory_recovery.py`: 보행/파지를 한 physics step으로 연결.
+  공유 grasp view는 `reset()` 금지이며 공장과 같은 model/data를 사용한다.
+  성공은 물체 바닥의 벨트 위 수직 높이 + 실제 양손 지지 + 다른 지지물 접촉 없음으로 판정한다.
 - `expert/sharpa_hand_demo.py`: free-space hand diagnostic
 - `expert/coupled_ik.py`, `pose_ik.py`, `timing.py`: 공통 expert 도구
 - `data/`, `imitation/`, `evaluation/`: Phase 2/3 및 이후 학습 기반
@@ -76,6 +86,10 @@ pre-hand-equipped base가 남기던 손목당 0.202839kg의 ghost hand mass도
 `phase4/dex3-grasp` branch 또는 `phase4-dex3-end` tag를 사용한다.
 
 ## Current blocker
+
+2026-09-11: dropped_part seed 0 양쪽 스테이션에서 live walk-to-lift 성공.
+Place/검증/재가동 연결, 위치 불량 시나리오와 더 넓은 시작조건, 파지 접촉 품질,
+공장 mission용 완전 명령 기록·재생은 별도 남은 작업이다. 아래는 단독 파지 트랙 기록이다.
 
 2026-09-05 작업영역 확장: 같은 설정으로 위치·크기·yaw 14조건과 별도 조합
 4조건의 물리 파지/상승이 성공했다. 최종 접근 재보정, 손목을 포함한 실제

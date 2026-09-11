@@ -127,6 +127,12 @@ def _panel(env, info, paused=False, walk=None) -> tuple[str, str]:
         values.append(info["mission_events"][-1]["event"])
     labels.extend(["Scenario", "Detection"])
     values.extend([info["scenario"], info["scenario_status"]])
+    if 'recovery_state' in info:
+        values[labels.index('G1')] = info['recovery_state'] + (
+            f" / {info['grasp_state']}" if info.get('grasp_state') and info['recovery_state'] == 'GRASP' else '')
+        labels.extend(['Best lift hold', 'Failure'])
+        values.extend([f"{info['lift_hold_steps'] * env.model.opt.timestep * env.config.frame_skip:.2f}s",
+                       str(info.get('recovery_failure') or '-')])
     return "\n".join(labels), "\n".join(values)
 
 
@@ -140,12 +146,13 @@ def run_offscreen(env, args) -> None:
     camera = _camera(env.factory)
     zero = np.zeros(env.action_space.shape[0], dtype=np.float32)
     bundle = _make_walker(env, args.walk_to) if args.walk_to is not None else None
+    recovery = _make_recovery(env, args)
     announced: dict = {}
     shots = {}
     for step in range(args.steps):
         if bundle is not None:
             _drive_walker(env, bundle, announced)
-        _, _, _, _, info = env.step(zero)
+        info = recovery.step() if recovery is not None else env.step(zero)[4]
         _update_beacons(env)
         if step + 1 in args.capture:
             shots[step + 1] = info
@@ -162,6 +169,9 @@ def run_offscreen(env, args) -> None:
                 print(f"step {step + 1:5d}  {_describe(env, info)}  -> {path}")
     if not shots:
         print("no frames captured; check --capture against --steps")
+    if recovery is not None:
+        print(f"Recovery result: {recovery.state}; failure={recovery.failure}")
+        recovery.close()
 
 
 def run_interactive(env, args) -> None:
@@ -174,7 +184,9 @@ def run_interactive(env, args) -> None:
     print("Green = producing, red = requested, amber = recovery/verification.")
     print("SPACE pause | R reset | 0 overview | 1/2 station camera | A accept | C verify.")
     print("A/C are manual task-manager messages only: they do not move G1 or restore the part.")
-    if args.walk_to is None:
+    if getattr(args, 'recover', False):
+        print('Experimental live recovery: fault -> prepare hands -> walk -> grasp/lift.')
+    elif args.walk_to is None:
         print("The G1 stands still; pass --walk-to 0 or --walk-to 1 to make it walk there.")
     print("Close the viewer to exit.")
     target_dt = env.model.opt.timestep * env.config.frame_skip
@@ -188,6 +200,7 @@ def run_interactive(env, args) -> None:
         finished = False
         event_count = 0
         bundle = _make_walker(env, args.walk_to) if args.walk_to is not None else None
+        recovery = _make_recovery(env, args)
         walk_announced: dict = {}
         while viewer.is_running():
             started = time.time()
@@ -197,6 +210,8 @@ def run_interactive(env, args) -> None:
                 if key == 32 and not finished:
                     paused = not paused
                 elif key == ord("R"):
+                    if recovery is not None:
+                        recovery.close()
                     _, info = env.reset(seed=args.seed, options=_reset_options(args))
                     paused = finished = False
                     event_count = 0
@@ -205,7 +220,8 @@ def run_interactive(env, args) -> None:
                     # old one still holds the previous run's leg targets.
                     bundle = _make_walker(env, args.walk_to) if args.walk_to is not None else None
                     walk_announced = {}
-                elif key in (ord("A"), ord("C")):
+                    recovery = _make_recovery(env, args)
+                elif key in (ord("A"), ord("C")) and recovery is None:
                     signal = ("accept" if key == ord("A") else "complete", info["target_workcell"])
                 elif key in (ord("0"), ord("1"), ord("2")):
                     with viewer.lock():
@@ -219,12 +235,19 @@ def run_interactive(env, args) -> None:
             if not paused:
                 if bundle is not None:
                     _drive_walker(env, bundle, walk_announced)
-                _, _, terminated, truncated, info = env.step(zero, supervisor_signal=signal)
+                if recovery is not None:
+                    info = recovery.step()
+                    terminated = recovery.state in recovery.TERMINAL
+                    truncated = False
+                else:
+                    _, _, terminated, truncated, info = env.step(zero, supervisor_signal=signal)
                 if signal is not None:
                     print(f"Manual signal {signal}: accepted={info['supervisor_signal_accepted']}")
                 if terminated or truncated:
                     paused = finished = True
                     print("Episode finished; scene retained. Press R to reset.")
+                    if recovery is not None:
+                        print(f"Recovery result: {recovery.state}; failure={recovery.failure}")
             for event in info["mission_events"][event_count:]:
                 print(f"  step {event['step']:5d} station {event['station']}: {event['event']}")
             event_count = len(info["mission_events"])
@@ -235,6 +258,15 @@ def run_interactive(env, args) -> None:
             remaining = target_dt - (time.time() - started)
             if remaining > 0:
                 time.sleep(remaining)
+        if recovery is not None:
+            recovery.close()
+
+
+def _make_recovery(env, args):
+    if not getattr(args, 'recover', False):
+        return None
+    from humanoid_learning.expert.factory_recovery import FactoryRecovery, RecoveryConfig
+    return FactoryRecovery(env, RecoveryConfig(stand_off_m=getattr(args, 'recovery_stand_off', 0.27)))
 
 
 def _make_walker(env, station: int):
@@ -296,12 +328,17 @@ def main() -> None:
     parser.add_argument("--walk-to", type=int, choices=range(fcfg.N_WORKCELLS), default=None,
                         help="walk the G1 from home to this station using Unitree's pre-trained "
                              "G1 locomotion policy, then hold a standing pose there")
+    parser.add_argument('--recover', action='store_true',
+                        help='experimental live fault-to-lift controller; does not yet place/restart')
+    parser.add_argument('--recovery-stand-off', type=float, default=0.27)
     parser.add_argument("--offscreen", action="store_true", help="render PNGs instead of opening a window")
     parser.add_argument("--out", default="results/factory/factory.png")
     parser.add_argument("--steps", type=int, default=400)
     parser.add_argument("--capture", type=int, nargs="+", default=[150, 400],
                         help="steps at which to save a frame in --offscreen mode")
     args = parser.parse_args()
+    if args.recover and (args.walk_to is not None or args.no_fault):
+        parser.error('--recover cannot be combined with --walk-to or --no-fault')
 
     if args.offscreen:
         os.environ.setdefault("MUJOCO_GL", "egl")

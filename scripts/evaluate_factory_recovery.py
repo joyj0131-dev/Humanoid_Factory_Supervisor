@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Run the live fault -> walk -> lift attempt and save an honest result."""
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+
+os.environ.setdefault('MUJOCO_GL', 'egl')
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import numpy as np
+
+from humanoid_learning.envs.factory_env import FactoryEnv
+from humanoid_learning.expert.factory_recovery import FactoryRecovery, RecoveryConfig
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--station', type=int, choices=(0, 1), required=True)
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--scenario', choices=('dropped_part', 'misplaced_part'), default='dropped_part')
+    parser.add_argument('--stand-off', type=float, default=0.27)
+    parser.add_argument('--max-steps', type=int, default=12000)
+    parser.add_argument('--squeeze', type=float, default=0.006)
+    parser.add_argument('--forward-bias', type=float, default=-0.08)
+    parser.add_argument('--out', default='results/factory/recovery.json')
+    parser.add_argument('--render', action='store_true')
+    args = parser.parse_args()
+    env = FactoryEnv()
+    try:
+        env.reset(seed=args.seed, options={'fault_workcell': args.station, 'scenario': args.scenario})
+        recovery = FactoryRecovery(env, RecoveryConfig(stand_off_m=args.stand_off, max_steps=args.max_steps,
+                                                       hold_squeeze_m=args.squeeze,
+                                                       forward_command_bias=args.forward_bias))
+        peak_step = 0.0
+        previous = env.data.qpos[:3].copy()
+        last_state = None
+        for step in range(args.max_steps):
+            info = recovery.step()
+            peak_step = max(peak_step, float(np.linalg.norm(env.data.qpos[:3] - previous)))
+            previous = env.data.qpos[:3].copy()
+            state = (recovery.state, getattr(getattr(recovery, 'expert', None), 'state', None))
+            if state != last_state:
+                print(step, *state, 'base', np.round(previous, 4), flush=True)
+                last_state = state
+            if recovery.state in recovery.TERMINAL:
+                break
+        result = {
+            'station': args.station, 'seed': args.seed, 'scenario': args.scenario,
+            'success': recovery.state == 'LIFTED', 'state': recovery.state,
+            'failure': recovery.failure, 'steps': recovery.total_steps,
+            'max_clearance_m': recovery.max_clearance,
+            'max_supported_hold_seconds': recovery.max_hold_steps * env.config.frame_skip * env.model.opt.timestep,
+            'max_base_step_m': peak_step, 'fallen': bool(info.get('fallen')),
+            'object_hand_penetration_max_m': recovery.max_object_hand_penetration_m,
+            'forbidden_contact_ticks': recovery.forbidden_contact_ticks,
+            'forbidden_contact_pairs': recovery.forbidden_contact_pairs,
+            'collision_free_lift_success': recovery.state == 'LIFTED' and recovery.forbidden_contact_ticks == 0,
+            'events': recovery.events, 'config': vars(recovery.config),
+        }
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(result, indent=2) + '\n')
+        print(json.dumps(result, indent=2), flush=True)
+        if args.render:
+            import mujoco
+            from PIL import Image
+            from humanoid_learning.envs import factory_config as fc
+            for station, arm in enumerate(env.arms):
+                env.model.geom_rgba[env.model.geom(fc.beacon_geom_name(station)).id] = (
+                    (1.0, 0.65, 0.05, 1.0) if arm.faulted else fc.BEACON_RUNNING_RGBA)
+            camera = mujoco.MjvCamera()
+            camera.lookat[:] = env.part_position(args.station)
+            camera.distance, camera.azimuth, camera.elevation = 1.6, 190, -15
+            with mujoco.Renderer(env.model, height=720, width=1280) as renderer:
+                renderer.update_scene(env.data, camera)
+                Image.fromarray(renderer.render()).save(out.with_suffix('.png'))
+        return 0 if result['success'] else 1
+    finally:
+        if 'recovery' in locals():
+            recovery.close()
+        env.close()
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

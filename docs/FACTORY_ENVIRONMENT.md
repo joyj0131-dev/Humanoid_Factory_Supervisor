@@ -1,6 +1,14 @@
 # Phase 5 — Scripted factory automation environment
 
-Conveyor line with two automation stations. Last updated 2026-09-10.
+Conveyor line with two automation stations. Current integration update: 2026-09-11.
+
+**Current:** pretrained walking and the opt-in live fault-to-lift controller now
+exist. Both dropped-part stations lift successfully, but forbidden contacts and
+grasp penetration remain; collision-free recovery is not complete. See
+[current results and commands](FACTORY_RECOVERY.md).
+
+The original scene-building audit below is historical. Its statements that no
+walking controller existed describe that earlier snapshot, not today's code.
 
 **Phase status: active, NOT complete.** The environment, the fault scenarios and
 the recovery signalling are built and tested (21/21). Contact quality is not
@@ -26,7 +34,7 @@ This replaces the previous single fixed spot with a single object as the scene
 for supervisor work. The fixed-base grasp env is unchanged and still used for
 grasp development.
 
-## What this is NOT
+## What was not implemented at the original scene-building checkpoint
 
 **There is no walking controller in this repository.** The audit at the start of
 this work confirmed it: the only base-moving code is `PlanarDebugEnv`, which

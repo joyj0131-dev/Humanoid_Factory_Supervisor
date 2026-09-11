@@ -136,7 +136,7 @@ class NavigationGains:
 class G1WalkPolicy:
     """Drives the 12 leg joints from a velocity command."""
 
-    def __init__(self, env, policy_path: Path | str = POLICY_PATH):
+    def __init__(self, env, policy_path: Path | str = POLICY_PATH, *, initialize_pose: bool = True):
         import torch  # imported lazily: only walking needs it
 
         path = Path(policy_path)
@@ -172,7 +172,7 @@ class G1WalkPolicy:
 
         self.holding = False
         self._apply_policy_gains()
-        self.reset()
+        self.reset(initialize_pose=initialize_pose)
 
     def _apply_policy_gains(self) -> None:
         """Retune the leg position actuators to the policy's PD law."""
@@ -183,14 +183,16 @@ class G1WalkPolicy:
             model.actuator_biasprm[aid, 2] = -LEG_KD[k]
 
     # ------------------------------------------------------------------
-    def reset(self) -> None:
+    def reset(self, *, initialize_pose: bool = True) -> None:
         """Put the legs in the policy's default stance and clear its history."""
         self.action = np.zeros(NUM_LEG_ACTIONS)
-        self.leg_target = DEFAULT_ANGLES.copy()
+        self.leg_target = (DEFAULT_ANGLES.copy() if initialize_pose
+                           else self.env.data.qpos[self.qpos_adr].copy())
         self._tick = 0
-        self.env.data.qpos[self.qpos_adr] = DEFAULT_ANGLES
-        self.env._leg_target[:] = DEFAULT_ANGLES
-        mujoco.mj_forward(self.env.model, self.env.data)
+        if initialize_pose:
+            self.env.data.qpos[self.qpos_adr] = DEFAULT_ANGLES
+            mujoco.mj_forward(self.env.model, self.env.data)
+        self.env._leg_target[:] = self.leg_target
 
     def base_pose(self) -> tuple[np.ndarray, float]:
         data = self.env.data

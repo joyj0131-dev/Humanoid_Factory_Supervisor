@@ -27,6 +27,7 @@ from humanoid_learning.envs import model_builder
 from humanoid_learning.envs import sharpa_config as sc
 from humanoid_learning.envs import task_config as tc
 from humanoid_learning.envs import whole_body_config as wbc
+from humanoid_learning.envs.frames import yaw_from_quat
 
 _ARM_JOINTS = tc.LEFT_ARM_JOINTS + tc.RIGHT_ARM_JOINTS  # 14
 _WAIST_JOINTS = wbc.WAIST_JOINTS  # 3
@@ -44,12 +45,19 @@ _RIGHT_GROUP_SLICE = slice(N_WAIST + N_ARMS + N_GROUPS_PER_HAND, ACTION_DIM)
 class SharpaGraspEnv(gym.Env):
     metadata = {"render_modes": ["rgb_array"], "render_fps": 30}
 
-    def __init__(self, config: gc.GraspEnvConfig | None = None, render_mode: str | None = None):
+    def __init__(self, config: gc.GraspEnvConfig | None = None, render_mode: str | None = None,
+                 *, shared_model=None, shared_data=None, object_joint=tc.OBJECT_JOINT,
+                 object_body=tc.OBJECT_BODY, object_geom=tc.OBJECT_GEOM, support_geom=tc.TABLE_GEOM):
         self.config = config or gc.GraspEnvConfig()
         self.render_mode = render_mode
 
-        self.model = model_builder.build_grasp_model_sharpa(self.config)
-        self.data = mujoco.MjData(self.model)
+        if (shared_model is None) != (shared_data is None):
+            raise ValueError("shared model and data must be supplied together")
+        self._shared_physics = shared_model is not None
+        self._object_joint_name, self._object_body_name = object_joint, object_body
+        self.object_geom_name, self.support_geom_name = object_geom, support_geom
+        self.model = shared_model if self._shared_physics else model_builder.build_grasp_model_sharpa(self.config)
+        self.data = shared_data if self._shared_physics else mujoco.MjData(self.model)
         self._reset_noslip_iterations = self.model.opt.noslip_iterations
         self._resolve_indices()
 
@@ -83,6 +91,11 @@ class SharpaGraspEnv(gym.Env):
         self._step_count = 0
         self._contact_streak = 0
         self._renderer: mujoco.Renderer | None = None
+        if self._shared_physics:
+            self._arm_target[:] = self.data.qpos[self._arm_qpos_adr]
+            self._waist_target[:] = self.data.qpos[self._waist_qpos_adr]
+            obj = self.data.qpos[self._object_qpos_adr:self._object_qpos_adr + 7]
+            self._reset_object_xy_yaw = np.r_[obj[:2], yaw_from_quat(obj[3:7])]
 
     # ------------------------------------------------------------------
     def _resolve_indices(self) -> None:
@@ -174,11 +187,14 @@ class SharpaGraspEnv(gym.Env):
         # the Sharpa open targets explicitly.
         self._stand_ctrl_arms_waist = model.key_ctrl[key_id][: len(model.key_ctrl[key_id])].copy()
 
-        obj_jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, tc.OBJECT_JOINT)
+        obj_jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, self._object_joint_name)
         assert obj_jid >= 0
         self._object_qpos_adr = model.jnt_qposadr[obj_jid]
         self._object_dof_adr = model.jnt_dofadr[obj_jid]
-        self._object_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, tc.OBJECT_BODY)
+        self._object_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, self._object_body_name)
+        support = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, self.support_geom_name)
+        assert support >= 0 and self._object_body_id >= 0
+        self._support_body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[support])
 
         self._left_hand_body_ids = {
             b for b in range(model.nbody)
@@ -191,6 +207,8 @@ class SharpaGraspEnv(gym.Env):
 
     # ------------------------------------------------------------------
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
+        if self._shared_physics:
+            raise RuntimeError("Shared physics must be reset by FactoryEnv, never by the grasp view")
         # The contact-lift controller enables no-slip iterations after contact;
         # reset restores the approach solver so repeated rollouts are identical.
         self.model.opt.noslip_iterations = self._reset_noslip_iterations
@@ -379,8 +397,8 @@ class SharpaGraspEnv(gym.Env):
             c = data.contact[i]
             b1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom1]) or ""
             b2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom2]) or ""
-            is_hand_table = (("table" in b1 and (b2.startswith("left_left_") or b2.startswith("right_right_"))) or
-                              ("table" in b2 and (b1.startswith("left_left_") or b1.startswith("right_right_"))))
+            is_hand_table = ((("table" in b1 or b1 == self._support_body_name) and (b2.startswith("left_left_") or b2.startswith("right_right_"))) or
+                              (("table" in b2 or b2 == self._support_body_name) and (b1.startswith("left_left_") or b1.startswith("right_right_"))))
             if not is_hand_table:
                 continue
             force6 = np.zeros(6)
@@ -424,9 +442,9 @@ class SharpaGraspEnv(gym.Env):
             def _is_hand_or_wrist(n: str) -> bool:
                 return n.startswith("left_left_") or n.startswith("right_right_") or n in self._WRIST_HOUSING_BODIES
 
-            if "table" in b1 and _is_hand_or_wrist(b2):
+            if ("table" in b1 or b1 == self._support_body_name) and _is_hand_or_wrist(b2):
                 other = b2
-            elif "table" in b2 and _is_hand_or_wrist(b1):
+            elif ("table" in b2 or b2 == self._support_body_name) and _is_hand_or_wrist(b1):
                 other = b1
             else:
                 continue

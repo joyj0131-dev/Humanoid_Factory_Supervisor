@@ -23,8 +23,8 @@ class SharpaContactLift:
         self.rotation = {s: self.env.palm_pose(s)[1].copy() for s in sc.SIDES}
         self.start_object = expert._object_pos().copy()
         self.height = 0.0
-        self.table_geom = mujoco.mj_name2id(self.env.model, mujoco.mjtObj.mjOBJ_GEOM, tc.TABLE_GEOM)
-        self.object_geom = mujoco.mj_name2id(self.env.model, mujoco.mjtObj.mjOBJ_GEOM, tc.OBJECT_GEOM)
+        self.table_geom = mujoco.mj_name2id(self.env.model, mujoco.mjtObj.mjOBJ_GEOM, self.env.support_geom_name)
+        self.object_geom = mujoco.mj_name2id(self.env.model, mujoco.mjtObj.mjOBJ_GEOM, self.env.object_geom_name)
         # This controller deliberately performs an enveloping hand/wrist grasp.
         # Excluding the G1 wrist while counting the opposing Sharpa fingers
         # misclassified real support as CONTACT_LOST (the uncounted wrist

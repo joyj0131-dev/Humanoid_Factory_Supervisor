@@ -113,30 +113,18 @@ observation만으로는 명령을 결정할 수 없다 — Expert는 접촉력 �
 
 ## 두 작업 공간 공장 환경
 
-감독 로봇이 실제로 일할 무대를 만들었다. **떨어져 있는 workcell 2개**가 각자
-scripted 자동화 팔과 부품을 갖고 돌아가고, seed가 정한 한쪽에서만 고장이 난다.
-반대쪽은 계속 정상 생산한다. 기존 고정 위치 grasp 환경은 그대로 두고 별도 환경으로
-추가했다.
+컨베이어 하나와 자동화 팔 두 개가 있는 공장이다. 기본 스테이션 간격은 2.2m이고
+두 위치 모두 같은 방향을 본다. 떨어뜨림/위치 불량 고장 시 task manager가
+라인을 정지시키고 G1에 복구를 요청한다.
 
-**아직 걷지 못한다.** 저장소에 보행 제어기가 없다(있는 것은 `PlanarDebugEnv`뿐이고
-그건 스스로 "gait이 아니다"라고 명시한 kinematic 디버그용이다). base는 자유롭게
-두었으므로 나중에 이동을 만들면 반드시 다리로 해야 한다. 실측: G1은 floating base
-위에서 2000 step(20초) 동안 pelvis drift 0.1mm로 서 있다 — 서 있기는 확실하고,
-걷기는 존재하지 않는다.
-
-workcell 간격은 3안을 수치로 비교해 골랐다(±35° 고정, 보행 0.5m/s 가정).
-
-| 안 | 이동거리 | 테이블 간격 | 이동 step | 4194-step grasp episode 대비 |
-| --- | --- | --- | --- | --- |
-| short | 1.50m | 1.36m | 401 | 9.6% |
-| **medium (선택)** | **2.50m** | **2.51m** | **601** | **14.3%** |
-| long | 4.00m | 4.23m | 901 | 21.5% |
-
-short는 두 셀이 한 덩어리로 보이고, long은 얻는 것 없이 tick만 50% 늘어난다.
-선택한 medium의 실측 manipulation pose 간격은 **2.868m**다.
-
-각 workcell은 검증된 canonical grasp 관계(테이블 0.30m 앞, 부품 0.27m)를 그대로
-rigid transform한 것이라, 두 셀은 자기 좌표계에서 완전히 동일하다.
+2026-09-11: `--recover`로 **고장 → 손 준비 → 실제 보행 → 정지 → 양손 파지·상승**을
+한 물리 장면에서 실행한다. dropped_part, seed 0의 양쪽 위치에서 5cm 이상 상승과
+양손 지지 5초를 확인했다(최대 수직 간격 67.7mm / 60.0mm, 넘어짐 없음).
+범용 복구 정책이나 학습 결과는 아니며, **제자리 내려놓기·재가동은 미구현**이다.
+끝나면 뷰어는 결과 자세를 보존하며 멈춘다. `R`로 다시 실행한다.
+보행 중 난간 접촉은 제거했지만, 파지 중 몸통 주변 접촉과 손–블록 관통 약 5mm가
+남아 있어 충돌 없는 복구 성공이나
+학습 데모 승인 상태는 아니다. [상세 결과와 남은 작업](docs/FACTORY_RECOVERY.md).
 
 Navigation Gate는 **보행 정책이 생기기 전에 미리** 못박았다: 위치 0.10m, heading
 0.15rad, 1.0초 유지, 넘어짐/금지 접촉 없음, 올바른 셀 먼저, 1500 step 이내, 그리고
@@ -150,6 +138,8 @@ BSD-3, 외부 도구). 최종 위치 오차 34.8mm / 46.8mm(허용 100mm), step�
 
 ```bash
 python3 scripts/install_g1_walk_policy.py
+DISPLAY=:0 python3 scripts/view_factory.py --recover --fault-workcell 0
+DISPLAY=:0 python3 scripts/view_factory.py --recover --fault-workcell 1
 DISPLAY=:0 python3 scripts/view_factory.py --walk-to 0
 DISPLAY=:0 python3 scripts/view_factory.py --walk-to 1 --scenario dropped_part
 DISPLAY=:0 python3 scripts/view_factory.py
@@ -161,10 +151,11 @@ OPENBLAS_NUM_THREADS=1 python3 scripts/view_factory.py --offscreen \
 OPENBLAS_NUM_THREADS=1 MUJOCO_GL=egl python3 scripts/test_factory.py
 ```
 
-주의할 것 두 가지를 실측했다. (1) 기존 grasp Expert는 접근 목표를 **world 축**으로
-만들기 때문에 35° 돌아간 셀에서는 최대 169mm 어긋난다 — heading 좌표계로 고쳐야
-한다. (2) `envs/`에 파일이 추가되면서 hash가 바뀌어 **기존 데모 10개는 재생이
-거부된다**(설계된 안전장치이며 hash를 건드리지 않았다). 자세한 내용은
+`--walk-to`는 종전 스테이션 마커까지 걷는 기능이고 `--recover`는 실제 고장 부품을
+향해 이동한 뒤 잡는 경로다. 동시에 지정하지 않는다. 기존 grasp의 world 축 가정은
+남아 있어 임의 방향·배치의 범용성은 보장하지 않는다. `envs/` 변경으로 기존 데모
+hash가 달라지므로 예전 데이터의 hash를 고치지 말고 새 버전에 재기록해야 한다.
+자세한 내용은
 [공장 환경](docs/FACTORY_ENVIRONMENT.md) 참고.
 
 ## 문서 안내
