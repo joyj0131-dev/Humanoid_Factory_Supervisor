@@ -183,16 +183,15 @@ def test_arm_actually_picks_the_part_up_and_places_it():
                     mujoco.mj_contactForce(env.model, env.data, c, value)
                     force += float(np.linalg.norm(value[:3]))
             peak_force = max(peak_force, force)
-            slots = [pose.table_slot_xy(i) for i in range(fcfg.OUTFEED_SLOTS)]
-            if min(float(np.linalg.norm(part[:2] - slot)) for slot in slots) < 0.06 and part[2] > fcfg.TABLE_TOP_Z:
+            if float(np.linalg.norm(part[:2] - pose.table_place_xy)) < 0.06 and part[2] > fcfg.TABLE_TOP_Z:
                 carried = True
 
         rest_z = float(env._part_rest_pos(0)[2])
         assert peak_force > 2.0, f"the jaws never really gripped (peak {peak_force:.2f} N)"
         assert peak_z > rest_z + 0.02, f"the part was never lifted (peak z {peak_z:.3f}, rest {rest_z:.3f})"
         assert carried, "the part never reached the outfeed table"
-        assert min(float(np.linalg.norm(env.part_position(0)[:2] - pose.table_slot_xy(i)))
-                   for i in range(fcfg.OUTFEED_SLOTS)) < 0.06, "the part did not end up on the table"
+        assert float(np.linalg.norm(env.part_position(0)[:2] - pose.table_place_xy)) < 0.06, (
+            "the part did not end up on the table")
         assert peak_z < 1.30, f"the part was flung (peak z {peak_z:.3f})"
         print(f"    peak jaw force {peak_force:.1f} N, lifted to z={peak_z:.3f} (rest {rest_z:.3f}), "
               f"delivered to the outfeed table")
@@ -285,42 +284,43 @@ def test_belt_stops_on_fault_and_restarts_only_after_verified_recovery():
         env.close()
 
 
-def test_a_stopped_line_is_visible_in_the_parts_not_just_a_flag():
-    """The reason the queue exists. With one part per line sitting at the blade
-    there was nothing moving on a running belt, so a stopped line looked exactly
-    like a running one. This measures the parts themselves."""
+def test_the_line_visibly_runs_and_then_visibly_stops():
+    """A part is only convincing as "stopped" if it was first seen moving.
+
+    The part enters upstream and rides the belt in. The jam takes the belt's
+    traction away mid-run, so it coasts down and stops short of the blade --
+    measured on the part itself, not on the flag that stopped it.
+    """
     env = FactoryEnv()
     try:
         env.reset(seed=0, options={"fault_workcell": 0, "scenario": "jam", "fault_step": 200})
-        moving_before = 0.0
+        start_y = float(env.part_position(0)[1])
+        running = 0.0
         for _ in range(150):
             _, _, _, _, info = env.step(ZERO)
-            moving_before = max(moving_before, info["line_throughput_m_s"][0])
-        assert moving_before > 0.1, f"nothing was moving on the running line ({moving_before:.3f} m/s)"
+            running = max(running, info["line_throughput_m_s"][0])
+        travelled = float(env.part_position(0)[1]) - start_y
+        assert running > 0.1, f"the part never got moving ({running:.3f} m/s)"
+        assert travelled > 0.15, f"the part barely travelled ({travelled * 1000:.0f} mm)"
 
-        wait_for_fault(env)
-        # The belt does not snap to a halt: the drive stops and the parts coast
-        # down against friction, which is the behaviour that makes a stopping
-        # line read as a stopping line. Let that settle before measuring.
-        coasting = 0.0
-        for _ in range(200):
-            _, _, _, _, info = env.step(ZERO)
-            coasting = max(coasting, info["line_throughput_m_s"][0])
-        assert coasting < moving_before, "the stopped line did not slow down at all"
-        frozen = [env.data.qpos[env._queue_qpos_adr[s] : env._queue_qpos_adr[s] + 3].copy()
-                  for s in range(fcfg.QUEUE_PARTS_PER_LINE)]
+        info = wait_for_fault(env)
+        assert env.scenario_status == "jammed"
+        stopped_at = env.part_position(0).copy()
         after = 0.0
         for _ in range(400):
             _, _, _, _, info = env.step(ZERO)
             after = max(after, info["line_throughput_m_s"][0])
-        moved = max(float(np.linalg.norm(
-            env.data.qpos[env._queue_qpos_adr[s] : env._queue_qpos_adr[s] + 3] - frozen[s]))
-            for s in range(fcfg.QUEUE_PARTS_PER_LINE))
-        assert after < 0.02, f"the stopped line's queue kept moving at {after:.3f} m/s"
-        assert moved < 0.01, f"the stopped line's queue drifted {moved * 1000:.0f} mm"
+        drift = float(np.linalg.norm(env.part_position(0) - stopped_at))
+        short = float(np.linalg.norm(env.part_position(0)[:2] - env.poses[0].pick_xy))
+
+        assert after < 0.02, f"the stopped line's part kept moving at {after:.3f} m/s"
+        assert drift < 0.01, f"the stopped part drifted {drift * 1000:.0f} mm"
+        assert short > fcfg.RECOVERY_POSITION_TOLERANCE_M, (
+            f"the part stopped close enough to the pick spot to count as indexed ({short * 1000:.0f} mm)")
         assert info["lines_running"][1], "the healthy line stopped too"
-        print(f"    line 0 queue ran at {moving_before:.2f} m/s, coasted down to {coasting:.2f} m/s "
-              f"and then held within {moved * 1000:.1f} mm for 400 steps while line 1 kept running")
+        print(f"    part ran {travelled * 1000:.0f} mm at up to {running:.2f} m/s, then stopped "
+              f"{short * 1000:.0f} mm short of the blade and held within {drift * 1000:.1f} mm "
+              f"while line 1 kept running")
     finally:
         env.close()
 
@@ -393,7 +393,7 @@ def test_verification_is_rechecked_before_restart():
                 break
         assert manager.state is LineState.RECOVERY_VERIFIED
         assert not manager.belt_should_run and manager.target_station == station
-        env._set_part(station, env._rest_pos(env.poses[station].jam_xy))
+        env._set_part(station, env._rest_pos(env.poses[station].infeed_xy))
         mujoco.mj_forward(env.model, env.data)
         manager.update(env, 100)
         assert manager.state is LineState.RECOVERING
@@ -563,9 +563,9 @@ def test_reset_clears_fault_and_leaks_no_state():
         assert not any(info["arm_faulted"]), info["arm_faulted"]
         assert env.navigation.steps == 0, "waiting must not consume navigation budget"
         for k in range(fcfg.N_WORKCELLS):
-            # Production starts with every part indexed on its own belt, whether
-            # or not that is where the line's recovery target happens to be.
-            expected = env._rest_pos(env.poses[k].pick_xy)
+            # Production starts with every part entering upstream, whichever
+            # surface that line's recovery target happens to be on.
+            expected = env._rest_pos(env.poses[k].infeed_xy)
             np.testing.assert_allclose(env.part_position(k), expected, atol=1e-9)
         # A fresh env reset to the same seed must match this one exactly.
         other = FactoryEnv()
@@ -805,7 +805,7 @@ def main() -> int:
         test_completion_signal_cannot_fake_recovery_and_reset_clears_messages,
         test_verification_is_rechecked_before_restart,
         test_each_lines_own_fault_is_physical_and_recoverable,
-        test_a_stopped_line_is_visible_in_the_parts_not_just_a_flag,
+        test_the_line_visibly_runs_and_then_visibly_stops,
         test_two_arms_move_independently,
         test_seed_reproduces_the_same_scenario_and_physics,
         test_different_seeds_select_both_workcells,
