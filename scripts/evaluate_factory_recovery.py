@@ -30,6 +30,8 @@ def main():
     parser.add_argument('--out', default='results/factory/recovery.json')
     parser.add_argument('--render', action='store_true')
     parser.add_argument('--place', action='store_true', help='continue after lift into experimental place/restart')
+    parser.add_argument('--carry', action=argparse.BooleanOptionalAction, default=True,
+                        help='walk the held part to the canonical spot before placing')
     parser.add_argument('--kinematic-ik', action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
     env = FactoryEnv()
@@ -40,6 +42,7 @@ def main():
                                                        motion_profile=args.motion_profile,
                                                        kinematic_ik=args.kinematic_ik,
                                                        place_after_lift=args.place,
+                                                       carry_by_walking=args.carry,
                                                        forward_command_bias=args.forward_bias))
         peak_step = 0.0
         previous = env.data.qpos[:3].copy()
@@ -96,6 +99,7 @@ def main():
             'station': args.station, 'seed': args.seed, 'scenario': args.scenario,
             'success': recovery.state == ('RECOVERED' if args.place else 'LIFTED'), 'state': recovery.state,
             'place_stage': info.get('place_stage'), 'place_error_m': info.get('place_error_m'),
+            'carry_error_m': info.get('carry_error_m'),
             'place_start_position': recovery.placer.start.tolist() if hasattr(recovery, 'placer') else None,
             'place_target_position': recovery.placer.target.tolist() if hasattr(recovery, 'placer') else None,
             'place_actual_position': env.part_position(recovery.station).tolist() if hasattr(recovery, 'placer') else None,

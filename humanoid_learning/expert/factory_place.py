@@ -1,8 +1,18 @@
 """Actuator-only place/retract prototype; never moves the free object directly.
 
-Known limitation: seed-0 station-0 loaded TRANSFER falls before reaching the
-pick pose. LOWER/RELEASE/RETRACT/restart are wired but not end-to-end validated.
-This must remain opt-in until loaded transfer and balance are solved.
+Reached only after FactoryRecovery has WALKED the held block to the placing
+stance, which is what made a loaded transfer survivable at all: reaching for the
+canonical spot from the picking stance is a 233 mm pull that closed no distance
+whatsoever (object error 221 -> 217 mm) and toppled the robot in 380 ticks.
+
+Known limitation, measured on seed 0 / station 0: after the carry the block is
+still ~99 mm short fore/aft, the loaded gait will not advance further (fore/aft
+error pinned at +110 mm for 2500 ticks, with no forbidden contact to blame, so
+the rail is not what stops it), and TRANSFER covering that last 99 mm by arm
+reach still falls. LOWER/RELEASE/RETRACT/restart are wired but have never run.
+This stays opt-in until the final approach is solved -- most likely by lowering
+onto the belt first, so the belt carries the load while the block is nudged the
+rest of the way, rather than holding it at extension.
 """
 from dataclasses import dataclass
 
