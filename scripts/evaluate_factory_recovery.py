@@ -100,6 +100,8 @@ def main():
             'success': recovery.state == ('RECOVERED' if args.place else 'LIFTED'), 'state': recovery.state,
             'place_stage': info.get('place_stage'), 'place_error_m': info.get('place_error_m'),
             'carry_error_m': info.get('carry_error_m'),
+            'place_commanded_rotation_deg': info.get('place_commanded_rotation_deg'),
+            'place_tilt_deg': info.get('place_tilt_deg'),
             'place_start_position': recovery.placer.start.tolist() if hasattr(recovery, 'placer') else None,
             'place_target_position': recovery.placer.target.tolist() if hasattr(recovery, 'placer') else None,
             'place_actual_position': env.part_position(recovery.station).tolist() if hasattr(recovery, 'placer') else None,

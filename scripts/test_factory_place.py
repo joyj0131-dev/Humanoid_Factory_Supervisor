@@ -31,14 +31,15 @@ def test_place_frame_roundtrip_and_no_pose_writes():
         np.testing.assert_array_equal(env.data.qpos, before)
         assert not env.task_manager.completion_requested
         # Even an exact target position must not trigger release in mid-air.
-        place.stage, place.tick = 'LOWER', place.config.lower_ticks - 1
+        place.stage, place.tick = 'SLIDE', place.config.slide_ticks - 1
+        place.slide_start = place.start.copy()
         with patch.object(place, '_move'), patch.object(place, '_object_supported_by_belt', return_value=False), \
                 patch.object(env, 'part_position', return_value=place.target.copy()):
             place.step()
-            assert place.stage == 'LOWER'
-            place.tick = place.config.lower_ticks + place.config.settle_ticks
+            assert place.stage == 'SLIDE'
+            place.tick = place.config.slide_ticks + place.config.settle_ticks
             place.step()
-            assert place.failure == 'PLACE_SUPPORT_NOT_ESTABLISHED'
+            assert place.failure == 'PLACE_SLIDE_NOT_REACHED'
         assert not env.task_manager.completion_requested
         np.testing.assert_array_equal(env.data.qpos, before)
         assert RecoveryConfig().place_after_lift is False

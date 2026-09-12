@@ -456,6 +456,8 @@ class FactoryRecovery:
                         if self.state in self.CARRY_STATES else None)
         if hasattr(self, 'placer'):
             info.update(place_stage=self.placer.stage, place_error_m=self.placer.final_error_m,
+                        place_commanded_rotation_deg=self.placer.commanded_rotation_deg,
+                        place_tilt_deg=self.placer.tilt_deg,
                         hands_clear=self.placer.hands_clear)
         self._last_info = info
         return info
