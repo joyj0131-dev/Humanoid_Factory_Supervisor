@@ -1,5 +1,61 @@
 # Factory fault-to-lift integration (2026-09-11)
 
+## Continuous approach (2026-09-12)
+
+The viewer's `--recover` now selects `--recovery-motion smooth`.
+`--recovery-motion direct` preserves the previous 274811c motion for comparison;
+`baseline` and `compact` remain available. The standalone grasp default is unchanged.
+
+The old ALIGN emitted a new IK target every 30 control ticks (0.30 s).
+DESCEND solved IK every tick but still held its Cartesian position target for
+30 ticks. Smooth mode uses a single quintic phase clock over each whole segment:
+position and ALIGN orientation advance every tick without intermediate waypoint
+stops. DESCEND's existing wrist trim is blended once over its initial 0.30 s,
+not jumped or restarted at subsequent waypoint boundaries. IK still uses measured
+joint positions and actions go through the same real physics/control path.
+
+This is **not** elimination of every pause: the walking handoff, endpoint posture
+checks, preshape check, contact settling and five-second supported lift remain.
+The raised-arm preparation before walking also remains. Segment durations and
+success/contact thresholds were not shortened. Smoothness is not a speedup claim.
+
+The evaluator records actual palm speed metrics by phase (interior 80% of the
+phase, slow = below 2 mm/s per hand) and controller wall-time p50/p95. This separates
+physical stop/start motion from rendering/computation delays; real-time GUI frame
+rate is not guaranteed by a successful headless rollout.
+
+Final measured results (seed 0, dropped_part, same scene; **not generalization**):
+
+| Metric | direct st0 | smooth st0 | direct st1 | smooth st1 |
+| --- | --- | --- | --- | --- |
+| Lift + supported hold | PASS | PASS | PASS | PASS |
+| Steps | 5179 | 5171 | 5292 | 5592 |
+| Max vertical clearance, mm | 79.92 | 80.20 | 73.08 | 55.75 |
+| Continuous support, s | 5 | 5 | 5 | 5 |
+| Max hand/object penetration, mm | 5.31 | 5.12 | 6.19 | 4.82 |
+| Forbidden-contact ticks | 938 | 989 | 840 | 847 |
+
+Evidence: `results/factory/continuous_final_st{0,1}.json`, before st0
+`continuous_before_st0.json`; direct st1 is the previous documented 274811c
+result. For st0 ALIGN, interior palm speed standard deviation left/right falls
+from 0.02194/0.02408 to 0.01355/0.01475 m/s (about 38%). DESCEND falls from
+0.03211/0.03011 to 0.02340/0.01592 m/s. These are variation measurements, not
+a proof of jerk-free motion: ALIGN peak speeds increase from 0.112/0.124 to
+0.159/0.153 m/s, and DESCEND slow fractions increase from 11.2/8.1% to
+13.9/15.1%. Endpoint/constraint-related hesitations still need work. Station 1
+takes 3 seconds longer; no blanket speedup or collision-free claim is made.
+
+Validation: recovery contracts 6/6, factory 21/21, walk 5/5; actual final
+smooth missions PASS 2/2. Offscreen viewer default was also exercised through
+2500 ticks (`continuous_viewer_{1800,2100,2500}.png`), not a human GUI check.
+
+```bash
+DISPLAY=:0 python3 scripts/view_factory.py --recover --fault-workcell 1
+DISPLAY=:0 python3 scripts/view_factory.py --recover --fault-workcell 1 --recovery-motion direct
+OPENBLAS_NUM_THREADS=1 python3 scripts/evaluate_factory_recovery.py \
+  --station 1 --motion-profile smooth --out results/factory/smooth_check.json
+```
+
 ## Current result
 
 The optional recovery controller physically walks to the dropped part, stops,

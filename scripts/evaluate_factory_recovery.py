@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 os.environ.setdefault('MUJOCO_GL', 'egl')
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -24,7 +25,7 @@ def main():
     parser.add_argument('--max-steps', type=int, default=12000)
     parser.add_argument('--squeeze', type=float, default=0.006)
     parser.add_argument('--forward-bias', type=float, default=-0.08)
-    parser.add_argument('--motion-profile', choices=('baseline', 'compact', 'direct'), default='baseline')
+    parser.add_argument('--motion-profile', choices=('baseline', 'compact', 'direct', 'smooth'), default='baseline')
     parser.add_argument('--out', default='results/factory/recovery.json')
     parser.add_argument('--render', action='store_true')
     args = parser.parse_args()
@@ -39,11 +40,25 @@ def main():
         previous = env.data.qpos[:3].copy()
         last_state = None
         phase_events = []
+        motion_samples = {}
+        previous_palms = None
+        previous_motion_state = None
+        step_times = []
         for step in range(args.max_steps):
+            started = time.perf_counter()
             info = recovery.step()
+            step_times.append(time.perf_counter() - started)
             peak_step = max(peak_step, float(np.linalg.norm(env.data.qpos[:3] - previous)))
             previous = env.data.qpos[:3].copy()
             state = (recovery.state, getattr(getattr(recovery, 'expert', None), 'state', None))
+            if state[0] == 'GRASP' and state[1] is not None:
+                palms = np.stack([recovery.grasp.palm_pose(s)[0].copy() for s in ('left', 'right')])
+                if previous_motion_state == state and previous_palms is not None:
+                    dt = env.config.frame_skip * env.model.opt.timestep
+                    speed = np.linalg.norm(palms - previous_palms, axis=1) / dt
+                    motion_samples.setdefault(state[1].name, []).append(speed.tolist())
+                previous_palms = palms
+            previous_motion_state = state
             if state != last_state:
                 phase_events.append({'step': step, 'phase': recovery.state,
                                      'grasp_state': state[1].name if state[1] is not None else None})
@@ -51,6 +66,17 @@ def main():
                 last_state = state
             if recovery.state in recovery.TERMINAL:
                 break
+        motion_metrics = {}
+        for name, samples in motion_samples.items():
+            speeds = np.asarray(samples)
+            # Interior 80% excludes intended phase-boundary acceleration/settling.
+            interior = speeds[len(speeds)//10:max(len(speeds)//10 + 1, 9*len(speeds)//10)]
+            motion_metrics[name] = {
+                'samples': len(samples),
+                'interior_slow_fraction_per_hand': np.mean(interior < 0.002, axis=0).tolist(),
+                'interior_speed_std_m_s_per_hand': np.std(interior, axis=0).tolist(),
+                'peak_speed_m_s_per_hand': speeds.max(axis=0).tolist(),
+            }
         result = {
             'station': args.station, 'seed': args.seed, 'scenario': args.scenario,
             'success': recovery.state == 'LIFTED', 'state': recovery.state,
@@ -65,6 +91,9 @@ def main():
             'events': recovery.events, 'config': vars(recovery.config),
             'phase_events': phase_events,
             'used_direct_approach': recovery.used_direct_approach,
+            'motion_metrics': motion_metrics,
+            'physics_dt_s': env.config.frame_skip * env.model.opt.timestep,
+            'controller_step_wall_p50_p95_s': np.percentile(step_times, [50, 95]).tolist(),
         }
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)

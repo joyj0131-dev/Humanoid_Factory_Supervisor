@@ -427,6 +427,13 @@ def _wrist_joint_margins_deg(env) -> dict:
     return out
 
 
+def _continuous_path_progress(step: int, waypoints: int, ticks_per_waypoint: int) -> float:
+    """Monotone phase clock; waypoint boundaries never reset its velocity."""
+    if waypoints <= 0 or ticks_per_waypoint <= 0:
+        raise ValueError('trajectory duration must be positive')
+    return float(np.clip((step + 1) / (waypoints * ticks_per_waypoint), 0.0, 1.0))
+
+
 def _quintic_scale(tau: float) -> float:
     """[Session 42] Canonical quintic minimum-jerk time-scaling: zero
     velocity AND zero acceleration at both tau=0 and tau=1 (clipped to
@@ -713,6 +720,7 @@ class BimanualGraspConfig:
     side_align_preshape_curl: float = 0.3
     side_align_waypoints: int = 14
     side_align_waypoint_ticks: int = 30
+    continuous_approach: bool = False
     side_align_max_steps: int = 600
     side_align_stable_streak_required: int = 15
     # Horizontal-Wrap Posture Gate tolerances (this session's spec,
@@ -2334,9 +2342,16 @@ class SharpaBimanualGraspExpert:
                 action[17:25] = self._group_action({s: {"index": cfg.close_rate_per_step, "middle": cfg.close_rate_per_step,
                                                           "wrap": cfg.close_rate_per_step} for s in SIDES})
             ticks_per_wp = cfg.side_align_waypoint_ticks
-            if self._state_step % ticks_per_wp == 0 and self._side_align_waypoint < cfg.side_align_waypoints:
-                self._side_align_waypoint += 1
-                frac = self._side_align_waypoint / cfg.side_align_waypoints
+            if ((cfg.continuous_approach or self._state_step % ticks_per_wp == 0)
+                    and self._side_align_waypoint < cfg.side_align_waypoints):
+                if cfg.continuous_approach:
+                    # One continuous segment, not a new stop at each waypoint.
+                    progress = _continuous_path_progress(self._state_step, cfg.side_align_waypoints, ticks_per_wp)
+                    self._side_align_waypoint = progress * cfg.side_align_waypoints
+                    frac = _quintic_scale(progress)
+                else:
+                    self._side_align_waypoint += 1
+                    frac = self._side_align_waypoint / cfg.side_align_waypoints
                 wp_pos = {
                     s: (1 - frac) * self._side_align_start_pos[s] + frac * self._side_align_final_pos[s] for s in SIDES
                 }
@@ -2568,6 +2583,7 @@ class SharpaBimanualGraspExpert:
                 )
                 self._side_descend_waypoint = 0
                 self._side_descend_wp_start_R = {s: self.env.palm_pose(s)[1].copy() for s in SIDES}
+                self._side_descend_start_R = {s: r.copy() for s, r in self._side_descend_wp_start_R.items()}
                 self._side_descend_wp_target_R = {s: self.env.palm_pose(s)[1].copy() for s in SIDES}
                 self._side_descend_wp_target_pos = {s: self._side_descend_start[s].copy() for s in SIDES}
             ticks_per_wp = cfg.side_descend_waypoint_ticks
@@ -2585,7 +2601,8 @@ class SharpaBimanualGraspExpert:
             # compromise (closing/wrap/ulnar) lands somewhere different
             # at every new position. Holding _locked_R fixed and only
             # solving position removes that drift by construction.
-            if tick_in_wp == 0 and self._side_descend_waypoint < cfg.side_descend_waypoints:
+            if (not cfg.continuous_approach and tick_in_wp == 0
+                    and self._side_descend_waypoint < cfg.side_descend_waypoints):
                 self._side_descend_waypoint += 1
                 frac = _quintic_scale(self._side_descend_waypoint / cfg.side_descend_waypoints)
                 self._side_descend_wp_start_R = {s: self.env.palm_pose(s)[1].copy() for s in SIDES}
@@ -2610,6 +2627,21 @@ class SharpaBimanualGraspExpert:
                 s: _slerp_R(self._side_descend_wp_start_R[s], self._side_descend_wp_target_R[s], sub_frac)
                 for s in SIDES
             }
+            if cfg.continuous_approach:
+                progress = _continuous_path_progress(self._state_step, cfg.side_descend_waypoints, ticks_per_wp)
+                frac = _quintic_scale(progress)
+                self._side_descend_waypoint = progress * cfg.side_descend_waypoints
+                waypoints_exhausted = progress >= 1.0
+                self._side_descend_wp_target_pos = {
+                    s: (1 - frac) * self._side_descend_start[s] + frac * self._side_descend_final[s]
+                    for s in SIDES
+                }
+                self._side_descend_wp_target_R = dict(self._locked_R)
+                # Apply the existing wrist trim once, continuously, instead of
+                # a jump at entry or restarting it at every waypoint boundary.
+                rotation_frac = _quintic_scale(min((self._state_step + 1) / ticks_per_wp, 1.0))
+                R_now = {s: _slerp_R(self._side_descend_start_R[s], self._locked_R[s], rotation_frac)
+                         for s in SIDES}
             # [Level-approach session] Hard orientation requirement (was
             # soft, ori_task_weight=0.3) -- soft let the solver trade
             # orientation accuracy for position accuracy tick to tick

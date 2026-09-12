@@ -192,6 +192,7 @@ def run_interactive(env, args) -> None:
     print("A/C are manual task-manager messages only: they do not move G1 or restore the part.")
     if getattr(args, 'recover', False):
         print('Experimental live recovery: fault -> prepare hands -> walk -> grasp/lift.')
+        print(f"Approach motion: {args.recovery_motion}")
     elif args.walk_to is None:
         print("The G1 stands still; pass --walk-to 0 or --walk-to 1 to make it walk there.")
     print("Close the viewer to exit.")
@@ -339,8 +340,8 @@ def main() -> None:
     parser.add_argument('--recover', action='store_true',
                         help='experimental live fault-to-lift controller; does not yet place/restart')
     parser.add_argument('--recovery-stand-off', type=float, default=0.27)
-    parser.add_argument('--recovery-motion', choices=('baseline', 'compact', 'direct'), default='direct',
-                        help='compact reuses settled arm preparation; direct reaches the block from the current arm pose with no clearance spread')
+    parser.add_argument('--recovery-motion', choices=('baseline', 'compact', 'direct', 'smooth'), default='smooth',
+                        help='smooth uses continuous approach targets; direct preserves the previous waypoint approach')
     parser.add_argument("--offscreen", action="store_true", help="render PNGs instead of opening a window")
     parser.add_argument("--out", default="results/factory/factory.png")
     parser.add_argument("--steps", type=int, default=400)

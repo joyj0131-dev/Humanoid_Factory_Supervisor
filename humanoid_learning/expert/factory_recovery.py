@@ -81,8 +81,8 @@ class FactoryRecovery:
     def __init__(self, env, config: RecoveryConfig | None = None):
         self.env, self.config = env, config or RecoveryConfig()
         self.used_direct_approach = None
-        if self.config.motion_profile not in ('baseline', 'compact', 'direct'):
-            raise ValueError('motion_profile must be baseline, compact or direct')
+        if self.config.motion_profile not in ('baseline', 'compact', 'direct', 'smooth'):
+            raise ValueError('motion_profile must be baseline, compact, direct or smooth')
         gain, bias = env.model.actuator_gainprm.copy(), env.model.actuator_biasprm.copy()
         self._original_gain, self._original_bias = gain, bias
         self._original_noslip = env.model.opt.noslip_iterations
@@ -194,7 +194,8 @@ class FactoryRecovery:
                 self.expert.config.contact_settle_grace_seconds = self.config.contact_settle_grace_seconds
                 if self.config.motion_profile == 'compact':
                     self.expert.resume_prepared_approach()
-                elif self.config.motion_profile == 'direct':
+                elif self.config.motion_profile in ('direct', 'smooth'):
+                    self.expert.config.continuous_approach = self.config.motion_profile == 'smooth'
                     # From the pose walking left the arms in, straight at the
                     # block. Falls back to the full entry if the arms are not
                     # settled, and that fallback is recorded rather than hidden.

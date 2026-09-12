@@ -16,7 +16,28 @@ from humanoid_learning.expert.factory_recovery import FactoryRecovery
 from humanoid_learning.expert.sharpa_contact_lift import SharpaContactLift
 from humanoid_learning.expert.sharpa_bimanual_grasp_expert import (
     BimanualGraspConfig, BimanualGraspState, SharpaBimanualGraspExpert,
+    _continuous_path_progress, _quintic_scale,
 )
+
+
+def test_continuous_clock_has_no_waypoint_stops_or_wraparound():
+    n, ticks = 28, 30
+    samples = np.array([_quintic_scale(_continuous_path_progress(t, n, ticks))
+                        for t in range(-1, n*ticks + 60)])
+    delta = np.diff(samples)
+    assert samples[0] == 0.0 and samples[-1] == 1.0
+    assert np.all(delta[:n*ticks] > 0.0)
+    assert np.all(delta[n*ticks:] == 0.0)
+    # Speed at interior former waypoint boundaries remains continuous.
+    for t in range(3*ticks, (n-3)*ticks, ticks):
+        assert abs(delta[t] - delta[t-1]) < 0.03 * delta[t]
+    assert BimanualGraspConfig().continuous_approach is False
+    try:
+        _continuous_path_progress(0, 0, ticks)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('zero duration must be rejected')
 
 
 def test_prepared_resume_guard_without_physics_writes():
