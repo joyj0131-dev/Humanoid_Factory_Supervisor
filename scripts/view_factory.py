@@ -54,18 +54,21 @@ def _describe(env, info) -> str:
             f"call={'none' if target < 0 else f'st{target}'}")
 
 
-CAMERA_DISTANCE = 6.4
-CAMERA_AZIMUTH = 143.0
-CAMERA_ELEVATION = -27.0
+# Over the supervisor's shoulder, looking back down both lines the way it does.
+CAMERA_DISTANCE = 6.0
+CAMERA_AZIMUTH = 90.0
+CAMERA_ELEVATION = -22.0
 
 
 def _camera_lookat(config) -> list[float]:
     """Centre on the work area between the two lines, so the corridor, both
     belts and both tables fit in frame."""
     lines = config.workcells
+    post, _ = fcfg.observation_pose()
     centre_x = float(np.mean([p.manipulation_xy[0] for p in lines]))
-    centre_y = float(np.mean([p.manipulation_xy[1] for p in lines])) * 0.6
-    return [centre_x, centre_y, 0.85]
+    work_y = float(np.mean([p.manipulation_xy[1] for p in lines]))
+    # Between the supervisor and the work it is watching.
+    return [centre_x, 0.5 * (work_y + float(post[1])), 0.85]
 
 
 def _camera(config):
@@ -122,7 +125,8 @@ def _panel(env, info, paused=False, walk=None) -> tuple[str, str]:
               "Line 1 (table faces corridor)", "Controls", "Manual signals"]
     values = [f"t={env.data.time:.1f}s", "PAUSED" if paused else "RUNNING",
               info["line_state"],
-              "  ".join(f"L{k} {'ON' if r else 'STOPPED'}" for k, r in enumerate(lines)),
+              "  ".join(f"L{k} {'ON' if r else 'STOPPED'} {info.get('line_throughput_m_s', [0.0] * fcfg.N_LINES)[k]:.2f} m/s"
+                        for k, r in enumerate(lines)),
               "none" if target < 0 else f"Station {target}",
               f"{info['recovery_progress']:.0%}", _g1_status(env, walk),
               *[f"{'FAULT' if info['arm_faulted'][k] else 'CYCLE'} / step {info['arm_waypoint'][k]}"

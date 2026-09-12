@@ -57,7 +57,11 @@ class ScriptedArm:
         index = pose.index
         self.index = index
         self.pose = pose
-        self.waypoints = fcfg.arm_cycle_waypoints(pose)
+        # One cycle per outfeed slot: the arm works along the table so a second
+        # part is not stacked on the first.
+        self.slot_waypoints = [fcfg.arm_cycle_waypoints(pose, slot=i)
+                               for i in range(fcfg.OUTFEED_SLOTS)]
+        self.waypoints = self.slot_waypoints[fcfg.OUTFEED_SLOTS // 2]
         # Same cycle, but the place spot sits past the table's corridor-facing
         # edge. Arming this is the whole of the drop fault: the arm carries the
         # part there and opens its jaws, and gravity does the rest. Nothing is
@@ -86,6 +90,7 @@ class ScriptedArm:
     def reset(self, phase_offset: int = 0) -> None:
         self._tick = int(phase_offset)
         self.faulted = False
+        self.place_slot = 0
         self.drop_fault = False
         self.released_off_table = False
         self.release_override = False
@@ -93,7 +98,7 @@ class ScriptedArm:
 
     @property
     def active_waypoints(self):
-        return self.drop_waypoints if self.drop_fault else self.waypoints
+        return self.drop_waypoints if self.drop_fault else self.slot_waypoints[self.place_slot]
 
     @property
     def carrying(self) -> bool:
@@ -159,8 +164,11 @@ class ScriptedArm:
         data.ctrl[self.jaw_act_ids] = self.jaw_target()
 
     def advance(self) -> None:
-        if not self.faulted and not self.release_override:
-            self._tick += 1
+        if self.faulted or self.release_override:
+            return
+        self._tick += 1
+        if self._tick % self.cycle_length == 0:
+            self.place_slot = (self.place_slot + 1) % fcfg.OUTFEED_SLOTS
 
 
 class ConveyorBelt:
@@ -212,7 +220,7 @@ class ConveyorBelt:
                 if line is None:
                     continue
                 body = int(env.model.geom_bodyid[other])
-                if body in env._part_body_ids:
+                if body in env._driven_body_ids:
                     touching[body] = line
         return touching
 
@@ -220,11 +228,25 @@ class ConveyorBelt:
         env.data.xfrc_applied[:] = 0.0
         target_velocity = fcfg.BELT_SPEED * fcfg.BELT_DIRECTION
         on_belt = self.belt_contacts(env)
-        for index, body in enumerate(env._part_body_ids):
+        # Zero-pressure accumulation: order each belt's parts front to back and
+        # cut the drive under anything that has closed up on the part ahead, so
+        # a queue parks without pushing. The part being picked is then never
+        # pressed against by the next one, and the moment the arm takes it away
+        # the gap opens and the queue indexes forward on its own.
+        blocked = set()
+        for line in range(fcfg.N_LINES):
+            ordered = sorted(((int(b), float(env.data.xpos[b][1])) for b, l in on_belt.items() if l == line),
+                             key=lambda item: -item[1])
+            for (body, y), (_, ahead_y) in zip(ordered[1:], ordered):
+                if ahead_y - y < fcfg.ACCUMULATION_GAP_M:
+                    blocked.add(body)
+        for index, body in enumerate(env._driven_body_ids):
             line = on_belt.get(int(body))
             if line is None or not self.line_running[line] or int(body) in self.jammed_parts:
                 continue
-            dof = env._part_dof_adr[index]
+            if int(body) in blocked:
+                continue
+            dof = env._driven_dof_adr[index]
             velocity_y = float(env.data.qvel[dof + 1])
             mass = float(env.model.body_mass[body])
             force = float(
@@ -502,6 +524,19 @@ class FactoryEnv(WholeBodyEnv):
             self._part_qpos_adr.append(model.jnt_qposadr[jid])
             self._part_dof_adr.append(model.jnt_dofadr[jid])
             self._part_body_ids.append(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, fcfg.part_body_name(k)))
+        # Queue parts are line traffic: the belt drives them and they stop when
+        # it stops, but no recovery is ever judged on them.
+        self._queue_qpos_adr, self._queue_dof_adr, self._queue_body_ids = [], [], []
+        for k in range(fcfg.N_WORKCELLS):
+            for slot in range(fcfg.QUEUE_PARTS_PER_LINE):
+                jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, fcfg.queue_part_joint_name(k, slot))
+                assert jid >= 0, f"queue joint {k}/{slot} not found"
+                self._queue_qpos_adr.append(model.jnt_qposadr[jid])
+                self._queue_dof_adr.append(model.jnt_dofadr[jid])
+                self._queue_body_ids.append(
+                    mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, fcfg.queue_part_body_name(k, slot)))
+        self._driven_body_ids = list(self._part_body_ids) + list(self._queue_body_ids)
+        self._driven_dof_adr = list(self._part_dof_adr) + list(self._queue_dof_adr)
         self._forbidden_body_ids = {
             mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
             for name in self.factory.navigation.forbidden_contact_bodies
@@ -517,6 +552,22 @@ class FactoryEnv(WholeBodyEnv):
         self.release_position = None
 
     # ------------------------------------------------------------------
+    def _stand_at_observation_post(self) -> None:
+        """Put the supervisor at the end of the lines, facing back up them.
+
+        This is the only pose written directly to the base, and only at reset:
+        it is the episode's initial condition, the same way the parts' starting
+        places are. Nothing moves the base after this except the legs.
+        """
+        adr = self.model.jnt_qposadr[
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, tc.FLOATING_BASE_JOINT)]
+        xy, heading = fcfg.observation_pose()
+        self.data.qpos[adr : adr + 2] = xy
+        self.data.qpos[adr + 3 : adr + 7] = [np.cos(heading / 2.0), 0.0, 0.0, np.sin(heading / 2.0)]
+        self.data.qvel[self.model.jnt_dofadr[
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, tc.FLOATING_BASE_JOINT)] : ][:6] = 0.0
+        mujoco.mj_forward(self.model, self.data)
+
     def _rest_pos(self, world_xy) -> np.ndarray:
         """A part standing on a work surface at the given world (x, y)."""
         z = fcfg.TABLE_TOP_Z + self.factory.part_half_size + tc.OBJECT_TABLE_GAP
@@ -528,12 +579,26 @@ class FactoryEnv(WholeBodyEnv):
             return self._rest_pos(self.poses[index].canonical_part_xy)
         return self._rest_pos(self.poses[index].to_world_xy(local_xy))
 
+    def _set_free_body(self, qpos_adr: int, dof_adr: int, position: np.ndarray) -> None:
+        self.data.qpos[qpos_adr : qpos_adr + 3] = position
+        self.data.qpos[qpos_adr + 3 : qpos_adr + 7] = [1.0, 0.0, 0.0, 0.0]
+        self.data.qvel[dof_adr : dof_adr + 6] = 0.0
+
     def _set_part(self, index: int, position: np.ndarray) -> None:
-        adr = self._part_qpos_adr[index]
-        self.data.qpos[adr : adr + 3] = position
-        self.data.qpos[adr + 3 : adr + 7] = [1.0, 0.0, 0.0, 0.0]
-        dof = self._part_dof_adr[index]
-        self.data.qvel[dof : dof + 6] = 0.0
+        self._set_free_body(self._part_qpos_adr[index], self._part_dof_adr[index], position)
+
+    def _line_traffic_speed(self) -> list[float]:
+        """How fast each line's queued parts are actually moving.
+
+        Reported so "the line stopped" is a measurement of the parts, not a
+        restatement of the flag that stopped them.
+        """
+        speeds = []
+        for k in range(fcfg.N_LINES):
+            per_line = [abs(float(self.data.qvel[self._queue_dof_adr[k * fcfg.QUEUE_PARTS_PER_LINE + s] + 1]))
+                        for s in range(fcfg.QUEUE_PARTS_PER_LINE)]
+            speeds.append(max(per_line) if per_line else 0.0)
+        return speeds
 
     def _part_on_work_surface(self, index: int) -> bool:
         """Contact-based: the part is actually resting on the surface it belongs on."""
@@ -575,6 +640,7 @@ class FactoryEnv(WholeBodyEnv):
             self.fault_step = int(fault_cfg.fixed_step)
 
         obs, info = super().reset(seed=seed, options=options)
+        self._stand_at_observation_post()
         self.belt.running = True
         self.belt.jammed_parts.clear()
 
@@ -589,6 +655,10 @@ class FactoryEnv(WholeBodyEnv):
             self.data.qpos[arm.qpos_adr] = arm.target()
             self.data.qpos[arm.jaw_qpos_adr] = arm.jaw_target()
             self._set_part(k, self._rest_pos(self.poses[k].pick_xy))
+            for slot in range(fcfg.QUEUE_PARTS_PER_LINE):
+                self._set_free_body(self._queue_qpos_adr[k * fcfg.QUEUE_PARTS_PER_LINE + slot],
+                                    self._queue_dof_adr[k * fcfg.QUEUE_PARTS_PER_LINE + slot],
+                                    self._rest_pos(self.poses[k].queue_xy(slot)))
 
         if fault_cfg.enabled and self.scenario == "jam":
             # A jam is an INITIAL CONDITION, not a mid-episode teleport: the
@@ -796,6 +866,7 @@ class FactoryEnv(WholeBodyEnv):
                 "line_state": self.task_manager.state.name,
                 "belt_running": bool(self.belt.line_running[self.fault_workcell]),
                 "lines_running": [bool(v) for v in self.belt.line_running],
+                "line_throughput_m_s": self._line_traffic_speed(),
                 "target_workcell": self.task_manager.target_station,
                 "completion_requested": self.task_manager.completion_requested,
                 "scenario": self.scenario,

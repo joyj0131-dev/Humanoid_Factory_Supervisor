@@ -112,6 +112,13 @@ LINE_X = _line_x_positions()
 LOCAL_CANONICAL_PART_XY = (0.27, 0.0)  # GraspEnvConfig.object_pos default
 LOCAL_TABLE_POS = tc.DEFAULT_TABLE_POS  # (0.30, 0.0, 0.70)
 LOCAL_OBSERVATION_XY = (-0.80, 0.0)
+
+# Where the supervisor stands when nothing is wrong: at the downstream end of
+# both lines, facing back up them, so production flows toward it and both
+# workcells are in view at once. This is a supervision post, not a parking spot
+# -- reaching either fault from here is a real walk down the corridor.
+OBSERVATION_SETBACK_M = 1.15
+OBSERVATION_HEADING_RAD = -math.pi / 2.0  # facing -Y, back along the lines
 # The canonical grasp has the work surface 0.30 m ahead of the pelvis and the
 # part at 0.27 m, so the part sits 30 mm in from the surface centreline, on the
 # robot's side. Reproducing that inset is what keeps the validated grasp
@@ -138,6 +145,28 @@ PICK_Y = STOPPER_DOWNSTREAM_M - STOPPER_HALF_SIZE[1] - PART_HALF_SIZE_M
 # the pick spot. Deliberately still ON the belt -- the supervisor has to put it
 # back at the pick spot, which is the belt-height task that already works.
 JAM_UPSTREAM_M = -0.34  # relative to the belt origin, well short of the blade
+
+# Production queue. One part at the blade is not a running line: with nothing
+# else on the belt there is nothing visibly moving, so a stopped line looks
+# exactly like a running one. These parts feed in from upstream, close up behind
+# the indexed part, and freeze where they are the moment the line stops.
+# Zero-pressure accumulation, the way a real accumulating conveyor works: the
+# drive disengages under a part that has closed up behind the one in front, so
+# the queue parks without pushing. A fixed escapement blade was tried first and
+# rejected -- it holds the queue but then the line can never index the next
+# part, so after a few seconds nothing moves on either belt and a stopped line
+# looks exactly like a running one again. Without any of this the belt pressed
+# the next part into the indexed one and the arm lifted BOTH: measured, the
+# queued part rode from 0.812 up to 0.906 m and the grip failed.
+ACCUMULATION_GAP_M = 0.18  # 0.12 m part plus 0.06 m of clear air
+QUEUE_PARTS_PER_LINE = 3
+QUEUE_FIRST_SETBACK_M = 0.90   # how far behind the pick spot the queue starts
+QUEUE_SPACING_M = 0.60         # gap between queued parts as they feed in
+
+# The arm sets each finished part down in the next free slot along the table,
+# so a second cycle does not stack a part on top of the first.
+OUTFEED_SLOTS = 3
+OUTFEED_SLOT_PITCH_M = 0.18
 JAM_JITTER_M = (0.03, 0.03)
 
 # Line 1 fault: the arm carries the part past the table and opens its jaws, so
@@ -253,8 +282,18 @@ class WorkcellPose:
     @property
     def table_place_xy(self) -> np.ndarray:
         """Where the arm sets a finished part down on the table."""
+        return self.table_slot_xy(OUTFEED_SLOTS // 2)
+
+    def table_slot_xy(self, slot: int) -> np.ndarray:
+        """One of the outfeed slots along the table, counted from upstream."""
+        offset = (int(slot) - (OUTFEED_SLOTS - 1) / 2.0) * OUTFEED_SLOT_PITCH_M
         return np.array([self.table_x + self.inward[0] * SURFACE_INSET_M,
-                         self.work_y + TABLE_DOWNSTREAM_M])
+                         self.work_y + TABLE_DOWNSTREAM_M + offset])
+
+    def queue_xy(self, slot: int) -> np.ndarray:
+        """Where a queued part starts, upstream of the pick spot."""
+        return np.array([self.pick_xy[0],
+                         self.pick_xy[1] - QUEUE_FIRST_SETBACK_M - slot * QUEUE_SPACING_M])
 
     @property
     def release_fault_xy(self) -> np.ndarray:
@@ -282,6 +321,12 @@ class WorkcellPose:
     @property
     def observation_xy(self) -> np.ndarray:
         return self.to_world_xy(LOCAL_OBSERVATION_XY)
+
+
+def observation_pose() -> tuple[np.ndarray, float]:
+    """The supervisor's home pose: (x, y) on the floor and its heading."""
+    return (np.array([CORRIDOR_CENTRE_X, WORK_Y + OBSERVATION_SETBACK_M]),
+            OBSERVATION_HEADING_RAD)
 
 
 def workcell_poses(layout: str | LayoutPreset = DEFAULT_LAYOUT) -> list[WorkcellPose]:
@@ -394,6 +439,18 @@ def part_joint_name(index: int) -> str:
 
 def part_geom_name(index: int) -> str:
     return f"wc{index}_part_geom"
+
+
+def queue_part_body_name(index: int, slot: int) -> str:
+    return f"wc{index}_queue{slot}"
+
+
+def queue_part_joint_name(index: int, slot: int) -> str:
+    return f"wc{index}_queue{slot}_joint"
+
+
+def queue_part_geom_name(index: int, slot: int) -> str:
+    return f"wc{index}_queue{slot}_geom"
 
 
 def belt_body_name(index: int) -> str:
@@ -532,14 +589,14 @@ ARM_RELEASE_STEP_INDEX = 6
 ARM_FAULT_WAYPOINT_INDEX = 2
 
 
-def arm_cycle_waypoints(pose: "WorkcellPose", *, drop_fault: bool = False):
+def arm_cycle_waypoints(pose: "WorkcellPose", *, drop_fault: bool = False, slot: int = OUTFEED_SLOTS // 2):
     """The scripted cycle as arm joint targets, derived from the layout.
 
     ``drop_fault`` swings the arm past the table's corridor-facing edge before
     it opens, which is the whole of line 1's failure: no special-case physics,
     just a place spot that is not over the table any more.
     """
-    place = pose.release_fault_xy if drop_fault else pose.table_place_xy
+    place = pose.release_fault_xy if drop_fault else pose.table_slot_xy(slot)
     spots = {"pick": pose.pick_xy, "place": place}
     out = []
     for spot, wrist_z, _jaw, _dwell in ARM_CYCLE_STEPS:

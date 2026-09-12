@@ -285,6 +285,25 @@ def _add_station(spec, pose: fcfg.WorkcellPose, config: fcfg.FactoryConfig) -> N
         friction=list(config.part_friction),
     )
 
+    # Parts already on the line behind the indexed one, so a running belt has
+    # something visibly moving on it and a stopped one visibly does not.
+    for slot in range(fcfg.QUEUE_PARTS_PER_LINE):
+        queue_xy = pose.queue_xy(slot)
+        queued = spec.worldbody.add_body(
+            name=fcfg.queue_part_body_name(index, slot),
+            pos=[float(queue_xy[0]), float(queue_xy[1]),
+                 fcfg.TABLE_TOP_Z + half + tc.OBJECT_TABLE_GAP],
+        )
+        queued.add_freejoint(name=fcfg.queue_part_joint_name(index, slot))
+        queued.add_geom(
+            name=fcfg.queue_part_geom_name(index, slot),
+            type=mujoco.mjtGeom.mjGEOM_BOX,
+            size=[half, half, half],
+            rgba=[0.72, 0.40, 0.16, 1],
+            mass=config.part_mass,
+            friction=list(config.part_friction),
+        )
+
     stopper_xy = pose.stopper_xy
     stopper = spec.worldbody.add_body(
         name=fcfg.stopper_body_name(index),
