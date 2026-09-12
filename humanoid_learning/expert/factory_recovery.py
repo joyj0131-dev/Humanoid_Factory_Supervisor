@@ -157,7 +157,8 @@ class FactoryRecovery:
         return SharpaGraspEnv(
             config, shared_model=e.model, shared_data=e.data,
             object_joint=fc.part_joint_name(station), object_body=fc.part_body_name(station),
-            object_geom=fc.part_geom_name(station), support_geom=fc.BELT_GEOM)
+            object_geom=fc.part_geom_name(station),
+            support_geom=fc.work_surface_geom_name(e.poses[station]))
 
     def _transition(self, state):
         self.events.append({'step': self.env._step_count, 'state': state})
@@ -173,7 +174,8 @@ class FactoryRecovery:
     def lift_evidence(self):
         e = self.env
         obj, belt = (e.model.geom(name).id for name in
-                     (fc.part_geom_name(self.station), fc.BELT_GEOM))
+                     (fc.part_geom_name(self.station),
+                      fc.work_surface_geom_name(e.poses[self.station])))
         half_height = abs(e.data.geom_xmat[obj].reshape(3, 3)[2]) @ e.model.geom_size[obj]
         top = e.data.geom_xpos[belt, 2] + abs(e.data.geom_xmat[belt].reshape(3, 3)[2]) @ e.model.geom_size[belt]
         clearance = float(e.data.geom_xpos[obj, 2] - half_height - top)
@@ -385,7 +387,7 @@ class FactoryRecovery:
                 self._transition('FAILED')
 
         e.task_manager.update(e, e._step_count)
-        e.belt.running = e.task_manager.belt_should_run
+        e.belt.set_line_running(self.station, e.task_manager.belt_should_run)
         e.belt.drive(e)
         for arm in e.arms:
             arm.apply(e.data)

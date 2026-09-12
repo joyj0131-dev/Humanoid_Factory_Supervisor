@@ -41,7 +41,7 @@ FACTORY_OBS_LAYOUT = (
     "(cos,sin), part position in base frame (x,y,z), arm cycle phase (cos,sin), "
     "arm fault flag; then: fault_active, target one-hot (2), target part in base "
     "frame (x,y,z), target manipulation pose in base frame (x,y), target heading "
-    "error (cos,sin), belt_running; mission state one-hot (4), verification progress, completion requested; active fault type one-hot (drop, misplaced)"
+    "error (cos,sin), belt_running; mission state one-hot (4), verification progress, completion requested; active fault type one-hot (jam, arm_drop)"
 )
 
 
@@ -53,11 +53,19 @@ class ScriptedArm:
     stall is visible in the scene and in the observation.
     """
 
-    def __init__(self, index: int, model: mujoco.MjModel):
+    def __init__(self, pose: fcfg.WorkcellPose, model: mujoco.MjModel):
+        index = pose.index
         self.index = index
-        self.waypoints = fcfg.arm_cycle_waypoints()
+        self.pose = pose
+        self.waypoints = fcfg.arm_cycle_waypoints(pose)
+        # Same cycle, but the place spot sits past the table's corridor-facing
+        # edge. Arming this is the whole of the drop fault: the arm carries the
+        # part there and opens its jaws, and gravity does the rest. Nothing is
+        # teleported and no contact is disabled.
+        self.drop_waypoints = fcfg.arm_cycle_waypoints(pose, drop_fault=True)
         self.jaw_targets = fcfg.arm_cycle_jaw_targets()
-        self.hold_steps = fcfg.ARM_CYCLE_HOLD_STEPS
+        self.dwells = fcfg.arm_cycle_dwells()
+        self._edges = np.cumsum(self.dwells)
 
         def act(suffix):
             aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, fcfg.arm_joint_name(index, suffix))
@@ -78,24 +86,41 @@ class ScriptedArm:
     def reset(self, phase_offset: int = 0) -> None:
         self._tick = int(phase_offset)
         self.faulted = False
+        self.drop_fault = False
+        self.released_off_table = False
         self.release_override = False
         self.park_target = None
 
     @property
+    def active_waypoints(self):
+        return self.drop_waypoints if self.drop_fault else self.waypoints
+
+    @property
+    def carrying(self) -> bool:
+        """True while the scripted cycle should have the part in its jaws."""
+        return fcfg.ARM_CYCLE_STEPS[self.waypoint_index][2] == "closed"
+
+    @property
     def cycle_length(self) -> int:
-        return len(self.waypoints) * self.hold_steps
+        return int(self._edges[-1])
 
     @property
     def waypoint_index(self) -> int:
         if self.faulted and self.park_target is None:
             return fcfg.ARM_FAULT_WAYPOINT_INDEX
-        return (self._tick // self.hold_steps) % len(self.waypoints)
+        return int(np.searchsorted(self._edges, self._tick % self.cycle_length, side="right"))
+
+    def _dwell_phase(self) -> float:
+        """How far through the current waypoint's dwell the arm is, 0..1."""
+        index = self.waypoint_index
+        start = 0 if index == 0 else int(self._edges[index - 1])
+        return ((self._tick % self.cycle_length) - start) / self.dwells[index]
 
     @property
     def phase(self) -> float:
         """Position in the cycle, 0..1. Frozen while faulted."""
         if self.faulted and self.park_target is None:
-            return fcfg.ARM_FAULT_WAYPOINT_INDEX / len(self.waypoints)
+            return fcfg.ARM_FAULT_WAYPOINT_INDEX / len(self.active_waypoints)
         return (self._tick % self.cycle_length) / self.cycle_length
 
     def target(self) -> np.ndarray:
@@ -109,13 +134,13 @@ class ScriptedArm:
         """
         if self.park_target is not None:
             return self.park_target.copy()
-        current = np.asarray(self.waypoints[self.waypoint_index], dtype=np.float64)
+        waypoints = self.active_waypoints
+        current = np.asarray(waypoints[self.waypoint_index], dtype=np.float64)
         if self.faulted or self.release_override:
             return current
         index = self.waypoint_index
-        previous = np.asarray(self.waypoints[(index - 1) % len(self.waypoints)], dtype=np.float64)
-        phase = (self._tick % self.hold_steps) / self.hold_steps
-        alpha = min(1.0, phase / RAMP_FRACTION)
+        previous = np.asarray(waypoints[(index - 1) % len(waypoints)], dtype=np.float64)
+        alpha = min(1.0, self._dwell_phase() / RAMP_FRACTION)
         alpha = alpha * alpha * (3.0 - 2.0 * alpha)  # smoothstep: zero velocity at both ends
         return previous + alpha * (current - previous)
 
@@ -124,7 +149,7 @@ class ScriptedArm:
         if self.faulted or self.release_override:
             return fcfg.GRIPPER_OPEN
         index = self.waypoint_index
-        alpha = min(1.0, (self._tick % self.hold_steps) / (self.hold_steps * RAMP_FRACTION))
+        alpha = min(1.0, self._dwell_phase() / RAMP_FRACTION)
         alpha = alpha * alpha * (3.0 - 2.0 * alpha)
         previous = self.jaw_targets[(index - 1) % len(self.jaw_targets)]
         return float(previous + alpha * (self.jaw_targets[index] - previous))
@@ -149,31 +174,55 @@ class ConveyorBelt:
     """
 
     def __init__(self, model: mujoco.MjModel):
-        self.belt_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, fcfg.BELT_GEOM)
-        assert self.belt_geom >= 0, "conveyor belt geom missing"
-        self.running = True
+        self.belt_of_geom: dict[int, int] = {}
+        for index in range(fcfg.N_LINES):
+            geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, fcfg.belt_geom_name(index))
+            assert geom >= 0, f"conveyor belt geom missing on line {index}"
+            self.belt_of_geom[int(geom)] = index
+        # One line faulting stops that line, not the factory.
+        self.line_running = [True] * fcfg.N_LINES
+        # A jammed part is one the belt cannot move: it is held by the guides,
+        # not riding the surface. That is what the belt losing traction on a
+        # single body represents -- the wedge's own contact mechanics are not
+        # simulated, and the part stays exactly where it stuck until something
+        # physically moves it.
+        self.jammed_parts: set[int] = set()
+
+    @property
+    def running(self) -> bool:
+        return all(self.line_running)
+
+    @running.setter
+    def running(self, value: bool) -> None:
+        self.line_running = [bool(value)] * fcfg.N_LINES
+
+    def set_line_running(self, index: int, value: bool) -> None:
+        self.line_running[int(index)] = bool(value)
 
     def parts_on_belt(self, env) -> set[int]:
-        touching = set()
+        return set(self.belt_contacts(env))
+
+    def belt_contacts(self, env) -> dict[int, int]:
+        """Part body id -> the line whose belt it is resting on."""
+        touching: dict[int, int] = {}
         for i in range(env.data.ncon):
             contact = env.data.contact[i]
-            geoms = {contact.geom1, contact.geom2}
-            if self.belt_geom not in geoms:
-                continue
-            other = (geoms - {self.belt_geom}).pop()
-            body = env.model.geom_bodyid[other]
-            if body in env._part_body_ids:
-                touching.add(int(body))
+            for geom, other in ((contact.geom1, contact.geom2), (contact.geom2, contact.geom1)):
+                line = self.belt_of_geom.get(int(geom))
+                if line is None:
+                    continue
+                body = int(env.model.geom_bodyid[other])
+                if body in env._part_body_ids:
+                    touching[body] = line
         return touching
 
     def drive(self, env) -> None:
         env.data.xfrc_applied[:] = 0.0
-        if not self.running:
-            return
         target_velocity = fcfg.BELT_SPEED * fcfg.BELT_DIRECTION
-        on_belt = self.parts_on_belt(env)
+        on_belt = self.belt_contacts(env)
         for index, body in enumerate(env._part_body_ids):
-            if body not in on_belt:
+            line = on_belt.get(int(body))
+            if line is None or not self.line_running[line] or int(body) in self.jammed_parts:
                 continue
             dof = env._part_dof_adr[index]
             velocity_y = float(env.data.qvel[dof + 1])
@@ -301,19 +350,25 @@ class FactoryTaskManager:
             # Signal back: restart the belt and let the stalled arm resume.
             # Start a fresh approach, not the interrupted grip/transfer phase.
             env.arms[self.fault_station].reset()
+            env.belt.jammed_parts.discard(int(env._part_body_ids[self.fault_station]))
             self.state = LineState.RUNNING
             env.scenario_status = "resolved"
             self._event("line_restarted", step_count)
 
     def _part_is_back(self, env) -> bool:
-        """Measured: the part sits at its pick spot and has stopped moving."""
+        """Measured: the part sits where this line needs it and has stopped.
+
+        Line 0's part belongs back at its belt pick spot; line 1's belongs on
+        its outfeed table. ``canonical_part_xy`` already knows which, so the
+        same check serves both without a per-scenario special case.
+        """
         index = self.fault_station
         pose = env.poses[index]
         part = env.part_position(index)
-        local = pose.to_local_xy(part[:2])
-        if float(np.linalg.norm(local - np.asarray(fcfg.LOCAL_CANONICAL_PART_XY))) > fcfg.RECOVERY_POSITION_TOLERANCE_M:
+        target = pose.canonical_part_xy
+        if float(np.linalg.norm(part[:2] - target)) > fcfg.RECOVERY_POSITION_TOLERANCE_M:
             return False
-        if abs(float(part[2]) - env._part_rest_pos(index, fcfg.LOCAL_CANONICAL_PART_XY)[2]) > 0.05:
+        if abs(float(part[2]) - env._part_rest_pos(index)[2]) > 0.05:
             return False
         rotation = env.data.xmat[env._part_body_ids[index]].reshape(3, 3)
         if rotation[2, 2] < np.cos(0.15):
@@ -322,7 +377,7 @@ class FactoryTaskManager:
         # A cube's quarter-turns are equivalent for this parallel gripper.
         if abs((yaw + np.pi / 4) % (np.pi / 2) - np.pi / 4) > 0.15:
             return False
-        if env._part_body_ids[index] not in env.belt.parts_on_belt(env):
+        if not env._part_on_work_surface(index):
             return False
         dof = env._part_dof_adr[index]
         return float(np.abs(env.data.qvel[dof : dof + 6]).max()) < fcfg.RECOVERY_SETTLE_SPEED
@@ -435,7 +490,7 @@ class FactoryEnv(WholeBodyEnv):
     def _resolve_indices(self) -> None:
         super()._resolve_indices()
         model = self.model
-        self.arms = [ScriptedArm(k, model) for k in range(fcfg.N_WORKCELLS)]
+        self.arms = [ScriptedArm(pose, model) for pose in self.poses]
         self.belt = ConveyorBelt(model)
         self.task_manager = FactoryTaskManager(self.factory)
         self._part_qpos_adr = []
@@ -462,10 +517,16 @@ class FactoryEnv(WholeBodyEnv):
         self.release_position = None
 
     # ------------------------------------------------------------------
-    def _part_rest_pos(self, index: int, local_xy) -> np.ndarray:
-        xy = self.poses[index].to_world_xy(local_xy)
+    def _rest_pos(self, world_xy) -> np.ndarray:
+        """A part standing on a work surface at the given world (x, y)."""
         z = fcfg.TABLE_TOP_Z + self.factory.part_half_size + tc.OBJECT_TABLE_GAP
-        return np.array([xy[0], xy[1], z])
+        return np.array([float(world_xy[0]), float(world_xy[1]), z])
+
+    def _part_rest_pos(self, index: int, local_xy=None) -> np.ndarray:
+        """Where this line's part belongs when the line is running normally."""
+        if local_xy is None:
+            return self._rest_pos(self.poses[index].canonical_part_xy)
+        return self._rest_pos(self.poses[index].to_world_xy(local_xy))
 
     def _set_part(self, index: int, position: np.ndarray) -> None:
         adr = self._part_qpos_adr[index]
@@ -473,6 +534,15 @@ class FactoryEnv(WholeBodyEnv):
         self.data.qpos[adr + 3 : adr + 7] = [1.0, 0.0, 0.0, 0.0]
         dof = self._part_dof_adr[index]
         self.data.qvel[dof : dof + 6] = 0.0
+
+    def _part_on_work_surface(self, index: int) -> bool:
+        """Contact-based: the part is actually resting on the surface it belongs on."""
+        surface = self.model.geom(fcfg.work_surface_geom_name(self.poses[index])).id
+        part = self.model.geom(fcfg.part_geom_name(index)).id
+        for contact in self.data.contact[: self.data.ncon]:
+            if {int(contact.geom1), int(contact.geom2)} == {surface, part}:
+                return True
+        return False
 
     def part_position(self, index: int) -> np.ndarray:
         adr = self._part_qpos_adr[index]
@@ -485,15 +555,18 @@ class FactoryEnv(WholeBodyEnv):
         # only on the episode seed, never on how many physics steps have run.
         scenario_rng = np.random.default_rng(0 if seed is None else int(seed))
         fault_cfg = self.factory.fault
-        self.scenario = options.get("scenario", fault_cfg.scenario)
-        if self.scenario not in ("dropped_part", "misplaced_part"):
-            raise ValueError("scenario must be dropped_part or misplaced_part")
-        self.scenario_status = "waiting"
-        self.release_position = None
-
         self.fault_workcell = int(options.get("fault_workcell", scenario_rng.integers(0, fcfg.N_WORKCELLS)))
         if not 0 <= self.fault_workcell < fcfg.N_WORKCELLS:
             raise ValueError(f"fault_workcell must be 0..{fcfg.N_WORKCELLS - 1}")
+        # Each line has its own failure mode, because each line presents a
+        # different surface to the corridor: line 0's belt faces in, so its part
+        # jams there; line 1's table faces in, so its part is dropped there.
+        self.scenario = options.get("scenario", fcfg.DEFAULT_SCENARIOS[self.fault_workcell])
+        if self.scenario not in fcfg.SCENARIOS:
+            raise ValueError(f"scenario must be one of {fcfg.SCENARIOS}")
+        self.scenario_status = "waiting"
+        self.release_position = None
+
         if "fault_step" in options:
             self.fault_step = int(options["fault_step"])
         elif fault_cfg.randomize_time:
@@ -502,6 +575,8 @@ class FactoryEnv(WholeBodyEnv):
             self.fault_step = int(fault_cfg.fixed_step)
 
         obs, info = super().reset(seed=seed, options=options)
+        self.belt.running = True
+        self.belt.jammed_parts.clear()
 
         for k, arm in enumerate(self.arms):
             # Offset the two cells so they are visibly out of phase and a test
@@ -513,15 +588,24 @@ class FactoryEnv(WholeBodyEnv):
             arm.apply(self.data)
             self.data.qpos[arm.qpos_adr] = arm.target()
             self.data.qpos[arm.jaw_qpos_adr] = arm.jaw_target()
-            self._set_part(k, self._part_rest_pos(k, fcfg.LOCAL_CANONICAL_PART_XY))
+            self._set_part(k, self._rest_pos(self.poses[k].pick_xy))
 
-        if fault_cfg.enabled and self.scenario == "misplaced_part":
+        if fault_cfg.enabled and self.scenario == "jam":
+            # A jam is an INITIAL CONDITION, not a mid-episode teleport: the
+            # part starts cocked on the belt short of the stop blade. What the
+            # simulation then reproduces honestly is the line's reaction -- the
+            # index sensor times out and that belt stops -- rather than the
+            # contact mechanics of the wedge itself, which is not modelled.
             k = self.fault_workcell
-            local = np.asarray(fcfg.LOCAL_CANONICAL_PART_XY) + [0., fault_cfg.misplaced_offset_y]
-            self._set_part(k, self._part_rest_pos(k, local))
+            self._set_part(k, self._rest_pos(self.poses[k].jam_xy))
+            self.belt.jammed_parts.add(int(self._part_body_ids[k]))
             adr = self._part_qpos_adr[k]
-            yaw = fault_cfg.misplaced_yaw_rad
+            yaw = fault_cfg.jam_yaw_rad
             self.data.qpos[adr + 3:adr + 7] = [np.cos(yaw / 2), 0., 0., np.sin(yaw / 2)]
+        elif fault_cfg.enabled and self.scenario == "arm_drop":
+            # Nothing is moved. The arm is simply given the cycle whose place
+            # spot is past the table edge; it carries the part there and opens.
+            self.arms[self.fault_workcell].drop_fault = True
 
         self.task_manager.reset(self.fault_workcell, self.fault_step)
         self.belt.running = True
@@ -555,35 +639,37 @@ class FactoryEnv(WholeBodyEnv):
         return len(touching)
 
     def _scenario_update(self) -> bool:
-        """Inject actuator release, detect the physical outcome; never teleport a part."""
+        """Detect the physical outcome of the injected fault. Never teleports a part."""
         k = self.fault_workcell
         arm = self.arms[k]
         part = self.part_position(k)
-        contacts = self._jaw_contacts(k)
-        rest_z = fcfg.TABLE_TOP_Z + self.factory.part_half_size
-        if self.scenario == "misplaced_part":
-            missed = (arm.waypoint_index == 3 and contacts == 0
-                      and abs(part[2] - rest_z) < 0.015
-                      and np.linalg.norm(part[:2] - self.poses[k].canonical_part_xy) > 0.10)
-            if missed:
-                self.scenario_status = "pick_failed"
-                arm.park_target = self.data.qpos[arm.qpos_adr].copy()
-            return bool(missed)
+        pose = self.poses[k]
+        if self.scenario == "jam":
+            # The index sensor times out: no part reached the pick spot. Judged
+            # on the measured part pose, not on the step counter alone.
+            short = float(np.linalg.norm(part[:2] - pose.pick_xy)) > fcfg.RECOVERY_POSITION_TOLERANCE_M
+            if short and self._step_count >= self.fault_step:
+                if self.scenario_status == "waiting":
+                    self.scenario_status = "jammed"
+                    arm.park_target = self.data.qpos[arm.qpos_adr].copy()
+                return True
+            return False
+        # arm_drop: the jaws open past the table edge and the part falls off it.
         if self.release_position is None:
-            transfer = np.linalg.norm(part[:2] - self.poses[k].canonical_part_xy)
-            if (arm.waypoint_index == 4 and contacts == 2
-                    and part[2] - rest_z > self.factory.fault.drop_min_lift_m
-                    and transfer > self.factory.fault.drop_min_transfer_m):
+            if arm.drop_fault and arm.waypoint_index >= fcfg.ARM_RELEASE_STEP_INDEX:
                 self.release_position = part.copy()
-                arm.park_target = self.data.qpos[arm.qpos_adr].copy()
-                arm.release_override = True
+                arm.released_off_table = True
                 self.scenario_status = "jaws_released"
             return False
-        fell = (contacts == 0 and self.release_position[2] - part[2]
-                > self.factory.fault.detection_fall_m)
-        if fell:
-            self.scenario_status = "drop_detected"
-        return bool(fell)
+        dof = self._part_dof_adr[k]
+        speed = float(np.abs(self.data.qvel[dof:dof + 3]).max())
+        on_floor = part[2] < fcfg.TABLE_TOP_Z - self.factory.fault.floor_clearance_m
+        if on_floor and speed < self.factory.fault.landed_speed_m_s:
+            if self.scenario_status != "dropped_to_floor":
+                self.scenario_status = "dropped_to_floor"
+                arm.park_target = self.data.qpos[arm.qpos_adr].copy()
+            return True
+        return False
 
     def step(self, action: np.ndarray, *, supervisor_signal: tuple[str, int] | None = None):
         signal_accepted = None
@@ -591,7 +677,8 @@ class FactoryEnv(WholeBodyEnv):
             name, station = supervisor_signal
             signal_accepted = self.task_manager.signal(name, station, self._step_count)
         self.task_manager.update(self, self._step_count)
-        self.belt.running = self.task_manager.belt_should_run
+        # One line faulting stops that line; the other keeps producing.
+        self.belt.set_line_running(self.fault_workcell, self.task_manager.belt_should_run)
         self.belt.drive(self)
 
         for arm in self.arms:
@@ -683,7 +770,7 @@ class FactoryEnv(WholeBodyEnv):
                     target_part,
                     target_manip,
                     target_heading,
-                    [1.0 if self.belt.running else 0.0],
+                    [1.0 if self.belt.line_running[self.fault_workcell] else 0.0],
                 ]
             )
         )
@@ -693,7 +780,7 @@ class FactoryEnv(WholeBodyEnv):
                             float(self.task_manager.completion_requested)])
         fault_type = np.zeros(2)
         if self.fault_active:
-            fault_type[0 if self.scenario == "dropped_part" else 1] = 1.
+            fault_type[fcfg.SCENARIOS.index(self.scenario)] = 1.
         pieces.append(fault_type)
         return np.concatenate([base, *pieces]).astype(np.float32)
 
@@ -707,7 +794,8 @@ class FactoryEnv(WholeBodyEnv):
                 "fault_triggered_step": self.task_manager.fault_triggered_step,
                 "recovered_step": self.task_manager.recovered_step,
                 "line_state": self.task_manager.state.name,
-                "belt_running": bool(self.belt.running),
+                "belt_running": bool(self.belt.line_running[self.fault_workcell]),
+                "lines_running": [bool(v) for v in self.belt.line_running],
                 "target_workcell": self.task_manager.target_station,
                 "completion_requested": self.task_manager.completion_requested,
                 "scenario": self.scenario,

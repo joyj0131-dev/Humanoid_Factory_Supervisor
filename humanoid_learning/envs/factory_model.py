@@ -1,5 +1,10 @@
-"""Compile the conveyor-line factory scene: floating-base G1 + Sharpa plus one
-conveyor carrying two independent scripted arm stations.
+"""Compile the two-line factory scene: floating-base G1 + Sharpa plus two
+independent lines, each a conveyor, a scripted arm and an outfeed table.
+
+Both lines read TABLE | ARM | BELT from world -X to +X -- the same order, not a
+mirror -- so the walking corridor between them has line 0's belt on one side and
+line 1's table on the other. That is what lets the supervisor reach line 0's
+jammed part and line 1's dropped part without walking around either line.
 
 Reuses ``model_builder``'s Sharpa attachment, EE/grasp sites and floor verbatim,
 so the robot half of this model is the same robot the whole-body and grasp envs
@@ -82,7 +87,13 @@ def _add_gripper(spec, wrist, index: int) -> None:
         jaw.add_joint(
             name=fcfg.arm_joint_name(index, suffix),
             type=mujoco.mjtJoint.mjJNT_SLIDE,
-            axis=[0.0, sign, 0.0],
+            # Closes ACROSS the line, not along it. Closing along the belt put
+            # the downstream jaw exactly where the stop blade is: the jaws
+            # jammed on the blade at 0.082 instead of reaching the commanded
+            # 0.058, only one jaw ever touched the part, and the arm lost it
+            # during the swing. A part indexed against a blade can only be
+            # gripped from its two free sides.
+            axis=[0.0, 0.0, sign],
             range=list(fcfg.GRIPPER_JOINT_RANGE),
         )
         jaw.add_geom(
@@ -190,10 +201,15 @@ def _add_automation_arm(spec, pose: fcfg.WorkcellPose) -> None:
         _add_position_actuator(spec, joint, joint, fcfg.ARM_KP, fcfg.ARM_KV, ctrlrange)
 
 
-def _add_conveyor(spec) -> None:
-    belt = spec.worldbody.add_body(name=fcfg.BELT_BODY, pos=[fcfg.CONVEYOR_CENTRE_X, 0.0, fcfg.BELT_BODY_Z])
+def _add_conveyor(spec, pose: fcfg.WorkcellPose) -> None:
+    """One line's belt plus its side rails, at that line's own x."""
+    index = pose.index
+    belt = spec.worldbody.add_body(
+        name=fcfg.belt_body_name(index),
+        pos=[float(pose.belt_x), float(pose.belt_y), fcfg.BELT_BODY_Z],
+    )
     belt.add_geom(
-        name=fcfg.BELT_GEOM,
+        name=fcfg.belt_geom_name(index),
         type=mujoco.mjtGeom.mjGEOM_BOX,
         size=list(fcfg.BELT_HALF_SIZE),
         rgba=[0.30, 0.32, 0.36, 1],
@@ -202,19 +218,40 @@ def _add_conveyor(spec) -> None:
     # Side rails, so the line reads as a conveyor rather than a long table.
     for sign, tag in ((-1.0, "m"), (1.0, "p")):
         rail = spec.worldbody.add_body(
-            name=f"conveyor_rail_{tag}",
+            name=f"wc{index}_rail_{tag}",
             pos=[
-                fcfg.CONVEYOR_CENTRE_X + sign * (fcfg.BELT_HALF_SIZE[0] + 0.02),
-                0.0,
+                float(pose.belt_x) + sign * (fcfg.BELT_HALF_SIZE[0] + 0.02),
+                float(pose.belt_y),
                 fcfg.TABLE_TOP_Z + fcfg.RAIL_HALF_HEIGHT,
             ],
         )
         rail.add_geom(
-            name=f"conveyor_rail_{tag}_geom",
+            name=f"wc{index}_rail_{tag}_geom",
             type=mujoco.mjtGeom.mjGEOM_BOX,
             size=[0.02, fcfg.BELT_HALF_SIZE[1], fcfg.RAIL_HALF_HEIGHT],
             rgba=[0.55, 0.57, 0.60, 1],
         )
+
+
+def _add_table(spec, pose: fcfg.WorkcellPose) -> None:
+    """The outfeed table the arm sets finished parts on.
+
+    Its top is flush with the belt, so a part standing on either surface sits at
+    the same height the canonical grasp was validated against.
+    """
+    index = pose.index
+    table_xy = pose.table_xy
+    table = spec.worldbody.add_body(
+        name=fcfg.table_body_name(index),
+        pos=[float(table_xy[0]), float(table_xy[1]), fcfg.TABLE_HALF_SIZE[2]],
+    )
+    table.add_geom(
+        name=fcfg.table_geom_name(index),
+        type=mujoco.mjtGeom.mjGEOM_BOX,
+        size=list(fcfg.TABLE_HALF_SIZE),
+        rgba=[0.24, 0.42, 0.78, 1],
+        friction=[1.0, 0.01, 0.0001],
+    )
 
 
 def _add_station(spec, pose: fcfg.WorkcellPose, config: fcfg.FactoryConfig) -> None:
@@ -289,8 +326,9 @@ def build_factory_model(config: fcfg.FactoryConfig) -> mujoco.MjModel:
     model_builder._add_sharpa_grasp_sites(spec)
     model_builder._add_floor(spec)
 
-    _add_conveyor(spec)
     for pose in config.workcells:
+        _add_conveyor(spec, pose)
+        _add_table(spec, pose)
         _add_station(spec, pose, config)
 
     # The line spans several metres, so the stock 640x480 offscreen framebuffer

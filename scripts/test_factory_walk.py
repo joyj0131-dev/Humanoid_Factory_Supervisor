@@ -163,7 +163,7 @@ def test_the_interactive_viewer_actually_drives_the_walker():
             try:
                 pelvis = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
                 start = env.data.xpos[pelvis][:2].copy()
-                args = types.SimpleNamespace(seed=0, walk_to=station, scenario="dropped_part",
+                args = types.SimpleNamespace(seed=0, walk_to=station, scenario=None,
                                              fault_workcell=None, fault_step=None, no_fault=False)
                 module.run_interactive(env, args)
                 assert StubViewer.rtf_seen, 'interactive viewer did not display measured RTF'

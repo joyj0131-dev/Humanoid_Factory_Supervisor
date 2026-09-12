@@ -48,7 +48,8 @@ def _describe(env, info) -> str:
         for k in range(fcfg.N_WORKCELLS)
     )
     target = info["target_workcell"]
-    belt = "BELT RUNNING" if info["belt_running"] else "BELT STOPPED"
+    lines = info.get("lines_running", [info["belt_running"]] * fcfg.N_LINES)
+    belt = " ".join(f"L{k}:{'RUN' if r else 'STOP'}" for k, r in enumerate(lines))
     return (f"{belt} [{info['line_state']}] || {cells} || "
             f"call={'none' if target < 0 else f'st{target}'}")
 
@@ -59,11 +60,12 @@ CAMERA_ELEVATION = -27.0
 
 
 def _camera_lookat(config) -> list[float]:
-    """Centre on the midpoint between the G1 home pose and the two cells, so
-    the robot and both workcells all fit in frame."""
-    cells = config.workcells
-    centre_x = float(np.mean([p.manipulation_xy[0] for p in cells]))
-    return [centre_x * 0.75, 0.0, 0.85]
+    """Centre on the work area between the two lines, so the corridor, both
+    belts and both tables fit in frame."""
+    lines = config.workcells
+    centre_x = float(np.mean([p.manipulation_xy[0] for p in lines]))
+    centre_y = float(np.mean([p.manipulation_xy[1] for p in lines])) * 0.6
+    return [centre_x, centre_y, 0.85]
 
 
 def _camera(config):
@@ -114,14 +116,17 @@ def navigator_station(navigator, env) -> int:
 
 def _panel(env, info, paused=False, walk=None) -> tuple[str, str]:
     target = info["target_workcell"]
-    labels = ["FACTORY SUPERVISOR", "Simulation", "Line", "Belt", "Request",
-              "Verification", "G1", "Station 0", "Station 1", "Controls", "Manual signals"]
+    lines = info.get("lines_running", [info["belt_running"]] * fcfg.N_LINES)
+    labels = ["FACTORY SUPERVISOR", "Simulation", "Line", "Belts", "Request",
+              "Verification", "G1", "Line 0 (belt faces corridor)",
+              "Line 1 (table faces corridor)", "Controls", "Manual signals"]
     values = [f"t={env.data.time:.1f}s", "PAUSED" if paused else "RUNNING",
-              info["line_state"], "ON" if info["belt_running"] else "STOPPED",
+              info["line_state"],
+              "  ".join(f"L{k} {'ON' if r else 'STOPPED'}" for k, r in enumerate(lines)),
               "none" if target < 0 else f"Station {target}",
               f"{info['recovery_progress']:.0%}", _g1_status(env, walk),
-              *[f"{'FAULT' if info['arm_faulted'][k] else 'CYCLE'} / phase {info['arm_waypoint'][k]}"
-                for k in range(2)], "SPACE pause | R reset | 0/1/2 cameras",
+              *[f"{'FAULT' if info['arm_faulted'][k] else 'CYCLE'} / step {info['arm_waypoint'][k]}"
+                for k in range(fcfg.N_LINES)], "SPACE pause | R reset | 0/1/2 cameras",
               "A accept | C request verification (no physical recovery)"]
     if info["mission_events"]:
         labels.append("Last event")
@@ -198,7 +203,7 @@ def run_interactive(env, args) -> None:
     print(f"Factory viewer: layout={env.factory.layout}, seed={args.seed}, "
           f"scenario={env.scenario}, station={env.fault_workcell}, eligible after step {env.fault_step}.")
     print("Green = producing, red = requested, amber = recovery/verification.")
-    print("SPACE pause | R reset | 0 overview | 1/2 station camera | A accept | C verify.")
+    print("SPACE pause | R reset | 0 overview | 1/2 line camera | A accept | C verify.")
     print("A/C are manual task-manager messages only: they do not move G1 or restore the part.")
     if getattr(args, 'recover', False):
         print('Experimental live recovery: fault -> prepare hands -> walk -> grasp/lift.')
@@ -337,7 +342,7 @@ def _drive_walker(env, bundle, announced: dict) -> None:
 
 
 def _reset_options(args) -> dict:
-    options = {"scenario": args.scenario}
+    options = {} if args.scenario is None else {"scenario": args.scenario}
     if args.fault_workcell is not None:
         options["fault_workcell"] = args.fault_workcell
     elif getattr(args, "walk_to", None) is not None:
@@ -354,8 +359,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--layout", choices=sorted(fcfg.LAYOUT_PRESETS), default=fcfg.DEFAULT_LAYOUT)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--scenario", choices=["dropped_part", "misplaced_part"],
-                        default="dropped_part")
+    parser.add_argument("--scenario", choices=list(fcfg.SCENARIOS), default=None,
+                        help="default: jam on line 0, arm_drop on line 1")
     parser.add_argument("--no-fault", action="store_true", help="normal production only")
     parser.add_argument("--fault-workcell", type=int, choices=range(fcfg.N_WORKCELLS), default=None,
                         help="override the seed's choice of which cell fails")
@@ -377,8 +382,8 @@ def main() -> None:
     parser.add_argument("--offscreen", action="store_true", help="render PNGs instead of opening a window")
     parser.add_argument("--out", default="results/factory/factory.png")
     parser.add_argument("--steps", type=int, default=400)
-    parser.add_argument("--camera", choices=("overview", "station0", "station1"), default="overview",
-                        help="offscreen viewpoint; the station cameras match the interactive 1/2 keys")
+    parser.add_argument("--camera", choices=("overview", "line0", "line1"), default="overview",
+                        help="offscreen viewpoint; the line cameras match the interactive 1/2 keys")
     parser.add_argument("--capture", type=int, nargs="+", default=[150, 400],
                         help="steps at which to save a frame in --offscreen mode")
     args = parser.parse_args()

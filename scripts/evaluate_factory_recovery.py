@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 
+from humanoid_learning.envs import factory_config as fcfg
 from humanoid_learning.envs.factory_env import FactoryEnv
 from humanoid_learning.expert.factory_recovery import FactoryRecovery, RecoveryConfig
 
@@ -21,7 +22,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--station', type=int, choices=(0, 1), required=True)
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--scenario', choices=('dropped_part', 'misplaced_part'), default='dropped_part')
+    parser.add_argument('--scenario', choices=list(fcfg.SCENARIOS), default=None,
+                        help='default: jam on line 0, arm_drop on line 1')
     parser.add_argument('--stand-off', type=float, default=0.27)
     parser.add_argument('--max-steps', type=int, default=12000)
     parser.add_argument('--squeeze', type=float, default=0.006)
@@ -36,7 +38,7 @@ def main():
     args = parser.parse_args()
     env = FactoryEnv()
     try:
-        env.reset(seed=args.seed, options={'fault_workcell': args.station, 'scenario': args.scenario})
+        env.reset(seed=args.seed, options={k: v for k, v in (('fault_workcell', args.station), ('scenario', args.scenario)) if v is not None})
         recovery = FactoryRecovery(env, RecoveryConfig(stand_off_m=args.stand_off, max_steps=args.max_steps,
                                                        hold_squeeze_m=args.squeeze,
                                                        motion_profile=args.motion_profile,

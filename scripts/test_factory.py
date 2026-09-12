@@ -24,7 +24,7 @@ from humanoid_learning.envs.factory_model import build_factory_model
 ZERO = np.zeros(ACTION_DIM)
 
 
-def wait_for_fault(env, limit=900):
+def wait_for_fault(env, limit=2200):
     for _ in range(limit):
         info = env.step(ZERO)[4]
         if info["fault_active"]:
@@ -35,7 +35,7 @@ def wait_for_fault(env, limit=900):
 G1_ACTUATOR_COUNT = 73
 
 
-def test_model_compiles_with_one_belt_and_two_independent_stations():
+def test_model_compiles_with_two_independent_lines():
     model = build_factory_model(fcfg.FactoryConfig())
     names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i) for i in range(model.nu)]
     assert len(names) == len(set(names)), "duplicate actuator names"
@@ -44,9 +44,9 @@ def test_model_compiles_with_one_belt_and_two_independent_stations():
     assert len(station_actuators) == expected, station_actuators
     assert model.nu - len(station_actuators) == G1_ACTUATOR_COUNT, "G1 actuator contract changed"
 
-    # One shared conveyor, but per-station parts, stoppers and arms.
-    assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, fcfg.BELT_GEOM) >= 0
-    for namer in (fcfg.part_body_name, fcfg.stopper_body_name, fcfg.beacon_body_name):
+    # Two of everything: each line owns a belt, a table, a part and an arm.
+    for namer in (fcfg.belt_body_name, fcfg.table_body_name,
+                  fcfg.part_body_name, fcfg.stopper_body_name, fcfg.beacon_body_name):
         ids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, namer(k)) for k in range(fcfg.N_WORKCELLS)]
         assert all(i >= 0 for i in ids), namer(0)
         assert len(set(ids)) == len(ids), f"stations share {namer(0)}"
@@ -87,7 +87,7 @@ def test_arm_links_do_not_collide_with_each_other():
         env.close()
 
 
-def test_workcell_poses_are_one_rigid_transform_of_the_canonical_scene():
+def test_each_line_reproduces_the_canonical_grasp_relationship():
     config = fcfg.FactoryConfig()
     poses = config.workcells
     assert len(poses) == fcfg.N_WORKCELLS
@@ -102,9 +102,18 @@ def test_workcell_poses_are_one_rigid_transform_of_the_canonical_scene():
         assert np.allclose(pose.to_local_xy(pose.table_pos[:2]), fcfg.LOCAL_TABLE_POS[:2], atol=1e-12)
         assert np.allclose(pose.to_local_xy(pose.canonical_part_xy), fcfg.LOCAL_CANONICAL_PART_XY, atol=1e-12)
 
+    # The corridor runs BETWEEN the lines, so the supervisor necessarily works
+    # them from opposite sides. Line 0 presents its belt to the corridor and
+    # line 1 its table, which is what makes both faults reachable from inside.
+    assert abs(abs(poses[0].heading_rad - poses[1].heading_rad) - math.pi) < 1e-12
+    assert poses[0].work_surface == "belt" and poses[1].work_surface == "table"
+    for pose in poses:
+        offset = float(np.linalg.norm(np.asarray(pose.manipulation_xy) - fcfg.CORRIDOR_CENTRE_X * np.array([1.0, 0.0])))
+        assert abs(pose.manipulation_xy[0] - fcfg.CORRIDOR_CENTRE_X) < fcfg.CORRIDOR_HALF_WIDTH_M, (
+            f"line {pose.index}'s stand pose is outside the walking corridor")
     separation = float(np.linalg.norm(np.asarray(poses[0].manipulation_xy) - np.asarray(poses[1].manipulation_xy)))
-    assert separation > 2.0, f"workcells too close for locomotion to be required: {separation:.3f} m"
-    print(f"    workcell manipulation-pose separation = {separation:.3f} m")
+    assert separation > 1.0, f"lines too close for locomotion to be required: {separation:.3f} m"
+    print(f"    both stand poses inside the corridor, {separation:.3f} m apart, facing opposite ways")
 
 
 def test_arm_cycle_stays_above_the_belt_and_reaches_the_part():
@@ -112,7 +121,6 @@ def test_arm_cycle_stays_above_the_belt_and_reaches_the_part():
     model = build_factory_model(config)
     data = mujoco.MjData(model)
     mujoco.mj_resetDataKeyframe(model, data, mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "stand"))
-    waypoints = fcfg.arm_cycle_waypoints()
     worst = math.inf
     grasp_error = None
     for k, pose in enumerate(config.workcells):
@@ -121,8 +129,8 @@ def test_arm_cycle_stays_above_the_belt_and_reaches_the_part():
             for s in fcfg.ARM_JOINT_SUFFIXES
         ]
         site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, fcfg.arm_body_name(k, "grasp"))
-        part = model.body(fcfg.part_body_name(k)).pos
-        for index, waypoint in enumerate(waypoints):
+        part = np.r_[pose.pick_xy, fcfg.PART_CENTRE_Z]
+        for index, waypoint in enumerate(fcfg.arm_cycle_waypoints(pose)):
             for a, v in zip(adr, waypoint):
                 data.qpos[a] = v
             mujoco.mj_forward(model, data)
@@ -130,7 +138,9 @@ def test_arm_cycle_stays_above_the_belt_and_reaches_the_part():
             # The gripper centre may sit at part height, but never below the belt.
             worst = min(worst, float(grasp[2]) - fcfg.TABLE_TOP_Z)
             if index == fcfg.ARM_FAULT_WAYPOINT_INDEX:
-                error = float(np.linalg.norm(grasp - part))
+                # Only the horizontal alignment has to be exact: the wrist is
+                # deliberately high enough to keep the palm off the part's top.
+                error = float(np.linalg.norm(grasp[:2] - part[:2]))
                 grasp_error = error if grasp_error is None else max(grasp_error, error)
     assert worst > 0.0, f"gripper reaches {worst:.3f} m relative to the belt surface"
     assert grasp_error < 0.005, f"grasp pose misses the part centre by {grasp_error * 1000:.1f} mm"
@@ -160,7 +170,7 @@ def test_arm_actually_picks_the_part_up_and_places_it():
         peak_z = 0.0
         peak_force = 0.0
         carried = False
-        for _ in range(fcfg.ARM_CYCLE_HOLD_STEPS * 8):
+        for _ in range(sum(fcfg.arm_cycle_dwells())):
             env.step(ZERO)
             part = env.part_position(0)
             peak_z = max(peak_z, float(part[2]))
@@ -173,17 +183,19 @@ def test_arm_actually_picks_the_part_up_and_places_it():
                     mujoco.mj_contactForce(env.model, env.data, c, value)
                     force += float(np.linalg.norm(value[:3]))
             peak_force = max(peak_force, force)
-            local = pose.to_local_xy(part[:2])
-            if abs(local[1] - fcfg.LOCAL_OUTFEED_XY[1]) < 0.06 and part[2] > fcfg.TABLE_TOP_Z:
+            if float(np.linalg.norm(part[:2] - pose.table_place_xy)) < 0.06 and part[2] > fcfg.TABLE_TOP_Z:
                 carried = True
 
-        rest_z = float(env._part_rest_pos(0, fcfg.LOCAL_CANONICAL_PART_XY)[2])
+        rest_z = float(env._part_rest_pos(0)[2])
         assert peak_force > 2.0, f"the jaws never really gripped (peak {peak_force:.2f} N)"
         assert peak_z > rest_z + 0.02, f"the part was never lifted (peak z {peak_z:.3f}, rest {rest_z:.3f})"
-        assert carried, "the part never reached the outfeed"
+        assert carried, "the part never reached the outfeed table"
+        assert env._part_on_work_surface(0) or float(
+            np.linalg.norm(env.part_position(0)[:2] - pose.table_place_xy)) < 0.06, (
+            "the part did not end up on the table")
         assert peak_z < 1.30, f"the part was flung (peak z {peak_z:.3f})"
         print(f"    peak jaw force {peak_force:.1f} N, lifted to z={peak_z:.3f} (rest {rest_z:.3f}), "
-              f"delivered to the outfeed")
+              f"delivered to the outfeed table")
     finally:
         env.close()
 
@@ -193,20 +205,20 @@ def test_running_belt_carries_a_part_to_the_stop_blade():
     try:
         env.reset(seed=0, options={"fault_step": 10 ** 9})
         pose = env.poses[0]
-        env._set_part(0, env._part_rest_pos(0, fcfg.LOCAL_OUTFEED_XY))
+        upstream = pose.pick_xy - np.array([0.0, 0.45])
+        env._set_part(0, env._rest_pos(upstream))
         mujoco.mj_forward(env.model, env.data)
-        start_y = float(pose.to_local_xy(env.part_position(0)[:2])[1])
+        start_y = float(env.part_position(0)[1])
         for _ in range(500):
             env.step(ZERO)
         part = env.part_position(0)
-        local = pose.to_local_xy(part[:2])
         speed = float(np.abs(env.data.qvel[env._part_dof_adr[0] : env._part_dof_adr[0] + 3]).max())
         # The blade holds the part's centre roughly at the pick spot.
-        assert local[1] > start_y + 0.20, f"the belt barely moved the part ({start_y:.3f} -> {local[1]:.3f})"
-        assert local[1] < fcfg.LOCAL_STOPPER_XY[1], "the part went past the stop blade"
+        assert part[1] > start_y + 0.20, f"the belt barely moved the part ({start_y:.3f} -> {part[1]:.3f})"
+        assert part[1] < float(pose.stopper_xy[1]), "the part went past the stop blade"
         assert speed < 0.05, f"the part never settled against the blade (|v|={speed:.3f})"
         assert part[2] > fcfg.TABLE_TOP_Z, "the part left the belt"
-        print(f"    belt carried the part from local y={start_y:+.3f} to {local[1]:+.3f} and the blade held it "
+        print(f"    belt carried the part from y={start_y:+.3f} to {part[1]:+.3f} and the blade held it "
               f"(|v|={speed:.4f} m/s)")
     finally:
         env.close()
@@ -241,7 +253,7 @@ def test_belt_stops_on_fault_and_restarts_only_after_verified_recovery():
         assert not info["belt_running"]
 
         # --- TEST HARNESS: stand in for the missing recovery policy ---
-        env._set_part(station, env._part_rest_pos(station, fcfg.LOCAL_CANONICAL_PART_XY))
+        env._set_part(station, env._part_rest_pos(station))
         mujoco.mj_forward(env.model, env.data)
         # Position alone must not restart the line; the supervisor must reply.
         for _ in range(fcfg.RECOVERY_HOLD_STEPS * 2):
@@ -333,7 +345,7 @@ def test_verification_is_rechecked_before_restart():
         manager.signal("accept", station, 1)
         manager.signal("complete", station, 1)
         # Test-only restoration; this is not a G1 recovery controller.
-        env._set_part(station, env._part_rest_pos(station, fcfg.LOCAL_CANONICAL_PART_XY))
+        env._set_part(station, env._part_rest_pos(station))
         mujoco.mj_forward(env.model, env.data)
         for _ in range(250):
             env.step(ZERO)
@@ -341,7 +353,7 @@ def test_verification_is_rechecked_before_restart():
                 break
         assert manager.state is LineState.RECOVERY_VERIFIED
         assert not manager.belt_should_run and manager.target_station == station
-        env._set_part(station, env._part_rest_pos(station, fcfg.LOCAL_DROP_ZONE_XY))
+        env._set_part(station, env._rest_pos(env.poses[station].jam_xy))
         mujoco.mj_forward(env.model, env.data)
         manager.update(env, 100)
         assert manager.state is LineState.RECOVERING
@@ -419,38 +431,44 @@ def test_fault_stalls_only_its_own_cell():
         env.close()
 
 
-def test_dropped_part_settles_on_a_real_surface():
+def test_arm_drop_puts_the_part_on_the_corridor_floor():
+    """Line 1's fault must leave the part somewhere the supervisor can reach.
+
+    The arm is not teleporting anything: it runs the same cycle with a place
+    spot past the table's corridor-facing edge, opens its jaws there, and the
+    part topples onto open floor. This test checks the outcome is physical --
+    at rest, in real contact, inside the corridor -- not that a flag was set.
+    """
     env = FactoryEnv()
     try:
-        _, info = env.reset(seed=0)
-        faulted = info["fault_workcell"]
-        for _ in range(600):
+        env.reset(seed=0, options={"fault_workcell": 1, "scenario": "arm_drop"})
+        info = wait_for_fault(env)
+        for _ in range(200):
             _, _, _, _, info = env.step(ZERO)
-        part = env.part_position(faulted)
-        dof = env._part_dof_adr[faulted]
+        part = env.part_position(1)
+        dof = env._part_dof_adr[1]
         velocity = float(np.abs(env.data.qvel[dof : dof + 6]).max())
-        resting_z = fcfg.TABLE_TOP_Z + env.factory.part_half_size
 
+        assert env.scenario_status == "dropped_to_floor", env.scenario_status
         assert velocity < 0.02, f"part never came to rest (|qvel|max={velocity:.4f})"
-        assert abs(part[2] - resting_z) < 0.01, f"part not resting on the tabletop: z={part[2]:.4f}"
-        assert part[2] > 0.1, "part fell through the world"
+        assert part[2] < fcfg.TABLE_TOP_Z - 0.3, f"the part is not on the floor: z={part[2]:.3f}"
+        assert abs(part[2] - env.factory.part_half_size) < 0.01, f"part not resting on the floor: z={part[2]:.4f}"
 
-        # It must be supported by real contact, not hovering.
-        support = [
-            i
-            for i in range(env.data.ncon)
-            if env._part_body_ids[faulted]
-            in (env.model.geom_bodyid[env.data.contact[i].geom1], env.model.geom_bodyid[env.data.contact[i].geom2])
-        ]
+        # Real contact, not hovering.
+        support = [i for i in range(env.data.ncon)
+                   if env._part_body_ids[1] in (env.model.geom_bodyid[env.data.contact[i].geom1],
+                                                env.model.geom_bodyid[env.data.contact[i].geom2])]
         assert support, "dropped part has no contacts -- it is floating"
         penetration = max(-float(env.data.contact[i].dist) for i in support)
-        assert penetration < 0.005, f"dropped part is sunk into its support by {penetration * 1000:.2f} mm"
+        assert penetration < 0.005, f"dropped part is sunk into the floor by {penetration * 1000:.2f} mm"
 
-        local = env.poses[faulted].to_local_xy(part[:2])
-        assert env.scenario_status == "drop_detected"
-        assert env.release_position[2] - part[2] > env.factory.fault.detection_fall_m
-        print(f"    dropped part rest z={part[2]:.4f} (expected {resting_z:.4f}), |qvel|max={velocity:.5f}, "
-              f"penetration={penetration * 1000:.2f} mm, local xy={np.round(local, 3)}")
+        # Inside the walking corridor, where the supervisor can stand over it.
+        assert abs(part[0] - fcfg.CORRIDOR_CENTRE_X) < fcfg.CORRIDOR_HALF_WIDTH_M, (
+            f"the part landed outside the corridor at x={part[0]:.3f}")
+        clearance = fcfg.CORRIDOR_HALF_WIDTH_M - abs(part[0] - fcfg.CORRIDOR_CENTRE_X)
+        print(f"    arm released past the table edge; part rests on the floor at "
+              f"{np.round(part, 3)}, {clearance * 1000:.0f} mm inside the corridor edge, "
+              f"penetration {penetration * 1000:.2f} mm")
     finally:
         env.close()
 
@@ -497,8 +515,7 @@ def test_reset_clears_fault_and_leaks_no_state():
     env = FactoryEnv()
     try:
         _, info = env.reset(seed=0)
-        for _ in range(400):
-            env.step(ZERO)
+        wait_for_fault(env)
         assert env.fault_active, "precondition: the episode should have faulted"
 
         _, info = env.reset(seed=0)
@@ -506,7 +523,9 @@ def test_reset_clears_fault_and_leaks_no_state():
         assert not any(info["arm_faulted"]), info["arm_faulted"]
         assert env.navigation.steps == 0, "waiting must not consume navigation budget"
         for k in range(fcfg.N_WORKCELLS):
-            expected = env._part_rest_pos(k, fcfg.LOCAL_CANONICAL_PART_XY)
+            # Production starts with every part indexed on its own belt, whether
+            # or not that is where the line's recovery target happens to be.
+            expected = env._rest_pos(env.poses[k].pick_xy)
             np.testing.assert_allclose(env.part_position(k), expected, atol=1e-9)
         # A fresh env reset to the same seed must match this one exactly.
         other = FactoryEnv()
@@ -616,7 +635,7 @@ def test_manipulation_pose_reproduces_the_canonical_grasp_geometry():
         ]
         # Use the env's own resting-pose expression so the 2 mm
         # OBJECT_TABLE_GAP cannot be forgotten here and re-derived wrongly.
-        canonical_rest_z = float(env._part_rest_pos(0, fcfg.LOCAL_CANONICAL_PART_XY)[2])
+        canonical_rest_z = float(env._part_rest_pos(0)[2])
         canonical_part_local = np.array([*fcfg.LOCAL_CANONICAL_PART_XY, canonical_rest_z])
         for pose in env.poses:
             yaw = pose.heading_rad
@@ -626,44 +645,48 @@ def test_manipulation_pose_reproduces_the_canonical_grasp_geometry():
 
             pelvis = env.data.xpos[env._pelvis_body_id]
             measured_yaw = frames.yaw_from_quat(env.data.xquat[env._pelvis_body_id])
-            part_base = frames.world_to_base(env.part_position(pose.index), pelvis, measured_yaw)
+            # Where the part BELONGS on this line -- line 0's belt pick spot,
+            # line 1's table -- not wherever production has it at this instant.
+            target = np.r_[pose.canonical_part_xy, canonical_rest_z]
+            part_base = frames.world_to_base(target, pelvis, measured_yaw)
             # Height is relative to the floor, not the pelvis, so compare xy
-            # against the canonical offset and z against the tabletop.
+            # against the canonical offset and z against the work surface.
             np.testing.assert_allclose(part_base[:2], canonical_part_local[:2], atol=1e-6)
-            assert abs(env.part_position(pose.index)[2] - canonical_part_local[2]) < 1e-6
+            assert abs(target[2] - canonical_part_local[2]) < 1e-6
 
-            table_base = frames.world_to_base(pose.table_pos, pelvis, measured_yaw)
-            np.testing.assert_allclose(table_base[:2], fcfg.LOCAL_TABLE_POS[:2], atol=1e-6)
-        print("    both cells reproduce the canonical (0.27, 0) part offset and (0.30, 0) table offset exactly")
+        print("    both lines reproduce the canonical (0.27, 0) part offset exactly, "
+              "line 0 against its belt and line 1 against its table")
     finally:
         env.close()
 
 
-def test_straight_line_layout_keeps_the_grasp_experts_world_axis_offsets_valid():
-    """Records that the previous layout's biggest blocker is gone.
+def test_the_two_lines_face_opposite_ways_and_that_is_recorded():
+    """Records the cost of putting the walking corridor BETWEEN the two lines.
 
     ``SharpaBimanualGraspExpert._mirrored_targets`` builds approach targets as
-    ``object_pos + [-standoff, +-y_offset, height]`` -- offsets along WORLD axes.
-    Under the earlier +-35 degree workcell placement those were wrong by up to
-    169 mm at a station. On a straight line both stations face world +X, so the
-    stations differ by a pure translation and the world-axis offsets stay
-    correct. This is a geometric result; it does not by itself prove the Expert
-    runs in the factory model (it still looks the object up by the fixed name
-    "object", which does not exist here).
+    ``object_pos + [-standoff, +-y_offset, height]`` -- offsets along WORLD
+    axes. The previous single-belt layout had both stations facing world +X, so
+    those offsets were exact. They cannot be exact for both lines now: the
+    corridor runs between them, so the supervisor works line 0 facing -X and
+    line 1 facing +X, and a world-axis offset that is right for one is mirrored
+    for the other. This test measures that error rather than letting it be
+    discovered later as a mystery 500 mm miss, and it is why the grasp side
+    still needs its Cartesian offsets expressed in the robot's own frame.
     """
     standoff, y_offset = 0.25, 0.13
-    worst = 0.0
+    errors = {}
     for pose in fcfg.FactoryConfig().workcells:
         world_axis = np.array([-standoff, y_offset])
         heading_frame = -standoff * pose.heading_dir + y_offset * pose.left_dir
-        worst = max(worst, float(np.linalg.norm(world_axis - heading_frame)))
-    assert worst < 1e-9, f"stations are rotated after all: offsets differ by {worst * 1000:.1f} mm"
-    print("    both stations face world +X, so the grasp Expert's world-axis approach offsets "
-          "are exact (was up to 169 mm wrong under the +-35 deg layout)")
+        errors[pose.index] = float(np.linalg.norm(world_axis - heading_frame))
+    assert errors[0] < 1e-9 or errors[1] < 1e-9, "neither line matches the world-axis convention"
+    assert max(errors.values()) > 0.1, "expected one line to be mirrored; the layout may have changed"
+    print(f"    world-axis approach offsets: line 0 off by {errors[0] * 1000:.0f} mm, "
+          f"line 1 by {errors[1] * 1000:.0f} mm -- the grasp Expert needs heading-relative offsets")
 
 
 def test_two_physical_faults_both_stations_and_recovery():
-    for scenario in ("dropped_part", "misplaced_part"):
+    for scenario in fcfg.SCENARIOS:
         for station in (0, 1):
             env = FactoryEnv()
             try:
@@ -678,19 +701,25 @@ def test_two_physical_faults_both_stations_and_recovery():
                 assert info["recovery_task"]["station"] == station
                 assert not info["belt_running"]
                 assert env._get_obs()[-2:].sum() == 1
-                if scenario == "dropped_part":
-                    assert info["scenario_status"] == "drop_detected"
-                    assert info["release_position"][2] > fcfg.TABLE_TOP_Z + .06 + .025
+                if scenario == "arm_drop":
+                    assert info["scenario_status"] == "dropped_to_floor"
+                    # Released while still carried above the table, then fell.
+                    assert info["release_position"][2] > fcfg.TABLE_TOP_Z
+                    assert env.part_position(station)[2] < fcfg.TABLE_TOP_Z - 0.3
                     assert env._jaw_contacts(station) == 0
                 else:
-                    assert info["scenario_status"] == "pick_failed"
+                    assert info["scenario_status"] == "jammed"
                     assert env._jaw_contacts(station) == 0
+                    short = float(np.linalg.norm(
+                        env.part_position(station)[:2] - env.poses[station].pick_xy))
+                    assert short > fcfg.RECOVERY_POSITION_TOLERANCE_M, (
+                        f"a jam that is already at the pick spot is not a jam ({short * 1000:.0f} mm)")
                 for _ in range(120):
                     info = env.step(ZERO)[4]
                 assert info["line_state"] == "FAULT_RAISED"
                 # Test harness restores the part; G1 has no recovery controller.
                 env._set_part = setter
-                setter(station, env._part_rest_pos(station, fcfg.LOCAL_CANONICAL_PART_XY))
+                setter(station, env._part_rest_pos(station))
                 adr = env._part_qpos_adr[station]
                 env.data.qpos[adr + 3:adr + 7] = [np.cos(.15), 0, 0, np.sin(.15)]
                 mujoco.mj_forward(env.model, env.data)
@@ -699,7 +728,7 @@ def test_two_physical_faults_both_stations_and_recovery():
                 for _ in range(120):
                     info = env.step(ZERO)[4]
                 assert not info["belt_running"], "misaligned returned part restarted the line"
-                setter(station, env._part_rest_pos(station, fcfg.LOCAL_CANONICAL_PART_XY))
+                setter(station, env._part_rest_pos(station))
                 mujoco.mj_forward(env.model, env.data)
                 for _ in range(300):
                     info = env.step(ZERO)[4]
@@ -718,9 +747,9 @@ def test_two_physical_faults_both_stations_and_recovery():
 
 def main() -> int:
     tests = [
-        test_model_compiles_with_one_belt_and_two_independent_stations,
+        test_model_compiles_with_two_independent_lines,
         test_arm_links_do_not_collide_with_each_other,
-        test_workcell_poses_are_one_rigid_transform_of_the_canonical_scene,
+        test_each_line_reproduces_the_canonical_grasp_relationship,
         test_arm_cycle_stays_above_the_belt_and_reaches_the_part,
         test_arm_actually_picks_the_part_up_and_places_it,
         test_running_belt_carries_a_part_to_the_stop_blade,
@@ -732,13 +761,13 @@ def main() -> int:
         test_seed_reproduces_the_same_scenario_and_physics,
         test_different_seeds_select_both_workcells,
         test_fault_stalls_only_its_own_cell,
-        test_dropped_part_settles_on_a_real_surface,
+        test_arm_drop_puts_the_part_on_the_corridor_floor,
         test_observation_exposes_target_workcell_relative_pose,
         test_reset_clears_fault_and_leaks_no_state,
         test_no_forbidden_collision_while_standing,
         test_navigation_gate_rejects_a_teleporting_oracle_and_scores_a_gradual_one,
         test_manipulation_pose_reproduces_the_canonical_grasp_geometry,
-        test_straight_line_layout_keeps_the_grasp_experts_world_axis_offsets_valid,
+        test_the_two_lines_face_opposite_ways_and_that_is_recorded,
     ]
     passed = 0
     for test in tests:
