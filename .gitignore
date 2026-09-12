@@ -24,8 +24,9 @@ env/
 # =========================
 # Claude / local AI context
 # =========================
-# Do not ignore *.md globally: README and public project/design documents
-# are versioned. Only the explicit local operational context below is ignored.
+# Local Markdown only; the root final README is the sole Markdown exception.
+*.[mM][dD]
+!/README.md
 /.claude
 CLAUDE.md
 PROJECT_CONTEXT.md
@@ -84,7 +85,7 @@ PROJECT_CONTEXT.md.BACKUP_*
 
 # Sharpa Wave hand MJCF/mesh assets (35th session) -- vendored subset is
 # ~23MB of upstream binary STL meshes, deliberately NOT committed to
-# history; assets/robots/sharpa_wave/{LICENSE,NOTICE,UPSTREAM_README,
+# history; assets/robots/sharpa_wave/{LICENSE,NOTICE,
 # checksums.sha256} ARE tracked, and
 # scripts/install_sharpa_wave_assets.py reproduces the ignored content
 # below bit-for-bit from the pinned upstream commit (verified: see
