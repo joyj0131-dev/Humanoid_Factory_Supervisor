@@ -56,12 +56,11 @@ results/session41_visual_after/
 results/session42_before/
 results/session42_after/
 
-# Local-only detailed session history (docs/ itself stays tracked for
-# future public documentation -- only the internal history archive is
-# ignored, same posture as PROJECT_CONTEXT.md below)
-/docs/history
+# docs/ is local-only. Working notes stay on disk but out of the repo; the
+# single public document is README.md, written at the end. The files were
+# untracked with `git rm -r --cached docs`, so nothing was deleted locally.
+/docs/
 PROJECT_CONTEXT.md.BACKUP_*
-
 # =========================
 # Temporary / cache
 # =========================
