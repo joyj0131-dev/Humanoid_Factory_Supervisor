@@ -137,6 +137,9 @@ def _panel(env, info, paused=False, walk=None) -> tuple[str, str]:
     if 'viewer_rtf' in info:
         labels.append('RTF (last 100 steps)')
         values.append(f"{info['viewer_rtf']:.2f}x (includes rendering)")
+    if 'place_stage' in info:
+        labels.extend(['Place', 'Place error'])
+        values.extend([info['place_stage'], f"{info['place_error_m'] * 1000:.1f} mm"])
     return "\n".join(labels), "\n".join(values)
 
 
@@ -197,6 +200,8 @@ def run_interactive(env, args) -> None:
     if getattr(args, 'recover', False):
         print('Experimental live recovery: fault -> prepare hands -> walk -> grasp/lift.')
         print(f"Approach motion: {args.recovery_motion}")
+        if getattr(args, 'place', False):
+            print('PLACE PROTOTYPE: loaded transfer is not yet validated; baseline can fall.')
     elif args.walk_to is None:
         print("The G1 stands still; pass --walk-to 0 or --walk-to 1 to make it walk there.")
     print("Close the viewer to exit.")
@@ -290,6 +295,7 @@ def _make_recovery(env, args):
     return FactoryRecovery(env, RecoveryConfig(
         stand_off_m=getattr(args, 'recovery_stand_off', 0.27),
         kinematic_ik=getattr(args, 'kinematic_ik', True),
+        place_after_lift=getattr(args, 'place', False),
         motion_profile=getattr(args, 'recovery_motion', 'baseline')))
 
 
@@ -355,6 +361,7 @@ def main() -> None:
     parser.add_argument('--recover', action='store_true',
                         help='experimental live fault-to-lift controller; does not yet place/restart')
     parser.add_argument('--recovery-stand-off', type=float, default=0.27)
+    parser.add_argument('--place', action='store_true', help='experimental place/restart after --recover lift')
     parser.add_argument('--kinematic-ik', action=argparse.BooleanOptionalAction, default=True,
                         help='skip unused dynamics in IK scratch data only; live physics is unchanged')
     parser.add_argument('--recovery-motion', choices=('baseline', 'compact', 'direct', 'smooth'), default='smooth',
@@ -369,6 +376,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.recover and (args.walk_to is not None or args.no_fault):
         parser.error('--recover cannot be combined with --walk-to or --no-fault')
+    if args.place and not args.recover:
+        parser.error('--place requires --recover')
 
     if args.offscreen:
         os.environ.setdefault("MUJOCO_GL", "egl")

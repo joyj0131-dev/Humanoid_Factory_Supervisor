@@ -23,6 +23,7 @@ from humanoid_learning.expert.stance_stabilizer import StanceGains, StanceStabil
 class RecoveryConfig:
     motion_profile: str = 'baseline'
     kinematic_ik: bool = True
+    place_after_lift: bool = False
     stand_off_m: float = 0.27
     arrival_radius_m: float = 0.03
     settle_steps: int = 200
@@ -77,7 +78,7 @@ class PrecisionApproach:
 class FactoryRecovery:
     """One tick advances physics exactly once, including the scripted factory."""
 
-    TERMINAL = ('LIFTED', 'FAILED')
+    TERMINAL = ('LIFTED', 'RECOVERED', 'FAILED')
 
     def __init__(self, env, config: RecoveryConfig | None = None):
         self.env, self.config = env, config or RecoveryConfig()
@@ -207,6 +208,22 @@ class FactoryRecovery:
         elif self.state == 'GRASP':
             action = self.expert.step()
             self._standing_feedback()
+        elif self.state == 'PLACE':
+            action = self.placer.step()
+            self._standing_feedback()
+            if self.placer.failure:
+                self.failure = self.placer.failure
+                self._transition('FAILED')
+            elif self.placer.stage == 'READY_TO_VERIFY':
+                e.task_manager.signal('complete', self.station, e._step_count)
+                self._transition('VERIFY')
+        elif self.state == 'VERIFY':
+            self._standing_feedback()
+            action[17:25] = -1.
+            if not self.placer._hands_clear():
+                e.task_manager.completion_requested = False
+                self.failure = 'HANDS_NOT_CLEAR_FOR_RESTART'
+                self._transition('FAILED')
 
         e.task_manager.update(e, e._step_count)
         e.belt.running = e.task_manager.belt_should_run
@@ -252,7 +269,14 @@ class FactoryRecovery:
                 self.failure = self.expert.failure_reason.name
                 self._transition('FAILED')
             elif self.hold_steps * dt >= self.config.lift_hold_seconds:
-                self._transition('LIFTED')
+                if self.config.place_after_lift:
+                    from humanoid_learning.expert.factory_place import FactoryPlace
+                    self.placer = FactoryPlace(self)
+                    self._transition('PLACE')
+                else:
+                    self._transition('LIFTED')
+        if self.state == 'VERIFY' and info.get('line_state') == 'RUNNING':
+            self._transition('RECOVERED')
         if info.get('fallen'):
             self.failure = 'FALL'
             self._transition('FAILED')
@@ -268,5 +292,8 @@ class FactoryRecovery:
                     object_hand_penetration_max_m=self.max_object_hand_penetration_m,
                     forbidden_contact_ticks=self.forbidden_contact_ticks,
                     grasp_state=(self.expert.state.name if hasattr(self, 'expert') else None))
+        if hasattr(self, 'placer'):
+            info.update(place_stage=self.placer.stage, place_error_m=self.placer.final_error_m,
+                        hands_clear=self.placer.hands_clear)
         self._last_info = info
         return info

@@ -29,6 +29,7 @@ def main():
     parser.add_argument('--motion-profile', choices=('baseline', 'compact', 'direct', 'smooth'), default='baseline')
     parser.add_argument('--out', default='results/factory/recovery.json')
     parser.add_argument('--render', action='store_true')
+    parser.add_argument('--place', action='store_true', help='continue after lift into experimental place/restart')
     parser.add_argument('--kinematic-ik', action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
     env = FactoryEnv()
@@ -38,6 +39,7 @@ def main():
                                                        hold_squeeze_m=args.squeeze,
                                                        motion_profile=args.motion_profile,
                                                        kinematic_ik=args.kinematic_ik,
+                                                       place_after_lift=args.place,
                                                        forward_command_bias=args.forward_bias))
         peak_step = 0.0
         previous = env.data.qpos[:3].copy()
@@ -92,7 +94,12 @@ def main():
             }
         result = {
             'station': args.station, 'seed': args.seed, 'scenario': args.scenario,
-            'success': recovery.state == 'LIFTED', 'state': recovery.state,
+            'success': recovery.state == ('RECOVERED' if args.place else 'LIFTED'), 'state': recovery.state,
+            'place_stage': info.get('place_stage'), 'place_error_m': info.get('place_error_m'),
+            'place_start_position': recovery.placer.start.tolist() if hasattr(recovery, 'placer') else None,
+            'place_target_position': recovery.placer.target.tolist() if hasattr(recovery, 'placer') else None,
+            'place_actual_position': env.part_position(recovery.station).tolist() if hasattr(recovery, 'placer') else None,
+            'line_state': info.get('line_state'), 'mission_events': info.get('mission_events'),
             'failure': recovery.failure, 'steps': recovery.total_steps,
             'max_clearance_m': recovery.max_clearance,
             'max_supported_hold_seconds': recovery.max_hold_steps * env.config.frame_skip * env.model.opt.timestep,
@@ -100,7 +107,7 @@ def main():
             'object_hand_penetration_max_m': recovery.max_object_hand_penetration_m,
             'forbidden_contact_ticks': recovery.forbidden_contact_ticks,
             'forbidden_contact_pairs': recovery.forbidden_contact_pairs,
-            'collision_free_lift_success': recovery.state == 'LIFTED' and recovery.forbidden_contact_ticks == 0,
+            'collision_free_lift_success': recovery.state in ('LIFTED', 'RECOVERED') and recovery.forbidden_contact_ticks == 0,
             'events': recovery.events, 'config': vars(recovery.config),
             'phase_events': phase_events,
             'used_direct_approach': recovery.used_direct_approach,
