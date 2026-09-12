@@ -40,6 +40,46 @@ def test_continuous_clock_has_no_waypoint_stops_or_wraparound():
         raise AssertionError('zero duration must be rejected')
 
 
+def test_kinematic_scratch_matches_full_forward_ik():
+    env = FactoryEnv()
+    try:
+        env.reset(seed=0)
+        recovery = FactoryRecovery(env)
+        expert = SharpaBimanualGraspExpert(recovery.grasp)
+        ik = expert.ik
+        live = env.data.qpos.copy()
+        rng = np.random.default_rng(7)
+        for _ in range(4):
+            full, fast = mujoco.MjData(env.model), mujoco.MjData(env.model)
+            full.qpos[:] = fast.qpos[:] = live
+            q = np.clip(live[ik.qpos_adr] + rng.uniform(-0.1, 0.1, ik.n), ik.joint_low, ik.joint_high)
+            ik.kinematics_only = False
+            ik._set_q(full, q)
+            ik.kinematics_only = True
+            with patch.object(mujoco, 'mj_forward', side_effect=AssertionError('unneeded dynamics')):
+                ik._set_q(fast, q)
+            np.testing.assert_array_equal(fast.site_xpos, full.site_xpos)
+            np.testing.assert_array_equal(fast.site_xmat, full.site_xmat)
+            args = (full.site_xpos[ik.left_site] + [0.01, 0., 0.],
+                    full.site_xmat[ik.left_site].reshape(3, 3).copy(),
+                    full.site_xpos[ik.right_site] + [0.01, 0., 0.],
+                    full.site_xmat[ik.right_site].reshape(3, 3).copy())
+            jac_full = ik._task_error_and_jacobian(full, *args)[1]
+            jac_fast = ik._task_error_and_jacobian(fast, *args)[1]
+            np.testing.assert_array_equal(jac_full, jac_fast)
+            ik.kinematics_only = False
+            a = ik.solve(full, *args, rest_q=q, max_iterations=20)
+            ik.kinematics_only = True
+            b = ik.solve(fast, *args, rest_q=q, max_iterations=20)
+            for field in ('waist_q', 'left_q', 'right_q', 'error_history'):
+                np.testing.assert_array_equal(getattr(a, field), getattr(b, field))
+            assert a.success == b.success
+        np.testing.assert_array_equal(env.data.qpos, live)
+        recovery.close()
+    finally:
+        env.close()
+
+
 def test_prepared_resume_guard_without_physics_writes():
     # Synthetic state tests the transition guard only, not physical reachability.
     expert = object.__new__(SharpaBimanualGraspExpert)

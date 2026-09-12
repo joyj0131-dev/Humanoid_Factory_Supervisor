@@ -24,6 +24,7 @@ from pathlib import Path
 import sys
 import time
 from queue import SimpleQueue
+from collections import deque
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -133,6 +134,9 @@ def _panel(env, info, paused=False, walk=None) -> tuple[str, str]:
         labels.extend(['Best lift hold', 'Failure'])
         values.extend([f"{info['lift_hold_steps'] * env.model.opt.timestep * env.config.frame_skip:.2f}s",
                        str(info.get('recovery_failure') or '-')])
+    if 'viewer_rtf' in info:
+        labels.append('RTF (last 100 steps)')
+        values.append(f"{info['viewer_rtf']:.2f}x (includes rendering)")
     return "\n".join(labels), "\n".join(values)
 
 
@@ -209,8 +213,11 @@ def run_interactive(env, args) -> None:
         bundle = _make_walker(env, args.walk_to) if args.walk_to is not None else None
         recovery = _make_recovery(env, args)
         walk_announced: dict = {}
+        rtf_samples = deque(maxlen=100)
         while viewer.is_running():
             started = time.time()
+            wall_started = time.perf_counter()
+            sim_started = env.data.time
             signal = None
             while not keys.empty():
                 key = keys.get()
@@ -220,6 +227,8 @@ def run_interactive(env, args) -> None:
                     if recovery is not None:
                         recovery.close()
                     _, info = env.reset(seed=args.seed, options=_reset_options(args))
+                    rtf_samples.clear()
+                    sim_started = env.data.time
                     paused = finished = False
                     event_count = 0
                     signal = None
@@ -260,11 +269,16 @@ def run_interactive(env, args) -> None:
             event_count = len(info["mission_events"])
             with viewer.lock():
                 _update_beacons(env)
+            if rtf_samples:
+                info['viewer_rtf'] = sum(s for s, _ in rtf_samples) / sum(w for _, w in rtf_samples)
             viewer.set_texts((None, None, *_panel(env, info, paused, walk=bundle)))
             viewer.sync()
             remaining = target_dt - (time.time() - started)
             if remaining > 0:
                 time.sleep(remaining)
+            sim_delta = env.data.time - sim_started
+            if sim_delta > 0:
+                rtf_samples.append((sim_delta, time.perf_counter() - wall_started))
         if recovery is not None:
             recovery.close()
 
@@ -275,6 +289,7 @@ def _make_recovery(env, args):
     from humanoid_learning.expert.factory_recovery import FactoryRecovery, RecoveryConfig
     return FactoryRecovery(env, RecoveryConfig(
         stand_off_m=getattr(args, 'recovery_stand_off', 0.27),
+        kinematic_ik=getattr(args, 'kinematic_ik', True),
         motion_profile=getattr(args, 'recovery_motion', 'baseline')))
 
 
@@ -340,6 +355,8 @@ def main() -> None:
     parser.add_argument('--recover', action='store_true',
                         help='experimental live fault-to-lift controller; does not yet place/restart')
     parser.add_argument('--recovery-stand-off', type=float, default=0.27)
+    parser.add_argument('--kinematic-ik', action=argparse.BooleanOptionalAction, default=True,
+                        help='skip unused dynamics in IK scratch data only; live physics is unchanged')
     parser.add_argument('--recovery-motion', choices=('baseline', 'compact', 'direct', 'smooth'), default='smooth',
                         help='smooth uses continuous approach targets; direct preserves the previous waypoint approach')
     parser.add_argument("--offscreen", action="store_true", help="render PNGs instead of opening a window")

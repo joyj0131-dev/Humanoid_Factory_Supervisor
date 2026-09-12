@@ -22,6 +22,7 @@ from humanoid_learning.expert.stance_stabilizer import StanceGains, StanceStabil
 @dataclass
 class RecoveryConfig:
     motion_profile: str = 'baseline'
+    kinematic_ik: bool = True
     stand_off_m: float = 0.27
     arrival_radius_m: float = 0.03
     settle_steps: int = 200
@@ -166,6 +167,7 @@ class FactoryRecovery:
                 self.grasp = self._grasp_view(self.station)
                 self.stabilizer.env = self.grasp
                 self.expert = SharpaBimanualGraspExpert(self.grasp)
+                self.expert.ik.kinematics_only = self.config.kinematic_ik
                 self._transition('PREPARE_HANDS')
         elif self.state == 'PREPARE_HANDS':
             action = self.expert.step()
@@ -189,6 +191,7 @@ class FactoryRecovery:
             self._standing_feedback()
             if self.ticks >= self.config.settle_steps:
                 self.expert = SharpaBimanualGraspExpert(self.grasp)
+                self.expert.ik.kinematics_only = self.config.kinematic_ik
                 self.expert.config.palm_first_closure = self.config.palm_first_closure
                 self.expert.config.hold_squeeze_m = self.config.hold_squeeze_m
                 self.expert.config.contact_settle_grace_seconds = self.config.contact_settle_grace_seconds

@@ -60,6 +60,7 @@ class CoupledBilateralIK:
         waist_weight: float = 6.0,
     ):
         self.model = model
+        self.kinematics_only = False
         self.left_site = left_palm_site
         self.right_site = right_palm_site
         # Coupled DOF ordering, fixed for the lifetime of this solver:
@@ -109,7 +110,13 @@ class CoupledBilateralIK:
 
     def _set_q(self, data: mujoco.MjData, q: np.ndarray) -> None:
         data.qpos[self.qpos_adr] = q
-        mujoco.mj_forward(self.model, data)
+        if self.kinematics_only:
+            # This solver reads only site poses and kinematic Jacobians, not
+            # contact forces/dynamics. The caller's scratch MjData only.
+            mujoco.mj_kinematics(self.model, data)
+            mujoco.mj_comPos(self.model, data)
+        else:
+            mujoco.mj_forward(self.model, data)
 
     def _task_error_and_jacobian(
         self, data: mujoco.MjData, left_target_pos, left_target_R, right_target_pos, right_target_R

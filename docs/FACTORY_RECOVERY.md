@@ -1,5 +1,58 @@
 # Factory fault-to-lift integration (2026-09-11)
 
+## RTF optimization (2026-09-12)
+
+Factory recovery now enables `kinematic_ik` by default. Coupled IK evaluates
+only site poses and position Jacobians on its **scratch** data, so it calls
+`mj_kinematics` + `mj_comPos` instead of running full `mj_forward` (including
+unused collision/constraint dynamics) on every candidate. This is the minimal
+Jacobian pipeline documented in the [MuJoCo API](https://mujoco.readthedocs.io/en/stable/APIreference/APIfunctions.html#mj-jac).
+The live world's `mj_step`, collision checks, no-slip solver, forces, timestep,
+IK tolerances/iteration budget and trajectory timing are unchanged. Standalone
+CoupledBilateralIK still defaults to full forward; the factory opts in explicitly.
+
+The alternative of IK every four ticks plus joint-target interpolation was
+tested at station 0: lift succeeded, but overall headless RTF was 0.684 vs 0.695
+before. It was **not adopted** and the experimental multirate controller was
+removed. The adopted optimization preserves per-tick smooth targets and feedback.
+
+Station 0 sequential headless measurements: 51.71 simulated seconds took
+74.35 s before, 51.77 s after (RTF 0.695 -> 0.999, about 30% less wall time).
+Reported phase events, clearance (80.20 mm), five-second support, penetration
+and forbidden-contact counts are unchanged. These are single-run host timings,
+not guaranteed FPS or a claim of real-time operation in every phase. In particular
+contact/lift remains heavier than free-space motion.
+
+Station 1: 55.92 simulated seconds took 84.34 s before vs 57.67 s after
+(RTF 0.663 -> 0.970). The entire per-tick qpos/qvel/ctrl trajectory SHA256 is
+identical (`ae7df9e3...2595`); it still lifts 55.75 mm and supports for 5 seconds.
+Evidence: `results/factory/rtf_before_st{0,1}.json` and
+`rtf_kinematic_st{0,1}.json`. These four benchmark runs were executed sequentially,
+without concurrently launched regression runs.
+
+The viewer now shows rolling RTF over the last 100 advancing steps, including
+rendering/synchronization and real-time pacing. Paused iterations are excluded,
+and reset clears the window. Headless RTF excludes rendering and pacing and must
+not be presented as measured GUI RTF.
+
+```bash
+# Optimized by default; compare old scratch calculation with --no-kinematic-ik.
+DISPLAY=:0 python3 scripts/view_factory.py --recover --fault-workcell 1
+DISPLAY=:0 python3 scripts/view_factory.py --recover --fault-workcell 1 --no-kinematic-ik
+OPENBLAS_NUM_THREADS=1 python3 scripts/evaluate_factory_recovery.py \
+  --station 1 --motion-profile smooth --out results/factory/rtf_check.json
+```
+
+Reports include loop wall/simulated time, phase timing, and a SHA256 over every
+post-step qpos/qvel/ctrl array for exact trajectory comparison. Existing collision
+and contact-quality limitations remain; this is a performance change, not a new
+grasp dataset approval or expansion of validated task conditions.
+
+Validation: recovery contracts 7/7 (including full-forward versus kinematics-only
+site poses, Jacobians and solver results), factory 21/21, walking 5/5 including
+the interactive loop exercised with a stub renderer and measured RTF text.
+The real GUI rendering rate still needs to be read on the user's display.
+
 ## Continuous approach (2026-09-12)
 
 The viewer's `--recover` now selects `--recovery-motion smooth`.

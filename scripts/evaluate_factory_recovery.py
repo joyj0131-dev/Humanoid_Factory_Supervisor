@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 import time
+import hashlib
 
 os.environ.setdefault('MUJOCO_GL', 'egl')
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -28,6 +29,7 @@ def main():
     parser.add_argument('--motion-profile', choices=('baseline', 'compact', 'direct', 'smooth'), default='baseline')
     parser.add_argument('--out', default='results/factory/recovery.json')
     parser.add_argument('--render', action='store_true')
+    parser.add_argument('--kinematic-ik', action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
     env = FactoryEnv()
     try:
@@ -35,6 +37,7 @@ def main():
         recovery = FactoryRecovery(env, RecoveryConfig(stand_off_m=args.stand_off, max_steps=args.max_steps,
                                                        hold_squeeze_m=args.squeeze,
                                                        motion_profile=args.motion_profile,
+                                                       kinematic_ik=args.kinematic_ik,
                                                        forward_command_bias=args.forward_bias))
         peak_step = 0.0
         previous = env.data.qpos[:3].copy()
@@ -44,10 +47,18 @@ def main():
         previous_palms = None
         previous_motion_state = None
         step_times = []
+        phase_times = {}
+        state_digest = hashlib.sha256()
+        loop_started = time.perf_counter()
+        sim_started = env.data.time
         for step in range(args.max_steps):
+            phase = (recovery.expert.state.name if recovery.state == 'GRASP' else recovery.state)
             started = time.perf_counter()
             info = recovery.step()
             step_times.append(time.perf_counter() - started)
+            phase_times.setdefault(phase, []).append(step_times[-1])
+            for values in (env.data.qpos, env.data.qvel, env.data.ctrl):
+                state_digest.update(values.tobytes())
             peak_step = max(peak_step, float(np.linalg.norm(env.data.qpos[:3] - previous)))
             previous = env.data.qpos[:3].copy()
             state = (recovery.state, getattr(getattr(recovery, 'expert', None), 'state', None))
@@ -66,6 +77,8 @@ def main():
                 last_state = state
             if recovery.state in recovery.TERMINAL:
                 break
+        elapsed = time.perf_counter() - loop_started
+        simulated = env.data.time - sim_started
         motion_metrics = {}
         for name, samples in motion_samples.items():
             speeds = np.asarray(samples)
@@ -94,6 +107,13 @@ def main():
             'motion_metrics': motion_metrics,
             'physics_dt_s': env.config.frame_skip * env.model.opt.timestep,
             'controller_step_wall_p50_p95_s': np.percentile(step_times, [50, 95]).tolist(),
+            'headless_loop_wall_seconds': elapsed,
+            'simulated_seconds': simulated,
+            'headless_loop_rtf': simulated / elapsed,
+            'qpos_qvel_ctrl_trajectory_sha256': state_digest.hexdigest(),
+            'phase_timing': {name: {'ticks': len(values), 'wall_seconds': sum(values),
+                                  'mean_step_ms': 1000 * float(np.mean(values))}
+                             for name, values in phase_times.items()},
         }
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)

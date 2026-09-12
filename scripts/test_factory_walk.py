@@ -121,6 +121,7 @@ def test_the_interactive_viewer_actually_drives_the_walker():
     spec.loader.exec_module(module)
 
     class StubViewer:
+        rtf_seen = False
         def __init__(self, ticks):
             self.ticks = ticks
             self.seen = 0
@@ -136,7 +137,12 @@ def test_the_interactive_viewer_actually_drives_the_walker():
             yield
 
         def set_texts(self, *a, **k):
-            pass
+            labels, values = a[0][-2:]
+            if 'RTF (last 100 steps)' in labels:
+                row = labels.splitlines().index('RTF (last 100 steps)')
+                value = float(values.splitlines()[row].split('x')[0])
+                assert np.isfinite(value) and value > 0
+                StubViewer.rtf_seen = True
 
         def sync(self):
             pass
@@ -152,6 +158,7 @@ def test_the_interactive_viewer_actually_drives_the_walker():
     module.time.sleep = lambda _s: None
     try:
         for station in range(fcfg.N_WORKCELLS):
+            StubViewer.rtf_seen = False
             env = FactoryEnv()
             try:
                 pelvis = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
@@ -159,6 +166,7 @@ def test_the_interactive_viewer_actually_drives_the_walker():
                 args = types.SimpleNamespace(seed=0, walk_to=station, scenario="dropped_part",
                                              fault_workcell=None, fault_step=None, no_fault=False)
                 module.run_interactive(env, args)
+                assert StubViewer.rtf_seen, 'interactive viewer did not display measured RTF'
                 travelled = float(np.linalg.norm(env.data.xpos[pelvis][:2] - start))
                 result = env.navigation_result()
                 assert travelled > 1.0, (

@@ -1332,7 +1332,8 @@ class SharpaBimanualGraspExpert:
         data = self.env.data
         scratch = mujoco.MjData(self.env.model)
         scratch.qpos[:] = data.qpos
-        mujoco.mj_forward(self.env.model, scratch)
+        if not self.ik.kinematics_only:
+            mujoco.mj_forward(self.env.model, scratch)
         kwargs = {} if rest_gain is None else {"rest_gain": rest_gain}
         if joint_weight is not None:
             kwargs["joint_weight"] = joint_weight
