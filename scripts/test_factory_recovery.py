@@ -12,12 +12,65 @@ import numpy as np
 
 from humanoid_learning.envs.factory_env import FactoryEnv
 from humanoid_learning.envs import factory_config as fc
-from humanoid_learning.expert.factory_recovery import FactoryRecovery
+from humanoid_learning.expert.factory_recovery import FactoryRecovery, RecoveryConfig, PrecisionApproach
+from humanoid_learning.expert.factory_floor_pickup import FactoryFloorPickup
+from humanoid_learning.envs import sharpa_config as sc
 from humanoid_learning.expert.sharpa_contact_lift import SharpaContactLift
 from humanoid_learning.expert.sharpa_bimanual_grasp_expert import (
     BimanualGraspConfig, BimanualGraspState, SharpaBimanualGraspExpert,
     _continuous_path_progress, _quintic_scale,
 )
+
+
+def test_four_finger_commands_open_thumb_without_physics_changes():
+    env = FactoryEnv()
+    try:
+        env.reset(seed=0)
+        recovery = FactoryRecovery(env, RecoveryConfig(floor_four_finger_grip=True))
+        recovery.station = 0
+        recovery.expert = SharpaBimanualGraspExpert(recovery.grasp)
+        friction = env.model.geom_friction.copy()
+        contype = env.model.geom_contype.copy()
+        floor = FactoryFloorPickup(recovery)
+        for side in sc.SIDES:
+            assert floor.finger_bodies[side] and floor.thumb_bodies[side]
+            assert not floor.finger_bodies[side] & floor.thumb_bodies[side]
+        recovery.grasp._group_synergy[:] = .5
+        crouch_action = floor.step()
+        assert crouch_action[17] > 0 and crouch_action[21] > 0  # tucked only while crouching
+        floor.begin_contact()
+        action = floor.step()
+        for side in sc.SIDES:
+            for suffix in sc.preshape_suffixes('thumb'):
+                assert env.data.ctrl[env.model.actuator(sc.sharpa_actuator(side, 'thumb', suffix)).id] == 0.
+        assert action[17] < 0 and action[21] < 0
+        assert all(action[i] > 0 for i in (18, 19, 20, 22, 23, 24))
+        np.testing.assert_array_equal(friction, env.model.geom_friction)
+        np.testing.assert_array_equal(contype, env.model.geom_contype)
+        recovery.close()
+    finally:
+        env.close()
+
+
+def test_arrival_hands_off_only_at_low_speed_and_double_support():
+    class Walker:
+        def __init__(self):
+            self.env = SimpleNamespace(model=SimpleNamespace(opt=SimpleNamespace(timestep=.002)),
+                config=SimpleNamespace(frame_skip=5), data=SimpleNamespace(qvel=np.zeros(6), ctrl=np.zeros(12)),
+                _leg_target=np.zeros(12))
+            self.act_ids = np.arange(12)
+            self.double, self.holding = False, False
+        def base_pose(self): return np.zeros(2), 0.
+        def in_double_support(self): return self.double
+        def hold_stance(self): self.holding = True
+        def step(self, command): self.command = command
+    w = Walker()
+    nav = PrecisionApproach(w, RecoveryConfig())
+    nav.step(None, pelvis_goal=[.01, .01])
+    assert not nav.arrived
+    w.double = True
+    nav.step(None, pelvis_goal=[.01, .01])
+    assert nav.arrived and w.holding
 
 
 def test_continuous_clock_has_no_waypoint_stops_or_wraparound():

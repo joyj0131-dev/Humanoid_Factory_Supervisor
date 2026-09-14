@@ -149,6 +149,11 @@ def _panel(env, info, paused=False, walk=None) -> tuple[str, str]:
         labels.extend(['Best lift hold', 'Failure'])
         values.extend([f"{info['lift_hold_steps'] * env.model.opt.timestep * env.config.frame_skip:.2f}s",
                        str(info.get('recovery_failure') or '-')])
+        if info.get('approach_goal_xy') is not None and info['recovery_state'] in ('WALK', 'SETTLE'):
+            x, y = info['approach_goal_xy']
+            labels.append('Actual approach target')
+            values.append(f"({x:.3f}, {y:.3f}) m | {1000*info['approach_error_m']:.0f} mm | "
+                          + ('standing hold' if info['approach_arrived'] else 'walking'))
     if 'viewer_rtf' in info:
         labels.append('RTF (last 100 steps)')
         values.append(f"{info['viewer_rtf']:.2f}x (includes rendering)")
@@ -317,6 +322,7 @@ def _make_recovery(env, args):
         kinematic_ik=getattr(args, 'kinematic_ik', True),
         place_after_lift=getattr(args, 'place', False),
         carry_by_walking=getattr(args, 'carry', True),
+        floor_four_finger_grip=getattr(args, 'four_finger', True),
         motion_profile=getattr(args, 'recovery_motion', 'baseline')))
 
 
@@ -382,6 +388,8 @@ def main() -> None:
     parser.add_argument('--recover', action='store_true',
                         help='experimental live fault-to-lift controller; does not yet place/restart')
     parser.add_argument('--recovery-stand-off', type=float, default=0.27)
+    parser.add_argument('--four-finger', action=argparse.BooleanOptionalAction, default=True,
+                        help='Line 2: thumbs open during grasp; --no-four-finger restores previous grip')
     parser.add_argument('--place', action='store_true', help='experimental place/restart after --recover lift')
     parser.add_argument('--carry', action=argparse.BooleanOptionalAction, default=True,
                         help='with --place, walk the held part to the canonical spot before lowering')

@@ -30,9 +30,14 @@ def main():
     parser.add_argument('--max-steps', type=int, default=12000)
     parser.add_argument('--squeeze', type=float, default=0.006)
     parser.add_argument('--forward-bias', type=float, default=-0.08)
+    parser.add_argument('--lateral-command-limit', type=float, default=.3,
+                        help='belt near-goal lateral command limit; .06 reproduces the old slow approach')
     parser.add_argument('--motion-profile', choices=('baseline', 'compact', 'direct', 'smooth'), default='baseline')
     parser.add_argument('--out', default='results/factory/recovery.json')
     parser.add_argument('--render', action='store_true')
+    parser.add_argument('--four-finger', action=argparse.BooleanOptionalAction, default=True,
+                        help='floor grasp without thumb opposition/curl; --no-four-finger restores previous grip')
+    parser.add_argument('--floor-grip-load', type=float, nargs=2, default=(3., 6.), metavar=('LOW', 'HIGH'))
     parser.add_argument('--place', action='store_true', help='continue after lift into experimental place/restart')
     parser.add_argument('--carry', action=argparse.BooleanOptionalAction, default=True,
                         help='walk the held part to the canonical spot before placing')
@@ -44,13 +49,17 @@ def main():
         recovery = FactoryRecovery(env, RecoveryConfig(stand_off_m=args.stand_off, max_steps=args.max_steps,
                                                        hold_squeeze_m=args.squeeze,
                                                        motion_profile=args.motion_profile,
+                                                       floor_four_finger_grip=args.four_finger,
+                                                       floor_grip_load_n=tuple(args.floor_grip_load),
                                                        kinematic_ik=args.kinematic_ik,
                                                        place_after_lift=args.place,
                                                        carry_by_walking=args.carry,
                                                        forward_command_bias=args.forward_bias))
+        recovery.config.belt_lateral_clamp_command = args.lateral_command_limit
         peak_step = 0.0
         foot_part_ticks, foot_part_peak_n = 0, 0.
         extra_contact_ticks, interference_ticks, extra_pairs = 0, 0, {}
+        grip_pairs = {}
         hands = SharpaContactLift.hand_wrist_body_ids(recovery.grasp)
         hand_ids = hands['left'] | hands['right']
         pelvis_id = recovery.stabilizer.pelvis_body
@@ -63,6 +72,7 @@ def main():
         previous_motion_state = None
         step_times = []
         phase_times = {}
+        navigation_samples = []
         state_digest = hashlib.sha256()
         loop_started = time.perf_counter()
         sim_started = env.data.time
@@ -70,6 +80,12 @@ def main():
             phase = (recovery.expert.state.name if recovery.state == 'GRASP' else recovery.state)
             started = time.perf_counter()
             info = recovery.step()
+            if phase == 'WALK' and (step % 10 == 0 or recovery.state != 'WALK'):
+                nav = recovery.navigator
+                navigation_samples.append({'step': step, 'error_m': nav.error.tolist(),
+                    'velocity_m_s': nav.velocity.tolist(), 'arrived': nav.arrived,
+                    'yaw_rad': recovery.walker.base_pose()[1], 'heading_rad': nav.heading,
+                    'double_support': recovery.walker.in_double_support()})
             step_times.append(time.perf_counter() - started)
             phase_times.setdefault(phase, []).append(step_times[-1])
             for values in (env.data.qpos, env.data.qvel, env.data.ctrl):
@@ -92,6 +108,17 @@ def main():
                     allowed_foot = (floor_geom in (contact.geom1, contact.geom2)
                                     and any(b in recovery.walker.foot_bodies for b in bodies))
                     allowed_grip = part_body in bodies and any(b in hand_ids for b in bodies)
+                    if allowed_grip:
+                        other = int(bodies[1] if bodies[0] == part_body else bodies[0])
+                        contact_force = np.zeros(6)
+                        mujoco.mj_contactForce(env.model, env.data, index, contact_force)
+                        magnitude = float(np.linalg.norm(contact_force[:3]))
+                        if magnitude > .01:
+                            key = f"{info.get('floor_stage') or recovery.state}:{env.model.body(other).name}"
+                            row = grip_pairs.setdefault(key, {'samples': 0, 'peak_force_n': 0., 'max_penetration_m': 0.})
+                            row['samples'] += 1
+                            row['peak_force_n'] = max(row['peak_force_n'], magnitude)
+                            row['max_penetration_m'] = max(row['max_penetration_m'], -float(contact.dist))
                     if allowed_foot or allowed_grip:
                         continue
                     force = np.zeros(6)
@@ -162,6 +189,7 @@ def main():
             'foot_part_contact_ticks': foot_part_ticks, 'foot_part_peak_force_n': foot_part_peak_n,
             'floor_stage': info.get('floor_stage'),
             'floor_peak_hand_force_n': info.get('floor_peak_hand_force_n'),
+            'floor_thumb_peak_force_n': recovery.floor_pickup.thumb_peak_force_n if hasattr(recovery, 'floor_pickup') else None,
             'floor_geometry': recovery.floor_pickup.geometry_report() if hasattr(recovery, 'floor_pickup') else None,
             'floor_target_error_m': info.get('floor_target_error_m'),
             'intentional_crouch': info.get('intentional_crouch', False),
@@ -181,10 +209,12 @@ def main():
             'additional_contact_ticks': extra_contact_ticks,
             'interference_contact_ticks': interference_ticks,
             'additional_contact_pairs': extra_pairs,
+            'object_grip_contact_pairs': grip_pairs,
             'pelvis_torso_contact_free_lift_success': recovery.state in ('LIFTED', 'RECOVERED') and recovery.forbidden_contact_ticks == 0,
             'collision_free_lift_success': recovery.state in ('LIFTED', 'RECOVERED') and extra_contact_ticks == 0,
             'events': recovery.events, 'config': vars(recovery.config),
             'phase_events': phase_events,
+            'navigation_samples': navigation_samples,
             'used_direct_approach': recovery.used_direct_approach,
             'motion_metrics': motion_metrics,
             'physics_dt_s': env.config.frame_skip * env.model.opt.timestep,

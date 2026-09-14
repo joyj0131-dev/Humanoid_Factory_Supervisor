@@ -60,6 +60,8 @@ class RecoveryConfig:
     arrival_radius_m: float = 0.03
     arrival_heading_rad: float = 0.06
     floor_heading_rad: float = 0.0
+    floor_four_finger_grip: bool = True
+    floor_grip_load_n: tuple[float, float] = (3., 6.)
     floor_stand_off_m: float = 0.27
     floor_support_grace_seconds: float = 0.05
     settle_steps: int = 200
@@ -79,6 +81,11 @@ class RecoveryConfig:
     # for all 2500 ticks). The carry therefore throttles only once close.
     lateral_clamp_radius_m: float = 0.08
     lateral_clamp_command: float = 0.06
+    # Belt approach: the old 0.06 near-goal clamp caused repeated extra gait
+    # cycles. Keep normal command saturation (0.3), then hand off at the
+    # SAME position/heading/velocity/double-support criteria. Floor and
+    # loaded-carry navigation retain their separately validated settings.
+    belt_lateral_clamp_command: float = 0.3
 
 
 class PrecisionApproach:
@@ -93,6 +100,7 @@ class PrecisionApproach:
         self.velocity = np.zeros(2)
         self.near = self.arrived = False
         self.error = np.full(2, np.inf)
+        self.goal = None
 
     def step(self, part_position, pelvis_goal=None):
         w = self.walker
@@ -101,6 +109,7 @@ class PrecisionApproach:
                 else stand_pose_for_part(part_position, self.heading,
                                          canonical_local_xy=(self.config.stand_off_m, 0.0)))
         yaw_error = float(np.arctan2(np.sin(yaw - self.heading), np.cos(yaw - self.heading)))
+        self.goal = goal.copy()
         self.error = goal - position
         dt = w.env.model.opt.timestep * w.env.config.frame_skip
         self.integral = np.clip(self.integral + self.error * dt, -0.5, 0.5)
@@ -356,7 +365,9 @@ class FactoryRecovery:
                 self.walker.holding = False
                 self.walker._apply_policy_gains()
                 self.navigator = PrecisionApproach(
-                    self.walker, self.config, heading=self.pick_heading)
+                    self.walker, replace(self.config,
+                        lateral_clamp_command=self.config.belt_lateral_clamp_command),
+                    heading=self.pick_heading)
                 self._transition('WALK')
         elif self.state == 'AISLE_APPROACH':
             self.navigator.step(e.part_position(self.station), pelvis_goal=self.aisle_goal)
@@ -567,5 +578,9 @@ class FactoryRecovery:
             info.update(floor_stage=self.floor_pickup.stage,
                         floor_peak_hand_force_n=self.floor_pickup.peak_hand_force_n.copy(),
                         floor_target_error_m=self.floor_pickup.target_error_m)
+        if hasattr(self, 'navigator') and self.navigator.goal is not None:
+            info.update(approach_goal_xy=self.navigator.goal.tolist(),
+                        approach_error_m=float(np.linalg.norm(self.navigator.goal-self.walker.base_pose()[0])),
+                        approach_arrived=self.navigator.arrived)
         self._last_info = info
         return info

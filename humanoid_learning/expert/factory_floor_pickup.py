@@ -7,11 +7,23 @@ from humanoid_learning.expert.sharpa_bimanual_grasp_expert import (
 )
 from humanoid_learning.expert.sharpa_contact_lift import SharpaContactLift
 from humanoid_learning.expert.pose_ik import orientation_error
+from humanoid_learning.envs import sharpa_config as sc
 
 
 class FactoryFloorPickup:
     def __init__(self, recovery):
         self.recovery, self.env = recovery, recovery.grasp
+        self.four_finger = getattr(getattr(recovery, 'config', None), 'floor_four_finger_grip', False)
+        self.load_low, self.load_high = getattr(getattr(recovery, 'config', None), 'floor_grip_load_n', (3., 6.))
+        if not 0. < self.load_low < self.load_high:
+            raise ValueError('floor grip load band must be positive and ordered')
+        self.finger_bodies = {side: {bid for bid in getattr(self.env, f'_{side}_hand_body_ids')
+            if any(f'_{finger}_' in (self.env.model.body(bid).name or '')
+                   for finger in ('index', 'middle', 'ring', 'pinky'))}
+            for side in sc.SIDES}
+        self.thumb_bodies = {side: {bid for bid in getattr(self.env, f'_{side}_hand_body_ids')
+            if '_thumb_' in (self.env.model.body(bid).name or '')} for side in sc.SIDES}
+        self.thumb_peak_force_n = {side: 0. for side in sc.SIDES}
         self.env.config.per_actuator_gravity_compensation = True
         self.ik_clearance_m = .008
         self.posture = WholeBodyPosture(self.env, self.ik_clearance_m)
@@ -67,7 +79,11 @@ class FactoryFloorPickup:
         else:
             palms = self.start * (1-progress) + self.goal * progress
             rotations = [_slerp_R(a, b, progress) for a, b in zip(self.start_R, self.goal_R)]
-        forces = SharpaContactLift.measure_support_forces(self.env)
+        forces = SharpaContactLift.measure_support_forces(
+            self.env, self.finger_bodies if self.four_finger else None)
+        thumb_forces = SharpaContactLift.measure_support_forces(self.env, self.thumb_bodies)
+        for side in sc.SIDES:
+            self.thumb_peak_force_n[side] = max(self.thumb_peak_force_n[side], float(np.linalg.norm(thumb_forces[side])))
         for side, force in forces.items():
             self.peak_hand_force_n[side] = max(self.peak_hand_force_n[side], float(np.linalg.norm(force)))
         normal_loads = {side: float(np.dot(force, -self._side_face(side)[2]))
@@ -133,6 +149,18 @@ class FactoryFloorPickup:
                    if self.stage == 'LOWER' else .8)
         if self.stage not in ('RISE', 'HOLD'):
             action[17:25] = np.clip((synergy - self.env._group_synergy)/self.env.config.hand_synergy_action_scale, -.1, .1)
+        if self.four_finger and self.stage != 'CROUCH':
+            # Keep the proven compact crouch; open the thumb on the reach,
+            # before contact, rather than sweeping an extended thumb past knees.
+            opening = (_quintic_scale(np.clip((progress-.6)/.4, 0., 1.))
+                       if self.stage == 'LOWER' else 1.)
+            for i in (0, 4):
+                action[17+i] = np.clip((.8*(1-opening)-self.env._group_synergy[i])/self.env.config.hand_synergy_action_scale, -.1, .1)
+            for side in sc.SIDES:
+                for suffix in sc.preshape_suffixes('thumb'):
+                    aid = self.env.model.actuator(sc.sharpa_actuator(side, 'thumb', suffix)).id
+                    self.env.data.ctrl[aid] = np.clip((1-opening)*sc.PRESHAPE_TARGETS['thumb'][suffix],
+                                                    *self.env.model.actuator_ctrlrange[aid])
         self.target_error_m = max(float(np.linalg.norm(self.env.palm_pose(s)[0]-palms[i]))
                                   for i, s in enumerate(('left','right')))
         if self.stage == 'CROUCH' and self.tick >= 1400:
@@ -217,14 +245,15 @@ class FactoryFloorPickup:
                 self.side_entry_ready[side] = True
             entering = not self.side_entry_ready[side]
             patch[axis] = sign*(half[axis]+.02 if entering else half[axis]-.001)
-            if not entering and 3. <= load <= 6.:
+            in_band = not entering and self.load_low <= load <= self.load_high
+            if in_band:
                 continue
             # Opposite side-face patches, not a shared nearest top corner.
             # Back off an overloaded hand while the other establishes contact.
             if self.stage in ('PICK_CLEAR','RISE','HOLD'):
-                difference = normal*(.0002 if load > 6. else -.0002)
+                difference = normal*(.0002 if load > self.load_high else -.0002)
             else:
-                difference = (normal*.0005 if load > 6.
+                difference = (normal*.0005 if load > self.load_high
                               else d.geom_xpos[obj]+object_R@patch-point)
             distance = np.linalg.norm(difference)
             direction = (difference/distance if distance > 1e-8
