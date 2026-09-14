@@ -89,8 +89,14 @@ class SharpaContactLift:
         action = np.zeros(25)
         if self.ticks % 10 == 0:
             squeeze = cfg.hold_squeeze_m * min(self.ticks * self.dt / 2.0, 1.0)
-            targets = {s: self.start[s] + np.array([
-                0.0, -squeeze if s == 'left' else squeeze, height]) for s in sc.SIDES}
+            # Press along the palms' OWN grasp axis, measured. Hard-coding world
+            # -y/+y worked only while every workcell faced world +X; with the
+            # corridor between two lines the robot faces one of them the other
+            # way round, and the same constants would pull the palms apart.
+            axis = self.start['right'] - self.start['left']
+            axis = axis / max(float(np.linalg.norm(axis)), 1e-9)
+            targets = {s: self.start[s] + (axis if s == 'left' else -axis) * squeeze
+                       + np.array([0.0, 0.0, height]) for s in sc.SIDES}
             result = self.expert._solve_both(
                 targets, self.rotation, require_orientation=True, ori_task_weight=1.0,
                 rest_q=self.expert._current_rest_q(), rest_gain=0.05,

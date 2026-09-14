@@ -12,10 +12,12 @@ os.environ.setdefault('MUJOCO_GL', 'egl')
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
+import mujoco
 
 from humanoid_learning.envs import factory_config as fcfg
 from humanoid_learning.envs.factory_env import FactoryEnv
 from humanoid_learning.expert.factory_recovery import FactoryRecovery, RecoveryConfig
+from humanoid_learning.expert.sharpa_contact_lift import SharpaContactLift
 
 
 def main():
@@ -47,6 +49,12 @@ def main():
                                                        carry_by_walking=args.carry,
                                                        forward_command_bias=args.forward_bias))
         peak_step = 0.0
+        foot_part_ticks, foot_part_peak_n = 0, 0.
+        extra_contact_ticks, interference_ticks, extra_pairs = 0, 0, {}
+        hands = SharpaContactLift.hand_wrist_body_ids(recovery.grasp)
+        hand_ids = hands['left'] | hands['right']
+        pelvis_id = recovery.stabilizer.pelvis_body
+        floor_geom = env.model.geom('floor').id
         previous = env.data.qpos[:3].copy()
         last_state = None
         phase_events = []
@@ -68,7 +76,43 @@ def main():
                 state_digest.update(values.tobytes())
             peak_step = max(peak_step, float(np.linalg.norm(env.data.qpos[:3] - previous)))
             previous = env.data.qpos[:3].copy()
-            state = (recovery.state, getattr(getattr(recovery, 'expert', None), 'state', None))
+            if recovery.station is not None:
+                part_body = env.model.body(fcfg.part_body_name(recovery.station)).id
+                touched, extra, interference = False, False, False
+                for index, contact in enumerate(env.data.contact):
+                    bodies = env.model.geom_bodyid[[contact.geom1, contact.geom2]]
+                    if part_body in bodies and any(body in bodies for body in recovery.walker.foot_bodies):
+                        force = np.zeros(6)
+                        mujoco.mj_contactForce(env.model, env.data, index, force)
+                        foot_part_peak_n = max(foot_part_peak_n, float(np.linalg.norm(force[:3])))
+                        touched = True
+                    robot = [env.model.body_rootid[b] == pelvis_id for b in bodies]
+                    if not any(robot):
+                        continue
+                    allowed_foot = (floor_geom in (contact.geom1, contact.geom2)
+                                    and any(b in recovery.walker.foot_bodies for b in bodies))
+                    allowed_grip = part_body in bodies and any(b in hand_ids for b in bodies)
+                    if allowed_foot or allowed_grip:
+                        continue
+                    force = np.zeros(6)
+                    mujoco.mj_contactForce(env.model, env.data, index, force)
+                    magnitude = float(np.linalg.norm(force[:3]))
+                    if magnitude <= .5:
+                        continue
+                    internal_hand = any(all(b in ids for b in bodies) for ids in hands.values())
+                    category = 'hand_internal' if internal_hand else ('robot_self' if all(robot) else 'environment')
+                    extra, interference = True, interference or not internal_hand
+                    phase_name = info.get('floor_stage') or recovery.state
+                    pair = ':'.join([phase_name, category, *(env.model.body(int(b)).name for b in bodies)])
+                    row = extra_pairs.setdefault(pair, {'samples': 0, 'peak_force_n': 0., 'max_penetration_m': 0.})
+                    row['samples'] += 1
+                    row['peak_force_n'] = max(row['peak_force_n'], magnitude)
+                    row['max_penetration_m'] = max(row['max_penetration_m'], -float(contact.dist))
+                foot_part_ticks += int(touched)
+                extra_contact_ticks += int(extra)
+                interference_ticks += int(interference)
+            state = (recovery.state, getattr(getattr(recovery, 'expert', None), 'state', None),
+                     info.get('floor_stage'))
             if state[0] == 'GRASP' and state[1] is not None:
                 palms = np.stack([recovery.grasp.palm_pose(s)[0].copy() for s in ('left', 'right')])
                 if previous_motion_state == state and previous_palms is not None:
@@ -79,9 +123,15 @@ def main():
             previous_motion_state = state
             if state != last_state:
                 phase_events.append({'step': step, 'phase': recovery.state,
-                                     'grasp_state': state[1].name if state[1] is not None else None})
+                                     'grasp_state': state[1].name if state[1] is not None else None,
+                                     'floor_stage': state[2]})
                 print(step, *state, 'base', np.round(previous, 4), flush=True)
                 last_state = state
+            elif recovery.state == 'FLOOR_PICKUP' and step % 500 == 0:
+                print(step, 'FLOOR_PICKUP', info.get('floor_stage'),
+                      'palm error', info.get('floor_target_error_m'),
+                      'hand forces', info.get('floor_peak_hand_force_n'),
+                      'base', np.round(previous, 4), flush=True)
             if recovery.state in recovery.TERMINAL:
                 break
         elapsed = time.perf_counter() - loop_started
@@ -109,13 +159,30 @@ def main():
             'place_actual_position': env.part_position(recovery.station).tolist() if hasattr(recovery, 'placer') else None,
             'line_state': info.get('line_state'), 'mission_events': info.get('mission_events'),
             'failure': recovery.failure, 'steps': recovery.total_steps,
+            'foot_part_contact_ticks': foot_part_ticks, 'foot_part_peak_force_n': foot_part_peak_n,
+            'floor_stage': info.get('floor_stage'),
+            'floor_peak_hand_force_n': info.get('floor_peak_hand_force_n'),
+            'floor_geometry': recovery.floor_pickup.geometry_report() if hasattr(recovery, 'floor_pickup') else None,
+            'floor_target_error_m': info.get('floor_target_error_m'),
+            'intentional_crouch': info.get('intentional_crouch', False),
+            'final_pelvis_position_m': env.data.xpos[recovery.stabilizer.pelvis_body].tolist(),
+            'final_tilt_rad': np.asarray(recovery.stabilizer.tilt()).tolist(),
+            'final_double_support_15n': recovery.walker.in_double_support(15.),
+            'floor_ground_foot_loads_n': info.get('floor_ground_foot_loads_n'),
             'max_clearance_m': recovery.max_clearance,
             'max_supported_hold_seconds': recovery.max_hold_steps * env.config.frame_skip * env.model.opt.timestep,
-            'max_base_step_m': peak_step, 'fallen': bool(info.get('fallen')),
+            'max_base_step_m': peak_step,
+            'fallen': bool(info.get('recovery_fallen', info.get('fallen'))),
+            'raw_env_fallen': bool(info.get('fallen')),
             'object_hand_penetration_max_m': recovery.max_object_hand_penetration_m,
             'forbidden_contact_ticks': recovery.forbidden_contact_ticks,
             'forbidden_contact_pairs': recovery.forbidden_contact_pairs,
-            'collision_free_lift_success': recovery.state in ('LIFTED', 'RECOVERED') and recovery.forbidden_contact_ticks == 0,
+            'contact_audit_force_threshold_n': .5,
+            'additional_contact_ticks': extra_contact_ticks,
+            'interference_contact_ticks': interference_ticks,
+            'additional_contact_pairs': extra_pairs,
+            'pelvis_torso_contact_free_lift_success': recovery.state in ('LIFTED', 'RECOVERED') and recovery.forbidden_contact_ticks == 0,
+            'collision_free_lift_success': recovery.state in ('LIFTED', 'RECOVERED') and extra_contact_ticks == 0,
             'events': recovery.events, 'config': vars(recovery.config),
             'phase_events': phase_events,
             'used_direct_approach': recovery.used_direct_approach,
@@ -135,15 +202,25 @@ def main():
         out.write_text(json.dumps(result, indent=2) + '\n')
         print(json.dumps(result, indent=2), flush=True)
         if args.render:
-            import mujoco
             from PIL import Image
             from humanoid_learning.envs import factory_config as fc
+            state_type = mujoco.mjtState.mjSTATE_INTEGRATION
+            snapshot = np.zeros(mujoco.mj_stateSize(env.model, state_type))
+            mujoco.mj_getState(env.model, env.data, snapshot, state_type)
+            np.savez(out.with_suffix('.npz'), diagnostic_only=True, learner_ready=False,
+                     state=snapshot, gain=env.model.actuator_gainprm,
+                     bias=env.model.actuator_biasprm, noslip_iterations=env.model.opt.noslip_iterations,
+                     qpos=env.data.qpos,
+                     qvel=env.data.qvel, ctrl=env.data.ctrl)
             for station, arm in enumerate(env.arms):
                 env.model.geom_rgba[env.model.geom(fc.beacon_geom_name(station)).id] = (
                     (1.0, 0.65, 0.05, 1.0) if arm.faulted else fc.BEACON_RUNNING_RGBA)
             camera = mujoco.MjvCamera()
-            camera.lookat[:] = env.part_position(args.station)
-            camera.distance, camera.azimuth, camera.elevation = 1.6, 190, -15
+            camera.lookat[:] = env.part_position(recovery.station) + [0., 0., .15]
+            camera.distance = 1.9
+            camera.azimuth, camera.elevation = 110., -45.
+            if recovery.floor_task:
+                camera.azimuth, camera.elevation = 110., -65.
             with mujoco.Renderer(env.model, height=720, width=1280) as renderer:
                 renderer.update_scene(env.data, camera)
                 Image.fromarray(renderer.render()).save(out.with_suffix('.png'))

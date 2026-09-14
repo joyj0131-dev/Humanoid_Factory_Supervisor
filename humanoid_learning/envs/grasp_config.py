@@ -22,6 +22,10 @@ class GraspEnvConfig:
     fixed_base: bool = True
 
     arm_action_scale: float = 0.05  # matches Foundation EnvConfig.action_scale
+    # Existing grasp trajectories were tuned with arm_kp for the waist too.
+    # New whole-body postures opt into the physically correct per-actuator
+    # feedforward without silently retuning the validated standing controller.
+    per_actuator_gravity_compensation: bool = False
     # Waist action channel, added for the coupled bilateral waist-aware IK
     # session -- same scale as the arms so a coupled-IK-derived joint delta
     # converts to an action the same way regardless of which of the 17

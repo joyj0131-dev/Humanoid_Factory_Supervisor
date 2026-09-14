@@ -225,12 +225,23 @@ def _add_conveyor(spec, pose: fcfg.WorkcellPose) -> None:
                 fcfg.TABLE_TOP_Z + fcfg.RAIL_HALF_HEIGHT,
             ],
         )
-        rail.add_geom(
-            name=f"wc{index}_rail_{tag}_geom",
-            type=mujoco.mjtGeom.mjGEOM_BOX,
-            size=[0.02, fcfg.BELT_HALF_SIZE[1], fcfg.RAIL_HALF_HEIGHT],
-            rgba=[0.55, 0.57, 0.60, 1],
-        )
+        spans = [(-fcfg.BELT_HALF_SIZE[1], fcfg.BELT_HALF_SIZE[1])]
+        if pose.work_surface == "belt" and sign * pose.inward[0] > 0:
+            # A real access opening, not a collision mask. Keep the opposite
+            # guard and the two end guards; expose the infeed-to-pick work zone.
+            lo = max(spans[0][0], pose.infeed_xy[1] - pose.belt_y - 0.40)
+            hi = min(spans[0][1], pose.pick_xy[1] - pose.belt_y + 0.45)
+            spans = [(spans[0][0], lo), (hi, spans[0][1])]
+        for segment, (lo, hi) in enumerate(spans):
+            if hi <= lo:
+                continue
+            rail.add_geom(
+                name=f"wc{index}_rail_{tag}_geom" + (f"_{segment}" if len(spans) > 1 else ""),
+                type=mujoco.mjtGeom.mjGEOM_BOX,
+                pos=[0, (lo + hi) / 2, 0],
+                size=[0.02, (hi - lo) / 2, fcfg.RAIL_HALF_HEIGHT],
+                rgba=[0.55, 0.57, 0.60, 1],
+            )
 
 
 def _add_table(spec, pose: fcfg.WorkcellPose) -> None:

@@ -145,7 +145,8 @@ class FactoryPlace:
             else:
                 f = _quintic_scale(self.tick / cfg.retract_ticks)
                 delta = lambda side: np.array([-0.08*f, 0.05 if side == 'left' else -0.05, 0.08*f])
-            self._solve({s: self.release_start[s] + delta(s) for s in self.offset}, self.release_R)
+            self._solve({s: self.release_start[s] + self.expert.task_rotation @ delta(s)
+                         for s in self.offset}, self.release_R)
             if self.stage == 'RELEASE' and self.tick >= cfg.release_ticks:
                 self._advance('RETRACT')
             elif self.stage == 'RETRACT' and self.tick >= cfg.retract_ticks:

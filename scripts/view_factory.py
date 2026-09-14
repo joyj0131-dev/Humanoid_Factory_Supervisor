@@ -140,6 +140,12 @@ def _panel(env, info, paused=False, walk=None) -> tuple[str, str]:
     if 'recovery_state' in info:
         values[labels.index('G1')] = info['recovery_state'] + (
             f" / {info['grasp_state']}" if info.get('grasp_state') and info['recovery_state'] == 'GRASP' else '')
+        if info.get('floor_stage'):
+            values[labels.index('G1')] += f" / {info['floor_stage']}"
+            if info['floor_stage'] in ('CROUCH', 'LOWER'):
+                values[labels.index('G1')] += f" | palm target residual {1000*info['floor_target_error_m']:.0f} mm"
+            else:
+                values[labels.index('G1')] += f" | best lift {100*info['lift_clearance_max_m']:.1f} cm"
         labels.extend(['Best lift hold', 'Failure'])
         values.extend([f"{info['lift_hold_steps'] * env.model.opt.timestep * env.config.frame_skip:.2f}s",
                        str(info.get('recovery_failure') or '-')])

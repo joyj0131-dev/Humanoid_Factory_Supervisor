@@ -518,8 +518,15 @@ class SharpaGraspEnv(gym.Env):
             # (one-tick feedback delay, standard and stable for a load that
             # changes slowly relative to the control tick) rather than an
             # extra mj_forward call.
-            grav_arm = self.data.qfrc_bias[self._arm_dof_adr] / self.config.arm_kp
-            grav_waist = self.data.qfrc_bias[self._waist_dof_adr] / self.config.arm_kp
+            # A shared factory model can have stiff waist/leg actuators and
+            # compliant arms. Divide by each actual actuator gain, not the arm
+            # config value: otherwise crouching overcompensates the waist.
+            arm_gain = (np.maximum(self.model.actuator_gainprm[self._arm_act_ids, 0], 1e-9)
+                        if self.config.per_actuator_gravity_compensation else self.config.arm_kp)
+            waist_gain = (np.maximum(self.model.actuator_gainprm[self._waist_act_ids, 0], 1e-9)
+                          if self.config.per_actuator_gravity_compensation else self.config.arm_kp)
+            grav_arm = self.data.qfrc_bias[self._arm_dof_adr] / arm_gain
+            grav_waist = self.data.qfrc_bias[self._waist_dof_adr] / waist_gain
             self.data.ctrl[self._arm_act_ids] = np.clip(
                 self._arm_target + grav_arm, self._arm_ctrl_low, self._arm_ctrl_high
             )

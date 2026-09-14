@@ -113,27 +113,47 @@ observation만으로는 명령을 결정할 수 없다 — Expert는 접촉력 �
 
 ## 두 작업 공간 공장 환경
 
-컨베이어 하나와 자동화 팔 두 개가 있는 공장이다. 기본 스테이션 간격은 2.2m이고
-두 위치 모두 같은 방향을 본다. 떨어뜨림/위치 불량 고장 시 task manager가
-라인을 정지시키고 G1에 복구를 요청한다.
+현재는 1.3m 통로 양쪽에 독립된 두 라인이 있다. 각 라인은 컨베이어·자동화 팔·
+테이블을 하나씩 사용한다. Line 1(index 0)은 벨트의 `jam`, Line 2(index 1)는
+테이블 밖 바닥으로 떨어지는 `arm_drop` 고장이다. Task manager가 해당 라인을
+정지시키고 G1에 복구를 요청한다.
 
-2026-09-11: `--recover`로 **고장 → 손 준비 → 실제 보행 → 정지 → 양손 파지·상승**을
-한 물리 장면에서 실행한다. dropped_part, seed 0의 양쪽 위치에서 5cm 이상 상승과
-양손 지지 5초를 확인했다(최대 수직 간격 67.7mm / 60.0mm, 넘어짐 없음).
-범용 복구 정책이나 학습 결과는 아니며, **제자리 내려놓기·재가동은 미구현**이다.
-끝나면 뷰어는 결과 자세를 보존하며 멈춘다. `R`로 다시 실행한다.
-보행 중 난간 접촉은 제거했지만, 파지 중 몸통 주변 접촉과 손–블록 관통 약 5mm가
-남아 있어 충돌 없는 복구 성공이나
-학습 데모 승인 상태는 아니다. [상세 결과와 남은 작업](docs/FACTORY_RECOVERY.md).
+2026-09-14, 새 배치에서의 검증 상태 (seed 0, smooth):
+
+- **Line 1:** 실제 보행 → 양손 파지 → 76.69mm 상승 → 공중 지지 5초 성공
+  (5364 step). 통로 쪽 난간에는 물리적 작업 개구부가 있으며 나머지 난간의 충돌은
+  유지한다. 손–블록 최대 관통은 8.71mm. 기존 pelvis/torso 검사는 0 tick이지만,
+  확장 검사에서는 엉덩이 링크–벨트 등 간섭 704 tick(최대 132N)이 검출됐다.
+- **Line 2:** 실제 고장 → 보행 → 앉기 → 바닥 블록 집기 → 기립 → 5초 유지 성공
+  (9022 step, 최대 바닥 간격 594.45mm, 발–블록 접촉 0, 넘어짐 없음).
+  벨트용 수평 감싸기와 달리 손목을 높게 두고 손가락을 위에서 양옆으로 내리는
+  바닥 전용 접근을 사용한다. 먼저 조금 들어 올린 후 팔의 파지 자세를 유지하며
+  다리로 일어선다. 손–블록 최대 관통 3.23mm. 자세 계획은 별도 모델의 8mm
+  자기충돌 여유를 사용하며, 실제 모델의 충돌 형상·마찰·질량은 바꾸지 않는다.
+  동일 조건 2회에서 전체 관절 위치·속도·명령 궤적 해시까지 일치했다.
+  다만 확장 검사상 팔·다리·테이블 간섭 2423 tick, 최대 63.83N이 남아 있다.
+  8mm는 계획상의 여유이지 실제 무충돌 보장이 아니다. 바닥 자세 계산도 느리며
+  전체 headless 실행 RTF 약 0.17이었다(하드웨어·동시 부하에 따라 달라짐).
+- 운반·내려놓기 코드는 실험 단계이며, 새 배치에서 **복구 → 생산 재가동까지
+  완결된 성공은 없다**. `--recover --place`는 완료 기능으로 간주하지 않는다.
+
+이는 현재 장면에서의 기능 성공이며, **충돌 없는 동작·범용 복구 정책·학습 데모
+승인을 뜻하지 않는다**. 평가 결과의 `additional_contact_pairs`는 기존 pelvis/torso
+검사에 없는 팔·다리·손–환경 접촉도 기록한다(0.5N 초과, 손 내부 접촉 별도 분류).
+뷰어는 결과 자세에서
+멈추며 `R`로 다시 실행한다. 수치 재검증에는
+`scripts/evaluate_factory_recovery.py --station 0 --motion-profile smooth`를 사용한다.
+Line 2는 `--station 1`로 검사한다. `--place` 없이 실행하면 들어 올린 상태에서
+끝나며 task manager는 `RECOVERING`을 유지한다. 복구 완료 신호를 가짜로 보내지 않는다.
 
 Navigation Gate는 **보행 정책이 생기기 전에 미리** 못박았다: 위치 0.10m, heading
 0.15rad, 1.0초 유지, 넘어짐/금지 접촉 없음, 올바른 셀 먼저, 1500 step 이내, 그리고
 step당 base 이동 0.05m 초과는 보행이 아니므로 실격. 테스트로 순간이동·엉뚱한 셀
 경유·넘어짐이 실제로 걸러지는 것을 확인했다.
 
-G1이 **집 위치에서 각 스테이션까지 실제로 걸어간다**(Unitree 사전학습 G1 정책,
-BSD-3, 외부 도구). 최종 위치 오차 34.8mm / 46.8mm(허용 100mm), step당 base 이동
-4.7mm(순간이동 판정 50mm)로 진짜 보행이다. 보행은 연구 대상이 아니라 주어진
+G1은 Unitree 사전학습 G1 정책(BSD-3, 외부 도구)으로 실제로 걷는다.
+과거 배치에서 측정한 위치 오차 34.8mm / 46.8mm는 새 배치의 검증값이 아니다.
+보행은 연구 대상이 아니라 주어진
 도구이며 출처는 `assets/policies/g1_walk/NOTICE`에 기록했다.
 
 ```bash
@@ -141,10 +161,10 @@ python3 scripts/install_g1_walk_policy.py
 DISPLAY=:0 python3 scripts/view_factory.py --recover --fault-workcell 0
 DISPLAY=:0 python3 scripts/view_factory.py --recover --fault-workcell 1
 DISPLAY=:0 python3 scripts/view_factory.py --walk-to 0
-DISPLAY=:0 python3 scripts/view_factory.py --walk-to 1 --scenario dropped_part
+DISPLAY=:0 python3 scripts/view_factory.py --walk-to 1 --scenario arm_drop
 DISPLAY=:0 python3 scripts/view_factory.py
-DISPLAY=:0 python3 scripts/view_factory.py --scenario dropped_part
-DISPLAY=:0 python3 scripts/view_factory.py --scenario misplaced_part --fault-workcell 0
+DISPLAY=:0 python3 scripts/view_factory.py --scenario arm_drop --fault-workcell 1
+DISPLAY=:0 python3 scripts/view_factory.py --scenario jam --fault-workcell 0
 DISPLAY=:0 python3 scripts/view_factory.py --no-fault
 OPENBLAS_NUM_THREADS=1 python3 scripts/view_factory.py --offscreen \
   --seed 0 --out results/factory/scene.png --steps 400 --capture 150 400
@@ -152,8 +172,8 @@ OPENBLAS_NUM_THREADS=1 MUJOCO_GL=egl python3 scripts/test_factory.py
 ```
 
 `--walk-to`는 종전 스테이션 마커까지 걷는 기능이고 `--recover`는 실제 고장 부품을
-향해 이동한 뒤 잡는 경로다. 동시에 지정하지 않는다. 기존 grasp의 world 축 가정은
-남아 있어 임의 방향·배치의 범용성은 보장하지 않는다. `envs/` 변경으로 기존 데모
+향해 이동한 뒤 잡는 경로다. 동시에 지정하지 않는다. 파지 목표와 안쪽 접근 방향은
+작업 heading 좌표계로 변환하지만 임의 방향·배치의 성공을 보장하지 않는다. `envs/` 변경으로 기존 데모
 hash가 달라지므로 예전 데이터의 hash를 고치지 말고 새 버전에 재기록해야 한다.
 자세한 내용은
 [공장 환경](docs/FACTORY_ENVIRONMENT.md) 참고.

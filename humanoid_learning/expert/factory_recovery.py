@@ -58,6 +58,10 @@ class RecoveryConfig:
     carry_extra_squeeze_m: float = 0.006
     stand_off_m: float = 0.27
     arrival_radius_m: float = 0.03
+    arrival_heading_rad: float = 0.06
+    floor_heading_rad: float = 0.0
+    floor_stand_off_m: float = 0.27
+    floor_support_grace_seconds: float = 0.05
     settle_steps: int = 200
     max_steps: int = 12000
     lift_clearance_m: float = 0.05
@@ -73,15 +77,18 @@ class RecoveryConfig:
     # already inside this radius, so the throttle applied from tick 0 and
     # the lateral error never closed (measured: 190 <-> 215 mm limit cycle
     # for all 2500 ticks). The carry therefore throttles only once close.
-    lateral_clamp_radius_m: float = 0.2
+    lateral_clamp_radius_m: float = 0.08
     lateral_clamp_command: float = 0.06
 
 
 class PrecisionApproach:
     """Slow near the actual part; hand off measured targets at double support."""
 
-    def __init__(self, walker, config):
-        self.walker, self.config = walker, config
+    def __init__(self, walker, config, heading: float = 0.0):
+        # The corridor runs BETWEEN the two lines, so the supervisor faces one
+        # of them along -X and the other along +X. Everything here that used to
+        # assume "yaw 0 is forward" is now measured against this line's heading.
+        self.walker, self.config, self.heading = walker, config, float(heading)
         self.integral = np.zeros(2)
         self.velocity = np.zeros(2)
         self.near = self.arrived = False
@@ -91,8 +98,9 @@ class PrecisionApproach:
         w = self.walker
         position, yaw = w.base_pose()
         goal = (np.asarray(pelvis_goal, dtype=np.float64) if pelvis_goal is not None
-                else stand_pose_for_part(part_position, 0.0,
+                else stand_pose_for_part(part_position, self.heading,
                                          canonical_local_xy=(self.config.stand_off_m, 0.0)))
+        yaw_error = float(np.arctan2(np.sin(yaw - self.heading), np.cos(yaw - self.heading)))
         self.error = goal - position
         dt = w.env.model.opt.timestep * w.env.config.frame_skip
         self.integral = np.clip(self.integral + self.error * dt, -0.5, 0.5)
@@ -108,11 +116,11 @@ class PrecisionApproach:
             command[1] = np.clip(command[1], -self.config.lateral_clamp_command,
                                  self.config.lateral_clamp_command)
         if (np.linalg.norm(self.error) < self.config.arrival_radius_m
-                and abs(yaw) < 0.06 and np.linalg.norm(self.velocity) < 0.07
+                and abs(yaw_error) < self.config.arrival_heading_rad and np.linalg.norm(self.velocity) < 0.07
                 and w.in_double_support()):
             w.hold_stance()
             self.arrived = True
-        w.step(np.r_[np.clip(command, -0.3, 0.3), np.clip(-2 * yaw, -0.3, 0.3)])
+        w.step(np.r_[np.clip(command, -0.3, 0.3), np.clip(-2 * yaw_error, -0.3, 0.3)])
         w.env.data.ctrl[w.act_ids] = w.env._leg_target
 
 
@@ -158,7 +166,8 @@ class FactoryRecovery:
             config, shared_model=e.model, shared_data=e.data,
             object_joint=fc.part_joint_name(station), object_body=fc.part_body_name(station),
             object_geom=fc.part_geom_name(station),
-            support_geom=fc.work_surface_geom_name(e.poses[station]))
+            support_geom=('floor' if getattr(self, 'floor_task', False)
+                          else fc.work_surface_geom_name(e.poses[station])))
 
     def _transition(self, state):
         self.events.append({'step': self.env._step_count, 'state': state})
@@ -175,9 +184,11 @@ class FactoryRecovery:
         e = self.env
         obj, belt = (e.model.geom(name).id for name in
                      (fc.part_geom_name(self.station),
-                      fc.work_surface_geom_name(e.poses[self.station])))
+                      self.grasp.support_geom_name))
         half_height = abs(e.data.geom_xmat[obj].reshape(3, 3)[2]) @ e.model.geom_size[obj]
         top = e.data.geom_xpos[belt, 2] + abs(e.data.geom_xmat[belt].reshape(3, 3)[2]) @ e.model.geom_size[belt]
+        if e.model.geom_type[belt] == mujoco.mjtGeom.mjGEOM_PLANE:
+            top = e.data.geom_xpos[belt, 2]
         clearance = float(e.data.geom_xpos[obj, 2] - half_height - top)
         bodies = SharpaContactLift.hand_wrist_body_ids(self.grasp)
         forces = SharpaContactLift.measure_support_forces(self.grasp, bodies)
@@ -194,10 +205,27 @@ class FactoryRecovery:
 
     def _standing_feedback(self):
         self.stabilizer.apply()
+        rotation = self.env.data.xmat[self.stabilizer.pelvis_body].reshape(3, 3)
+        velocity = rotation.T @ self.env.data.qvel[:3]
         self.env.data.ctrl[self.stabilizer.pitch_ids] += np.clip(
-            0.3 * self.env.data.qvel[0], -0.08, 0.08)
+            0.3 * velocity[0], -0.08, 0.08)
         self.env.data.ctrl[self.stabilizer.roll_ids] -= np.clip(
-            0.3 * self.env.data.qvel[1], -0.08, 0.08)
+            0.3 * velocity[1], -0.08, 0.08)
+
+    def _floor_support_continuity(self, loads):
+        """Allow at most 50 ms contact chatter after measured double support.
+
+        Low pelvis alone means crouching, not falling. Sustained loss of floor
+        load still fails; excessive tilt/height are checked independently.
+        """
+        if min(loads) >= 15.:
+            self._floor_support_seen = True
+            self._floor_support_gap = 0
+            return True
+        self._floor_support_gap = getattr(self, '_floor_support_gap', 0) + 1
+        dt = self.env.model.opt.timestep * self.env.config.frame_skip
+        return (getattr(self, '_floor_support_seen', False)
+                and self._floor_support_gap * dt <= self.config.floor_support_grace_seconds)
 
     def _latch_standing_hold(self):
         """Freeze the legs where the gait left them and re-zero the stabiliser."""
@@ -280,7 +308,8 @@ class FactoryRecovery:
         self.navigator = PrecisionApproach(
             self.walker, replace(self.config, arrival_radius_m=self.config.carry_arrival_radius_m,
                                  lateral_clamp_radius_m=self.config.carry_lateral_clamp_radius_m,
-                                 forward_command_bias=self.config.carry_forward_command_bias))
+                                 forward_command_bias=self.config.carry_forward_command_bias),
+            heading=self.env.poses[self.station].heading_rad)
         self._transition('CARRY')
 
     def _begin_place(self):
@@ -292,24 +321,62 @@ class FactoryRecovery:
         if self.state in self.TERMINAL:
             return self._last_info
         e = self.env
+        was_floor_control = self.state == 'FLOOR_PICKUP'
         action = np.zeros(25)
         if self.state == 'WAIT_FAULT':
             self.stabilizer.apply()
             if e.fault_active:
                 self.station = e.fault_workcell
+                self.floor_task = e.part_position(self.station)[2] < .30
+                # Turn in clear aisle space before the final floor approach.
+                self.pick_heading = (self.config.floor_heading_rad if self.floor_task
+                                     else e.poses[self.station].heading_rad)
                 e.task_manager.signal('accept', self.station, e._step_count)
                 self.grasp = self._grasp_view(self.station)
                 self.stabilizer.env = self.grasp
-                self.expert = SharpaBimanualGraspExpert(self.grasp)
+                self.expert = SharpaBimanualGraspExpert(self.grasp, heading=self.pick_heading)
                 self.expert.ik.kinematics_only = self.config.kinematic_ik
-                self._transition('PREPARE_HANDS')
+                if self.floor_task:
+                    # There is no belt to reach across: carrying the wide
+                    # belt-clearance pose into this turn only exposes the arms
+                    # to the parked automation gripper.
+                    self.walker.holding = False
+                    self.walker._apply_policy_gains()
+                    self.aisle_goal = np.array([fc.CORRIDOR_CENTRE_X,
+                                               e.part_position(self.station)[1] - .45])
+                    self.navigator = PrecisionApproach(self.walker, replace(
+                        self.config, arrival_radius_m=.08, forward_command_bias=0.0), heading=-np.pi/2)
+                    self._transition('AISLE_APPROACH')
+                else:
+                    self._transition('PREPARE_HANDS')
         elif self.state == 'PREPARE_HANDS':
             action = self.expert.step()
             self.stabilizer.apply()
             if self.expert.state.name == 'FOREARM_FORWARD_REACH':
                 self.walker.holding = False
                 self.walker._apply_policy_gains()
-                self.navigator = PrecisionApproach(self.walker, self.config)
+                self.navigator = PrecisionApproach(
+                    self.walker, self.config, heading=self.pick_heading)
+                self._transition('WALK')
+        elif self.state == 'AISLE_APPROACH':
+            self.navigator.step(e.part_position(self.station), pelvis_goal=self.aisle_goal)
+            if self.navigator.arrived:
+                self.walker.holding = False
+                self.walker._apply_policy_gains()
+                self.turn_goal = self.walker.base_pose()[0].copy()
+                self.navigator = PrecisionApproach(self.walker, replace(
+                    self.config, arrival_radius_m=.08, arrival_heading_rad=.10,
+                    forward_command_bias=0.0), heading=self.pick_heading)
+                self._transition('TURN_TO_PART')
+        elif self.state == 'TURN_TO_PART':
+            self.navigator.step(e.part_position(self.station), pelvis_goal=self.turn_goal)
+            if self.navigator.arrived:
+                self.walker.holding = False
+                self.walker._apply_policy_gains()
+                self.navigator = PrecisionApproach(self.walker, replace(
+                    self.config, stand_off_m=self.config.floor_stand_off_m,
+                    arrival_radius_m=.04, arrival_heading_rad=.10,
+                    forward_command_bias=0.0), heading=self.pick_heading)
                 self._transition('WALK')
         elif self.state == 'WALK':
             self.navigator.step(e.part_position(self.station))
@@ -324,12 +391,15 @@ class FactoryRecovery:
             e.data.ctrl[self.walker.act_ids] = self.leg_hold
             self._standing_feedback()
             if self.ticks >= self.config.settle_steps:
-                self.expert = SharpaBimanualGraspExpert(self.grasp)
+                self.expert = SharpaBimanualGraspExpert(self.grasp, heading=self.pick_heading)
                 self.expert.ik.kinematics_only = self.config.kinematic_ik
                 self.expert.config.palm_first_closure = self.config.palm_first_closure
                 self.expert.config.hold_squeeze_m = self.config.hold_squeeze_m
                 self.expert.config.contact_settle_grace_seconds = self.config.contact_settle_grace_seconds
-                if self.config.motion_profile == 'compact':
+                if self.floor_task:
+                    from humanoid_learning.expert.factory_floor_pickup import FactoryFloorPickup
+                    self.floor_pickup = FactoryFloorPickup(self)
+                elif self.config.motion_profile == 'compact':
                     self.expert.resume_prepared_approach()
                 elif self.config.motion_profile in ('direct', 'smooth'):
                     self.expert.config.continuous_approach = self.config.motion_profile == 'smooth'
@@ -337,7 +407,12 @@ class FactoryRecovery:
                     # block. Falls back to the full entry if the arms are not
                     # settled, and that fallback is recorded rather than hidden.
                     self.used_direct_approach = self.expert.begin_direct_approach()
-                self._transition('GRASP')
+                self._transition('FLOOR_PICKUP' if self.floor_task else 'GRASP')
+        elif self.state == 'FLOOR_PICKUP':
+            action = self.floor_pickup.step()
+            if self.floor_pickup.failure:
+                self.failure = self.floor_pickup.failure
+                self._transition('FAILED')
         elif self.state == 'GRASP':
             action = self.expert.step()
             self._standing_feedback()
@@ -387,7 +462,8 @@ class FactoryRecovery:
                 self._transition('FAILED')
 
         e.task_manager.update(e, e._step_count)
-        e.belt.set_line_running(self.station, e.task_manager.belt_should_run)
+        if self.station is not None:
+            e.belt.set_line_running(self.station, e.task_manager.belt_should_run)
         e.belt.drive(e)
         for arm in e.arms:
             arm.apply(e.data)
@@ -412,7 +488,7 @@ class FactoryRecovery:
                     record['samples'] += 1
                     record['peak_force_n'] = max(record['peak_force_n'], float(np.linalg.norm(force[:3])))
                     record['max_penetration_m'] = max(record['max_penetration_m'], -float(contact.dist))
-        if self.state == 'GRASP':
+        if self.state in ('GRASP', 'FLOOR_PICKUP'):
             clearance, supported = self.lift_evidence()
             hands = SharpaContactLift.hand_wrist_body_ids(self.grasp)
             hand_ids = hands['left'] | hands['right']
@@ -422,14 +498,16 @@ class FactoryRecovery:
                     self.max_object_hand_penetration_m = max(
                         self.max_object_hand_penetration_m, -float(contact.dist))
             self.max_clearance = max(self.max_clearance, clearance)
+            upright = (not was_floor_control or self.floor_pickup.stage == 'HOLD')
             self.hold_steps = self.hold_steps + 1 if (
-                clearance >= self.config.lift_clearance_m and supported) else 0
+                clearance >= self.config.lift_clearance_m and supported and upright) else 0
             self.max_hold_steps = max(self.max_hold_steps, self.hold_steps)
             dt = e.model.opt.timestep * e.config.frame_skip
-            if self.expert.state.name == 'FAILURE':
+            if self.state == 'GRASP' and self.expert.state.name == 'FAILURE':
                 self.failure = self.expert.failure_reason.name
                 self._transition('FAILED')
-            elif self.hold_steps * dt >= self.config.lift_hold_seconds:
+            elif (self.hold_steps * dt >= self.config.lift_hold_seconds
+                  and (not was_floor_control or e.data.xpos[self.stabilizer.pelvis_body, 2] > .65)):
                 if not self.config.place_after_lift:
                     self._transition('LIFTED')
                 elif self.config.carry_by_walking:
@@ -438,7 +516,31 @@ class FactoryRecovery:
                     self._begin_place()
         if self.state == 'VERIFY' and info.get('line_state') == 'RUNNING':
             self._transition('RECOVERED')
-        if info.get('fallen'):
+        # Low pelvis is intentional ONLY during foot-supported floor posture.
+        # Keep the environment's raw fall flag, and expose the task-qualified
+        # result separately. Loss of support/large tilt still stops the attempt.
+        floor_control = was_floor_control or self.state == 'FLOOR_PICKUP'
+        foot_loads = np.zeros(2)
+        if floor_control:
+            ground = e.model.geom('floor').id
+            for index, contact in enumerate(e.data.contact):
+                if ground not in (contact.geom1, contact.geom2):
+                    continue
+                other = contact.geom2 if contact.geom1 == ground else contact.geom1
+                for side, body in enumerate(self.walker.foot_bodies):
+                    if e.model.geom_bodyid[other] == body:
+                        force = np.zeros(6)
+                        mujoco.mj_contactForce(e.model, e.data, index, force)
+                        foot_loads[side] += np.linalg.norm(force[:3])
+        continuous_support = floor_control and self._floor_support_continuity(foot_loads)
+        intentional_crouch = (continuous_support
+                              and abs(self.stabilizer.tilt()[0]) < .4
+                              and abs(self.stabilizer.tilt()[1]) < 1.0
+                              and e.data.xpos[self.stabilizer.pelvis_body, 2] > .18)
+        info['intentional_crouch'] = bool(intentional_crouch)
+        info['recovery_fallen'] = bool(info.get('fallen') and not intentional_crouch)
+        info['floor_ground_foot_loads_n'] = foot_loads.tolist() if floor_control else None
+        if info['recovery_fallen']:
             self.failure = 'FALL'
             self._transition('FAILED')
         elif not np.isfinite(e.data.qpos).all() or not np.isfinite(e.data.qvel).all():
@@ -461,5 +563,9 @@ class FactoryRecovery:
                         place_commanded_rotation_deg=self.placer.commanded_rotation_deg,
                         place_tilt_deg=self.placer.tilt_deg,
                         hands_clear=self.placer.hands_clear)
+        if hasattr(self, 'floor_pickup'):
+            info.update(floor_stage=self.floor_pickup.stage,
+                        floor_peak_hand_force_n=self.floor_pickup.peak_hand_force_n.copy(),
+                        floor_target_error_m=self.floor_pickup.target_error_m)
         self._last_info = info
         return info

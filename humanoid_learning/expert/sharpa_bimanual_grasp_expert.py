@@ -1196,7 +1196,9 @@ class SharpaBimanualGraspExpert:
     DESCEND_JOINT_WEIGHT[[3, 6, 10, 13]] = 3.0
     DESCEND_JOINT_WEIGHT[[7, 8, 9, 14, 15, 16]] = 0.15
 
-    def __init__(self, env, config: BimanualGraspConfig | None = None):
+    def __init__(self, env, config: BimanualGraspConfig | None = None, *, heading: float = 0.0):
+        c, s = np.cos(heading), np.sin(heading)
+        self.task_rotation = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
         self.env = env
         self.config = config or BimanualGraspConfig()
         self.state = BimanualGraspState.STABLE_START
@@ -1293,7 +1295,16 @@ class SharpaBimanualGraspExpert:
 
     def _mirrored_targets(self, standoff: float, height: float, y_offset: float) -> dict:
         obj_pos = self._object_pos()
-        return {side: obj_pos + np.array([-standoff, Y_SIGN[side] * y_offset, height]) for side in SIDES}
+        return {side: obj_pos + self.task_rotation @ np.array(
+            [-standoff, Y_SIGN[side] * y_offset, height]) for side in SIDES}
+
+    def _inward_direction(self, side):
+        return self.task_rotation @ np.array([0.0, -Y_SIGN[side], 0.0])
+
+    def _facing_rotation(self, side, palm, obj, approach):
+        r = self.task_rotation
+        return r @ _object_facing_R(side, r.T @ palm, r.T @ obj,
+                                    current_approach_world=r.T @ approach)
 
     def _current_rest_q(self) -> np.ndarray:
         """[Fingertip-contact session] Same 17-dim layout as self._rest_q
@@ -1322,9 +1333,9 @@ class SharpaBimanualGraspExpert:
         precontact_y_offset_m Cartesian target."""
         obj_pos = self._object_pos()
         rotation = self.env.data.xmat[self.env._object_body_id].reshape(3, 3)
-        half_y = self.env.config.effective_object_half_extents[1]
-        local_tip = rotation.T @ (self._nonthumb_tip_centroid(side) - obj_pos)
-        return float(Y_SIGN[side] * local_tip[1] - half_y)
+        outward = -self._inward_direction(side)
+        radius = np.abs(rotation.T @ outward) @ np.asarray(self.env.config.effective_object_half_extents)
+        return float(outward @ (self._nonthumb_tip_centroid(side) - obj_pos) - radius)
 
     def _solve_both(self, targets: dict, R: dict, require_orientation: bool, ori_task_weight: float,
                      rest_q: np.ndarray | None = None, rest_gain: float | None = None,
@@ -1628,7 +1639,9 @@ class SharpaBimanualGraspExpert:
 
         local_palm = {s: object_R.T @ (palm[s][0] - obj_pos) for s in SIDES}
         local_tip = {s: object_R.T @ (tip_centroid[s] - obj_pos) for s in SIDES}
-        outside_side_face = {s: bool(Y_SIGN[s] * local_palm[s][1] > half[1]) for s in SIDES}
+        outside_side_face = {
+            s: bool(-self._inward_direction(s) @ (palm[s][0] - obj_pos)
+                    > np.abs(object_R.T @ self._inward_direction(s)) @ half) for s in SIDES}
         inward_angle_deg = {
             "left": self.left_object_facing_angle_deg, "right": self.right_object_facing_angle_deg,
         }
@@ -1697,7 +1710,8 @@ class SharpaBimanualGraspExpert:
             for s in SIDES
         )
         mirror_pos_err_m = float(np.linalg.norm(
-            (palm["left"][0] - obj_pos) * np.array([1, -1, 1]) - (palm["right"][0] - obj_pos)
+            (self.task_rotation.T @ (palm["left"][0] - obj_pos)) * np.array([1, -1, 1])
+            - self.task_rotation.T @ (palm["right"][0] - obj_pos)
         ))
         rel = palm["left"][1].T @ palm["right"][1]
         # left/right are mirrors (Y-flip), not identical -- compare each side's OWN
@@ -2309,8 +2323,8 @@ class SharpaBimanualGraspExpert:
                     cfg.approach_standoff_m, cfg.side_align_height_m, cfg.side_align_y_offset_m
                 )
                 self._side_align_final_R = {
-                    s: _object_facing_R(s, self._side_align_final_pos[s], obj_pos,
-                                         current_approach_world=self._side_align_start_R[s][:, 0]) for s in SIDES
+                    s: self._facing_rotation(s, self._side_align_final_pos[s], obj_pos,
+                                            self._side_align_start_R[s][:, 0]) for s in SIDES
                 }
                 self._side_align_waypoint = 0
                 self._side_align_stable_streak = 0
@@ -2855,7 +2869,7 @@ class SharpaBimanualGraspExpert:
                         cfg.precontact_recovery_min_step_m,
                     )
                     step = float(np.clip(error, 0.0, side_step_cap))
-                inward_dir = np.array([0.0, -Y_SIGN[s], 0.0])
+                inward_dir = self._inward_direction(s)
                 # Height target servoed the SAME way as the inward
                 # step (small bounded move toward a goal), never a
                 # discontinuous jump -- the goal itself
@@ -3043,7 +3057,7 @@ class SharpaBimanualGraspExpert:
                     # moves the palm plate) is reachable by the solver.
                     need_solve = True
                     anchor = self._contact_acquire_anchor[side]
-                    direction = np.array([0.0, -Y_SIGN[side], 0.0])
+                    direction = self._inward_direction(side)
                     # Keep pressing THROUGH first contact (that's the
                     # point -- see the streak comment above), but guard on
                     # the palm's own force too so "keep pressing" never
@@ -3108,7 +3122,7 @@ class SharpaBimanualGraspExpert:
                     self._contact_acquire_offset[side] = float(np.clip(
                         self._contact_acquire_offset[side] + step, 0.0, cfg.side_descend_y_offset_m,
                     ))
-                    inward_dir = np.array([0.0, -Y_SIGN[side], 0.0])
+                    inward_dir = self._inward_direction(side)
                     targets[side] = self._contact_acquire_anchor[side] + inward_dir * self._contact_acquire_offset[side]
                 R[side] = self._descend_locked_R[side]
             if need_solve:
