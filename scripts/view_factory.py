@@ -323,6 +323,7 @@ def _make_recovery(env, args):
         place_after_lift=getattr(args, 'place', False),
         carry_by_walking=getattr(args, 'carry', True),
         floor_four_finger_grip=getattr(args, 'four_finger', True),
+        floor_pad_grip=getattr(args, 'pad_grip', False),
         motion_profile=getattr(args, 'recovery_motion', 'baseline')))
 
 
@@ -390,6 +391,8 @@ def main() -> None:
     parser.add_argument('--recovery-stand-off', type=float, default=0.27)
     parser.add_argument('--four-finger', action=argparse.BooleanOptionalAction, default=True,
                         help='Line 2: thumbs open during grasp; --no-four-finger restores previous grip')
+    parser.add_argument('--pad-grip', action='store_true',
+                        help='experimental Line 2 extended-finger rubber-pad grasp')
     parser.add_argument('--place', action='store_true', help='experimental place/restart after --recover lift')
     parser.add_argument('--carry', action=argparse.BooleanOptionalAction, default=True,
                         help='with --place, walk the held part to the canonical spot before lowering')

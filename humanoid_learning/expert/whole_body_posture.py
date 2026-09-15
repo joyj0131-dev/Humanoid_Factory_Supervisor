@@ -15,7 +15,7 @@ from humanoid_learning.expert.pose_ik import orientation_error, so3_exp
 
 
 class WholeBodyPosture:
-    def __init__(self, env, clearance_m=0.0):
+    def __init__(self, env, clearance_m=0.0, self_collision_only=True):
         self.env = env
         m, d = env.model, env.data
         self.names = wc.LEG_JOINTS + wc.WAIST_JOINTS + tc.LEFT_ARM_JOINTS + tc.RIGHT_ARM_JOINTS
@@ -55,10 +55,31 @@ class WholeBodyPosture:
         # Planning-only clearance: detect self proximity before penetration.
         # A separate model preserves ALL live collision/physical parameters.
         self.clearance_m = float(clearance_m)
-        self.ik_model = copy.copy(m) if clearance_m > 0. else m
+        self.ik_model = copy.copy(m) if clearance_m > 0. or self_collision_only else m
+        robot = m.body_rootid[m.geom_bodyid] == self.pelvis
         if clearance_m > 0.:
-            robot = m.body_rootid[m.geom_bodyid] == self.pelvis
             self.ik_model.geom_margin[robot] = np.maximum(m.geom_margin[robot], clearance_m)
+        if self_collision_only:
+            # The objective below uses robot self contacts ONLY. Avoid narrow
+            # phase work for conveyor/parts/floor that would be discarded.
+            # This is a private planning model; live contacts remain unchanged.
+            self.ik_model.geom_contype[~robot] = 0
+            self.ik_model.geom_conaffinity[~robot] = 0
+            active = robot & ((m.geom_contype != 0) | (m.geom_conaffinity != 0))
+            if np.all(m.geom_contype[active] == 1) and np.all(m.geom_conaffinity[active] == 1):
+                # Finger joints are not optimization variables here. Contacts
+                # wholly within one hand have zero Jacobian in these columns:
+                # they cannot be relieved by any leg/waist/arm/base motion.
+                # Keep hand-to-arm, hand-to-body and opposite-hand contacts.
+                self.ik_model.geom_contype[active] = 1
+                self.ik_model.geom_conaffinity[active] = 7
+                for side, bit, affinity in (('left', 2, 5), ('right', 4, 3)):
+                    ids = getattr(env, f'_{side}_hand_body_ids')
+                    hand = active & np.isin(m.geom_bodyid, list(ids))
+                    self.ik_model.geom_contype[hand] = bit
+                    self.ik_model.geom_conaffinity[hand] = affinity
+        self.geom_body = m.geom_bodyid.copy()
+        self.geom_is_robot = robot.copy()
         self.scratch = mujoco.MjData(self.ik_model)
         self.solution = None
         self.last_error = {}
@@ -114,17 +135,19 @@ class WholeBodyPosture:
             add(jr, orientation_error(d.xmat[self.pelvis].reshape(3, 3), desired_pelvis_R), .5)
             mujoco.mj_collision(m, d)
             for contact in d.contact:
-                b1, b2 = m.geom_bodyid[[contact.geom1, contact.geom2]]
+                g1, g2 = contact.geom1, contact.geom2
                 # Foot support is intended; all robot self contact is not.
-                if m.body_rootid[b1] != self.pelvis or m.body_rootid[b2] != self.pelvis:
+                if not (self.geom_is_robot[g1] and self.geom_is_robot[g2]):
                     continue
+                clearance_error = max(.003, self.clearance_m) - contact.dist
+                if clearance_error <= 0.:
+                    continue
+                b1, b2 = self.geom_body[g1], self.geom_body[g2]
                 jp1, jp2 = np.zeros((3, m.nv)), np.zeros((3, m.nv))
                 mujoco.mj_jac(m, d, jp1, None, contact.pos, int(b1))
                 mujoco.mj_jac(m, d, jp2, None, contact.pos, int(b2))
                 normal = contact.frame.reshape(3, 3)[0]
-                clearance_error = max(.003, self.clearance_m) - contact.dist
-                if clearance_error > 0.:
-                    add((normal @ (jp2 - jp1))[None, :], [clearance_error], 30.)
+                add((normal @ (jp2 - jp1))[None, :], [clearance_error], 30.)
             # Weak posture regularization prevents arbitrary knee/arm branches.
             regularizer = np.zeros((len(self.names), n))
             regularizer[:, 6:] = np.eye(len(self.names)) * .015

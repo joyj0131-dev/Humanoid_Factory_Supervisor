@@ -38,6 +38,8 @@ def main():
     parser.add_argument('--four-finger', action=argparse.BooleanOptionalAction, default=True,
                         help='floor grasp without thumb opposition/curl; --no-four-finger restores previous grip')
     parser.add_argument('--floor-grip-load', type=float, nargs=2, default=(3., 6.), metavar=('LOW', 'HIGH'))
+    parser.add_argument('--posture-iterations', type=int, default=8)
+    parser.add_argument('--pad-grip', action='store_true')
     parser.add_argument('--place', action='store_true', help='continue after lift into experimental place/restart')
     parser.add_argument('--carry', action=argparse.BooleanOptionalAction, default=True,
                         help='walk the held part to the canonical spot before placing')
@@ -51,6 +53,8 @@ def main():
                                                        motion_profile=args.motion_profile,
                                                        floor_four_finger_grip=args.four_finger,
                                                        floor_grip_load_n=tuple(args.floor_grip_load),
+                                                       floor_posture_iterations=args.posture_iterations,
+                                                       floor_pad_grip=args.pad_grip,
                                                        kinematic_ik=args.kinematic_ik,
                                                        place_after_lift=args.place,
                                                        carry_by_walking=args.carry,
@@ -114,7 +118,8 @@ def main():
                         mujoco.mj_contactForce(env.model, env.data, index, contact_force)
                         magnitude = float(np.linalg.norm(contact_force[:3]))
                         if magnitude > .01:
-                            key = f"{info.get('floor_stage') or recovery.state}:{env.model.body(other).name}"
+                            other_geom = contact.geom2 if bodies[0] == part_body else contact.geom1
+                            key = f"{info.get('floor_stage') or recovery.state}:{env.model.body(other).name}:{env.model.geom(other_geom).name}"
                             row = grip_pairs.setdefault(key, {'samples': 0, 'peak_force_n': 0., 'max_penetration_m': 0.})
                             row['samples'] += 1
                             row['peak_force_n'] = max(row['peak_force_n'], magnitude)
@@ -153,6 +158,11 @@ def main():
                                      'grasp_state': state[1].name if state[1] is not None else None,
                                      'floor_stage': state[2]})
                 print(step, *state, 'base', np.round(previous, 4), flush=True)
+                if args.pad_grip and state[0] == 'FLOOR_PICKUP' and state[2] == 'RISE':
+                    floor = recovery.floor_pickup
+                    print('RISE handoff leg target jump', getattr(floor, 'rise_leg_target_jump_rad', None),
+                          'arm target error', np.round(recovery.grasp._arm_target - env.data.qpos[recovery.grasp._arm_qpos_adr], 3),
+                          flush=True)
                 last_state = state
             elif recovery.state == 'FLOOR_PICKUP' and step % 500 == 0:
                 print(step, 'FLOOR_PICKUP', info.get('floor_stage'),
@@ -175,6 +185,8 @@ def main():
                 'peak_speed_m_s_per_hand': speeds.max(axis=0).tolist(),
             }
         result = {
+            'floor_pad_grip': args.pad_grip,
+            'floor_posture_iterations': args.posture_iterations,
             'station': args.station, 'seed': args.seed, 'scenario': args.scenario,
             'success': recovery.state == ('RECOVERED' if args.place else 'LIFTED'), 'state': recovery.state,
             'place_stage': info.get('place_stage'), 'place_error_m': info.get('place_error_m'),

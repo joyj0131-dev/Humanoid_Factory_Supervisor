@@ -32,6 +32,8 @@ def main():
     parser.add_argument('--render', default=None)
     parser.add_argument('--body-lift', action='store_true',
                         help='subsystem candidate: start standing after bilateral contact, without arm-only lift')
+    parser.add_argument('--pad-grip', action='store_true',
+                        help='probe the measured rubber-face, near-straight finger clamp')
     parser.add_argument('--horizontal-wrap', action='store_true',
                         help='A/B only: old low-wrist belt grasp reused on the floor')
     parser.add_argument('--azimuth', type=float, default=110.)
@@ -39,7 +41,7 @@ def main():
     args = parser.parse_args()
     e = FactoryEnv()
     e.reset(seed=0, options={'fault_workcell': 1})
-    r = FactoryRecovery(e, RecoveryConfig(motion_profile='smooth'))
+    r = FactoryRecovery(e, RecoveryConfig(motion_profile='smooth', floor_pad_grip=args.pad_grip))
     state_type = mujoco.mjtState.mjSTATE_INTEGRATION
     if args.capture:
         for _ in range(12000):
