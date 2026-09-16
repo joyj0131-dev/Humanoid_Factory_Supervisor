@@ -146,7 +146,38 @@ def main():
             np.testing.assert_allclose(lifted[7*i:7*i+7], expected/grasp.config.arm_action_scale,
                                        atol=1e-12)
         print('PASS initial pad lift uses the squeeze controller joint preference')
+        retract = floor._pick_clear_action(-.00008*forward, False)
+        for i in range(2):
+            jp = np.zeros((3, m.nv))
+            mujoco.mj_jacSite(m, d, jp, None, floor.posture.palms[i])
+            columns = grasp._arm_dof_adr[7*i:7*i+7]
+            movement = jp[:, columns] @ (retract[7*i:7*i+7]*grasp.config.arm_action_scale)
+            assert movement@forward < 0.
+        print('PASS loaded retraction commands both hands toward the worker')
+        floor.frog_stance = True
+        floor.stage = 'CLOSE'
+        floor.side_entry_ready = {'left': False, 'right': False}
+        floor.support_ticks = 0
+        gentle = {side: -.5*floor._side_face(side)[2] for side in ('left', 'right')}
+        floor._contact_action(gentle)
+        assert all(floor.side_entry_ready.values())
+        assert floor.support_ticks == 0 and floor.stage == 'CLOSE'
+        print('PASS light pad touch switches the servo but is not accepted as grasp support')
         recovery.close()
+        widths = []
+        live_pose = d.qpos.copy()
+        for outward in (0., .06):
+            plan = WholeBodyPosture(grasp, .008)
+            palms = np.array([grasp.palm_pose(s)[0] for s in ('left', 'right')])
+            palms[:, 2] -= plan.start_height-.45
+            plan.solve(.45, palms, pelvis_pitch=.4, iterations=80, knee_outward_m=outward)
+            widths.append(float((plan.scratch.xpos[plan.knees[0]]-
+                                 plan.scratch.xpos[plan.knees[1]]) @ plan.base_rotation[:, 1]))
+            assert max(np.linalg.norm(plan.scratch.site_xpos[s]-p)
+                       for s, p in zip(plan.feet, plan.foot_positions)) < .015
+        assert widths[1] > widths[0]+.04
+        np.testing.assert_array_equal(d.qpos, live_pose)
+        print('PASS frog planning widens the knees without moving live poses (not a balance test)')
     finally:
         env.close()
 

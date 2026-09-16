@@ -50,6 +50,8 @@ class WholeBodyPosture:
         old_base = d.xmat[self.pelvis].reshape(3, 3)
         yaw = np.arctan2(old_base[1, 0], old_base[0, 0])
         self.base_rotation = so3_exp(np.array([0., 0., yaw]))
+        self.knees = [m.body(f'{side}_knee_link').id for side in ('left', 'right')]
+        self.knee_lateral = [float(d.xpos[b] @ self.base_rotation[:, 1]) for b in self.knees]
         self.com_xy = np.mean(self.foot_positions, axis=0)[:2] + .025*self.base_rotation[:2, 0]
         self.rest = d.qpos[self.qadr].copy()
         # Planning-only clearance: detect self proximity before penetration.
@@ -87,7 +89,7 @@ class WholeBodyPosture:
         self.command_velocity = np.zeros(len(self.names))
 
     def solve(self, height, palms, rotations=None, pelvis_pitch=0.0, iterations=12,
-              locked_upper_q=None):
+              locked_upper_q=None, knee_outward_m=0.0):
         m, live, d = self.ik_model, self.env.data, self.scratch
         d.qpos[:] = live.qpos
         if self.solution is not None:
@@ -113,11 +115,23 @@ class WholeBodyPosture:
             def add(j, err, weight):
                 rows.append(weight * j[:, self.cols])
                 errors.append(weight * np.atleast_1d(err))
-            for sid, pos, rotation in zip(self.feet, self.foot_positions, self.foot_rotations):
+            for i, (sid, pos, rotation) in enumerate(zip(self.feet, self.foot_positions, self.foot_rotations)):
+                # Turn toes outward with the squat instead of asking a fixed,
+                # forward-facing ankle to accommodate all of the hip rotation.
+                if knee_outward_m > 0.:
+                    rotation = rotation @ so3_exp(np.array([
+                        0., 0., (1 if i == 0 else -1)*min(np.deg2rad(25.), 5*knee_outward_m)]))
                 jp, jr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
                 mujoco.mj_jacSite(m, d, jp, jr, sid)
                 add(jp, pos - d.site_xpos[sid], 20.)
                 add(jr, orientation_error(d.site_xmat[sid].reshape(3, 3), rotation), 3.)
+            if knee_outward_m > 0.:
+                lateral = self.base_rotation[:, 1]
+                for i, body in enumerate(self.knees):
+                    jp = np.zeros((3, m.nv))
+                    mujoco.mj_jacBody(m, d, jp, None, body)
+                    target = self.knee_lateral[i] + (1 if i == 0 else -1)*knee_outward_m
+                    add((lateral @ jp)[None, :], [target-lateral@d.xpos[body]], 3.)
             for i, (sid, pos) in enumerate(zip(self.palms, palms)):
                 if locked_upper_q is not None:
                     continue  # carry the held arm posture with the torso

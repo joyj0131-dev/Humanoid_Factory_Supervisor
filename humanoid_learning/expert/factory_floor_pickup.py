@@ -22,6 +22,9 @@ class FactoryFloorPickup:
                           else None)
         if self.pad_grasp is not None:
             self.four_finger = True
+        self.frog_stance = bool(getattr(recovery.config, 'floor_frog_stance', False))
+        if self.frog_stance and self.pad_grasp is None:
+            raise ValueError('frog stance requires the pad grip')
         self.load_low, self.load_high = getattr(getattr(recovery, 'config', None), 'floor_grip_load_n', (3., 6.))
         if not 0. < self.load_low < self.load_high:
             raise ValueError('floor grip load band must be positive and ordered')
@@ -60,6 +63,7 @@ class FactoryFloorPickup:
         self.peak_hand_force_n = {'left': 0., 'right': 0.}
         self.target_error_m = float('inf')
         self.last_q = None
+        self.stance_metrics = {}
         self.close_height = self.height
         self.close_pitch = self.pitch
         for side in ('left', 'right'):
@@ -78,6 +82,8 @@ class FactoryFloorPickup:
             self.lower_start_height = self.posture.start_height
             self.start = np.array([self.env.palm_pose(s)[0] for s in ('left', 'right')])
             self.start_R = [self.env.palm_pose(s)[1] for s in ('left', 'right')]
+            self.stance_knee_lateral = self.posture.knee_lateral.copy()
+            self.stance_foot_rotations = [R.copy() for R in self.posture.foot_rotations]
         self.tick += 1
         expert = self.recovery.expert
         progress = _quintic_scale(min(self.tick / 1400., 1.)) if self.stage in ('CROUCH','LOWER') else 1.
@@ -101,19 +107,30 @@ class FactoryFloorPickup:
                         for side, force in forces.items()}
         supported = (all(load>1.5 for load in normal_loads.values())
                      and np.dot(forces['left'][:2], forces['right'][:2]) < 0.)
+        moving_support = (all(load > .15 for load in normal_loads.values())
+                          if self.frog_stance else supported)
         if self.stage == 'CLOSE':
             height, pitch = self.close_height, self.close_pitch
             self.support_ticks = self.support_ticks+1 if supported else 0
             if self.support_ticks >= 30:
                 self.stage, self.tick = 'PICK_CLEAR', 0
                 self.pick_rotations = [self.env.palm_pose(s)[1] for s in ('left','right')]
+                self.pick_object_R = self.env.data.geom_xmat[
+                    self.env.model.geom(self.env.object_geom_name).id].reshape(3, 3).copy()
+                self.pick_forward_distance = float((self.recovery.env.part_position(self.recovery.station)-
+                    self.env.data.xpos[self.posture.pelvis]) @ expert.task_rotation[:, 0])
                 self.clear_ticks = 0
                 self.env.model.opt.noslip_iterations = expert.config.hold_noslip_iterations
             elif self.tick >= 800:
                 self.failure = 'FLOOR_CONTACT_NOT_ESTABLISHED'
         if self.stage == 'PICK_CLEAR':
             clearance, held = self.recovery.lift_evidence()
-            self.clear_ticks = self.clear_ticks+1 if clearance >= .03 and held else 0
+            drawn_in = True
+            if self.frog_stance:
+                distance = float((self.recovery.env.part_position(self.recovery.station)-
+                    self.env.data.xpos[self.posture.pelvis]) @ expert.task_rotation[:, 0])
+                drawn_in = distance <= self.pick_forward_distance-.04
+            self.clear_ticks = self.clear_ticks+1 if clearance >= .03 and held and drawn_in else 0
             if self.clear_ticks >= 30:
                 self.stage, self.tick = 'RISE', 0
                 self.lift_start = np.array([self.env.palm_pose(s)[0] for s in ('left', 'right')])
@@ -142,23 +159,40 @@ class FactoryFloorPickup:
                     self.failure = 'FLOOR_STAND_NOT_ACHIEVED'
         if self.stage in ('CLOSE', 'PICK_CLEAR'):
             action = self._contact_action(forces)
-            if self.stage == 'PICK_CLEAR' and supported:
+            if self.stage == 'PICK_CLEAR' and moving_support:
                 action[3:17] += self._pick_clear_action()
                 action[3:17] = np.clip(action[3:17], -.003/self.env.config.arm_action_scale,
                                        .003/self.env.config.arm_action_scale)
         else:
             locked = (self.env.data.qpos[self.posture.qadr[12:]].copy()
                       if self.stage in ('RISE', 'HOLD') else None)
+            spread = 0.
+            if self.frog_stance:
+                # Clear the hips with the proven reach first. Opening the
+                # knees from the start blocks that reach with the thighs.
+                if self.stage == 'LOWER':
+                    spread = .06*_quintic_scale(np.clip((progress-.75)/.25, 0., 1.))
+                elif self.stage in ('RISE', 'HOLD'):
+                    spread = .06*(1-f)
+                self.posture.knee_lateral = self.stance_knee_lateral.copy()
+                self.posture.foot_rotations = [R.copy() for R in self.stance_foot_rotations]
             self.last_q = self.posture.solve(height, palms, rotations, pitch, iterations=self.posture_iterations,
-                                            locked_upper_q=locked)
+                                            locked_upper_q=locked, knee_outward_m=spread)
             action = self.posture.command(self.last_q)
             if self.stage == 'RISE' and self.tick == 0:
                 self.rise_leg_target_jump_rad = float(np.max(np.abs(
-                    self.env.data.ctrl[self.posture.act[:12]] - self.rise_leg_ctrl)))
+                    self.env.data.ctrl[self.posture.act[:12]]-self.rise_leg_ctrl)))
             if self.stage in ('RISE', 'HOLD'):
                 # Preserve the loaded arm targets; only contact feedback may
                 # adjust them. Re-solving their world pose released the grip.
                 action[3:17] = self._contact_action(forces, hold_legs=False)[3:17]
+                if self.frog_stance and moving_support and self.stage == 'RISE':
+                    forward = expert.task_rotation[:, 0]
+                    relative = self.recovery.env.part_position(self.recovery.station) - self.env.data.xpos[self.posture.pelvis]
+                    retreat = np.clip(.02*(relative@forward-.30), 0., .0005)
+                    action[3:17] += self._pick_clear_action(-retreat*forward, False)
+                    action[3:17] = np.clip(action[3:17], -.003/self.env.config.arm_action_scale,
+                                           .003/self.env.config.arm_action_scale)
                 action[:3] = 0.  # preserve the loaded waist target too
         synergy = (.8 - .55*_quintic_scale(np.clip((progress-.6)/.4, 0., 1.))
                    if self.stage == 'LOWER' and self.pad_grasp is None else .8)
@@ -199,6 +233,19 @@ class FactoryFloorPickup:
             # impossible. Try closure plus inward adjustment from the actual
             # pose; only measured contact/lift can establish grasp success.
             self.begin_contact()
+        lateral = expert.task_rotation[:, 1]
+        forward = expert.task_rotation[:, 0]
+        d = self.env.data
+        sample = {
+            'knee_width_m': float((d.xpos[self.posture.knees[0]]-d.xpos[self.posture.knees[1]])@lateral),
+            'object_forward_from_pelvis_m': float((self.recovery.env.part_position(self.recovery.station)-
+                                                  d.xpos[self.posture.pelvis])@forward),
+        }
+        row = self.stance_metrics.setdefault(self.stage, {})
+        for key, value in sample.items():
+            row[key+'_min'] = min(row.get(key+'_min', value), value)
+            row[key+'_max'] = max(row.get(key+'_max', value), value)
+            row[key+'_last'] = value
         return action
 
     def begin_contact(self):
@@ -212,22 +259,28 @@ class FactoryFloorPickup:
         self.close_hand_rotations = [self.env.palm_pose(s)[1] for s in ('left', 'right')]
         self.last_q = d.qpos[self.posture.qadr].copy()
 
-    def _pick_clear_action(self):
+    def _pick_clear_action(self, translation=None, preserve_rotation=True):
         """Lift clear with arms before rising; pad grip retracts from the table."""
         m, d = self.env.model, self.env.data
         action = np.zeros(14)
         # With long exposed pads, advancing toward the table traps the thumb
         # and then the index finger on its vertical side. Clear upward/back
         # toward the worker instead; preserve the legacy hook-grip trajectory.
-        forward = -.00004 if self.pad_grasp is not None else .00004
-        translation = self.recovery.expert.task_rotation[:,0]*forward + np.array([0.,0.,.00008])
+        forward = (-.00025 if self.frog_stance else -.00004) if self.pad_grasp is not None else .00004
+        if translation is None:
+            translation = self.recovery.expert.task_rotation[:,0]*forward + np.array([0.,0.,.00008])
         for i, side in enumerate(('left','right')):
             sid = self.posture.palms[i]
             jp, jr = np.zeros((3,m.nv)), np.zeros((3,m.nv))
             mujoco.mj_jacSite(m,d,jp,jr,sid)
             cols = self.env._arm_dof_adr[7*i:7*i+7]
             jac = np.vstack([jp[:,cols], .2*jr[:,cols]])
-            rotation_error = orientation_error(self.env.palm_pose(side)[1], self.pick_rotations[i])
+            reference = self.pick_rotations[i]
+            if self.frog_stance:
+                object_R = d.geom_xmat[m.geom(self.env.object_geom_name).id].reshape(3, 3)
+                reference = object_R @ self.pick_object_R.T @ reference
+            rotation_error = (orientation_error(self.env.palm_pose(side)[1], reference)
+                              if preserve_rotation else np.zeros(3))
             delta = np.r_[translation, .2*np.clip(.05*rotation_error,-.002,.002)]
             # Use the same joint preference as the squeeze servo: summing an
             # unrestricted lift with a shoulder-averse squeeze defeats the
@@ -283,7 +336,8 @@ class FactoryFloorPickup:
             else:
                 up_axis = 2
                 patch[2] = .5*half[2]
-            if load > 1.5 or (not self.side_entry_ready[side]
+            contact_load = .15 if self.frog_stance else 1.5
+            if load > contact_load or (not self.side_entry_ready[side]
                     and abs(local_point[up_axis]-patch[up_axis]) < .005
                     and sign*local_point[axis] > half[axis]+.012):
                 self.side_entry_ready[side] = True
@@ -296,7 +350,12 @@ class FactoryFloorPickup:
             # Back off an overloaded hand while the other establishes contact.
             if in_band:
                 difference = np.zeros(3)
-            elif self.stage in ('PICK_CLEAR','RISE','HOLD'):
+            elif self.stage in ('PICK_CLEAR','RISE','HOLD') or (
+                    self.frog_stance and self.stage == 'CLOSE' and load > contact_load):
+                # Once rubber touches, stop chasing the tangential patch.
+                # That position servo pushed the 0.1 kg block toward the
+                # table before bilateral pressure was established. This is a
+                # controller switch only; support/success thresholds stay put.
                 difference = normal*(.0002 if load > self.load_high else -.0002)
             else:
                 difference = (normal*.0005 if load > self.load_high
@@ -315,7 +374,11 @@ class FactoryFloorPickup:
             # turn a side grasp into pressure on the upper edge of the block.
             # Keep the measured hand frame while translating toward the face.
             reference = self.close_hand_rotations[i]
-            if self.pad_grasp is not None and self.stage in ('RISE', 'HOLD'):
+            if self.frog_stance and self.stage in ('PICK_CLEAR', 'RISE', 'HOLD'):
+                # Track the two measured frames relative to the same live
+                # object, not two independently frozen world orientations.
+                reference = object_R @ self.pick_object_R.T @ self.pick_rotations[i]
+            elif self.pad_grasp is not None and self.stage in ('RISE', 'HOLD'):
                 # Preserve the loaded arm targets while the torso rises.
                 # Pressure corrections minimize instantaneous wrist rotation;
                 # do not chase a stored world/body pose through the chest.

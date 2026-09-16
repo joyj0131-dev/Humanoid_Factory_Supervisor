@@ -40,6 +40,7 @@ def main():
     parser.add_argument('--floor-grip-load', type=float, nargs=2, default=(3., 6.), metavar=('LOW', 'HIGH'))
     parser.add_argument('--posture-iterations', type=int, default=8)
     parser.add_argument('--pad-grip', action='store_true')
+    parser.add_argument('--frog-stance', action='store_true')
     parser.add_argument('--place', action='store_true', help='continue after lift into experimental place/restart')
     parser.add_argument('--carry', action=argparse.BooleanOptionalAction, default=True,
                         help='walk the held part to the canonical spot before placing')
@@ -55,6 +56,7 @@ def main():
                                                        floor_grip_load_n=tuple(args.floor_grip_load),
                                                        floor_posture_iterations=args.posture_iterations,
                                                        floor_pad_grip=args.pad_grip,
+                                                       floor_frog_stance=args.frog_stance,
                                                        kinematic_ik=args.kinematic_ik,
                                                        place_after_lift=args.place,
                                                        carry_by_walking=args.carry,
@@ -203,6 +205,7 @@ def main():
             'floor_peak_hand_force_n': info.get('floor_peak_hand_force_n'),
             'floor_thumb_peak_force_n': recovery.floor_pickup.thumb_peak_force_n if hasattr(recovery, 'floor_pickup') else None,
             'floor_geometry': recovery.floor_pickup.geometry_report() if hasattr(recovery, 'floor_pickup') else None,
+            'floor_stance_metrics': recovery.floor_pickup.stance_metrics if hasattr(recovery, 'floor_pickup') else None,
             'floor_target_error_m': info.get('floor_target_error_m'),
             'intentional_crouch': info.get('intentional_crouch', False),
             'final_pelvis_position_m': env.data.xpos[recovery.stabilizer.pelvis_body].tolist(),

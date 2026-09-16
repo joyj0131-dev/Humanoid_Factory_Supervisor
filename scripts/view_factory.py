@@ -324,6 +324,7 @@ def _make_recovery(env, args):
         carry_by_walking=getattr(args, 'carry', True),
         floor_four_finger_grip=getattr(args, 'four_finger', True),
         floor_pad_grip=getattr(args, 'pad_grip', False),
+        floor_frog_stance=getattr(args, 'frog_stance', False),
         motion_profile=getattr(args, 'recovery_motion', 'baseline')))
 
 
@@ -393,6 +394,8 @@ def main() -> None:
                         help='Line 2: thumbs open during grasp; --no-four-finger restores previous grip')
     parser.add_argument('--pad-grip', action='store_true',
                         help='experimental Line 2 extended-finger rubber-pad grasp')
+    parser.add_argument('--frog-stance', action='store_true',
+                        help='with --pad-grip: knees/toes out and retract the load while rising')
     parser.add_argument('--place', action='store_true', help='experimental place/restart after --recover lift')
     parser.add_argument('--carry', action=argparse.BooleanOptionalAction, default=True,
                         help='with --place, walk the held part to the canonical spot before lowering')
