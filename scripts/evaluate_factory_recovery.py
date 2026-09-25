@@ -79,6 +79,7 @@ def main():
         step_times = []
         phase_times = {}
         navigation_samples = []
+        floor_samples = []
         state_digest = hashlib.sha256()
         loop_started = time.perf_counter()
         sim_started = env.data.time
@@ -86,6 +87,19 @@ def main():
             phase = (recovery.expert.state.name if recovery.state == 'GRASP' else recovery.state)
             started = time.perf_counter()
             info = recovery.step()
+            if info.get('floor_stage') in ('PICK_CLEAR', 'RISE', 'HOLD') and step % 10 == 0:
+                floor = recovery.floor_pickup
+                grasp = recovery.grasp
+                floor_samples.append({
+                    'step': step, 'stage': info['floor_stage'],
+                    'pelvis': env.data.xpos[floor.posture.pelvis].tolist(),
+                    'part': env.part_position(recovery.station).tolist(),
+                    'palms': [grasp.palm_pose(s)[0].tolist() for s in ('left', 'right')],
+                    'tilt': np.asarray(recovery.stabilizer.tilt()).tolist(),
+                    'arm_error': (grasp._arm_target-env.data.qpos[grasp._arm_qpos_adr]).tolist(),
+                    'pad_forces': ({s: f.tolist() for s, f in floor.pad_grasp.forces().items()}
+                                   if floor.pad_grasp is not None else None),
+                })
             if phase == 'WALK' and (step % 10 == 0 or recovery.state != 'WALK'):
                 nav = recovery.navigator
                 navigation_samples.append({'step': step, 'error_m': nav.error.tolist(),
@@ -206,6 +220,7 @@ def main():
             'floor_thumb_peak_force_n': recovery.floor_pickup.thumb_peak_force_n if hasattr(recovery, 'floor_pickup') else None,
             'floor_geometry': recovery.floor_pickup.geometry_report() if hasattr(recovery, 'floor_pickup') else None,
             'floor_stance_metrics': recovery.floor_pickup.stance_metrics if hasattr(recovery, 'floor_pickup') else None,
+            'floor_motion_samples': floor_samples,
             'floor_target_error_m': info.get('floor_target_error_m'),
             'intentional_crouch': info.get('intentional_crouch', False),
             'final_pelvis_position_m': env.data.xpos[recovery.stabilizer.pelvis_body].tolist(),
