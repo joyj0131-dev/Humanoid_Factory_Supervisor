@@ -89,7 +89,10 @@ class WholeBodyPosture:
         self.command_velocity = np.zeros(len(self.names))
 
     def solve(self, height, palms, rotations=None, pelvis_pitch=0.0, iterations=12,
-              locked_upper_q=None, knee_outward_m=0.0):
+              locked_upper_q=None, knee_outward_m=0.0, knee_lateral_targets=None):
+        """``knee_lateral_targets`` sets absolute knee lateral coordinates
+        (base frame y) without the toe-out that ``knee_outward_m`` couples in:
+        for motions whose planted feet must not be re-oriented."""
         m, live, d = self.ik_model, self.env.data, self.scratch
         d.qpos[:] = live.qpos
         if self.solution is not None:
@@ -125,12 +128,13 @@ class WholeBodyPosture:
                 mujoco.mj_jacSite(m, d, jp, jr, sid)
                 add(jp, pos - d.site_xpos[sid], 20.)
                 add(jr, orientation_error(d.site_xmat[sid].reshape(3, 3), rotation), 3.)
-            if knee_outward_m > 0.:
+            if knee_outward_m > 0. or knee_lateral_targets is not None:
                 lateral = self.base_rotation[:, 1]
                 for i, body in enumerate(self.knees):
                     jp = np.zeros((3, m.nv))
                     mujoco.mj_jacBody(m, d, jp, None, body)
-                    target = self.knee_lateral[i] + (1 if i == 0 else -1)*knee_outward_m
+                    target = (knee_lateral_targets[i] if knee_lateral_targets is not None
+                              else self.knee_lateral[i] + (1 if i == 0 else -1)*knee_outward_m)
                     add((lateral @ jp)[None, :], [target-lateral@d.xpos[body]], 3.)
             for i, (sid, pos) in enumerate(zip(self.palms, palms)):
                 if locked_upper_q is not None:

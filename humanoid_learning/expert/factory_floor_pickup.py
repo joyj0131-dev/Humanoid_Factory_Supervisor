@@ -8,7 +8,42 @@ from humanoid_learning.expert.sharpa_bimanual_grasp_expert import (
 from humanoid_learning.expert.sharpa_contact_lift import SharpaContactLift
 from humanoid_learning.expert.pose_ik import orientation_error
 from humanoid_learning.envs import sharpa_config as sc
+from humanoid_learning.envs import factory_config as fc
 from humanoid_learning.expert.sharpa_pad_grasp import SharpaPadGrasp, upper_side_patch
+
+
+# G1 elbow: straight at q~1.3; q > 1.3 bends it BACKWARD (limit 2.094 is ~45
+# deg of hyperextension). Pulling a near-straight arm in is singular, and the
+# solver was measured to resolve it into hyperextension up to the limit.
+# Arm servos below add a weak preference for ordinary flexion instead.
+ELBOW_FLEX_START = 1.1
+
+
+def _with_elbow_flexion(jac, target, q_elbow, column=3, weight=.3):
+    """Append a DLS row nudging a straightish/hyperextended elbow to flex.
+
+    Below ELBOW_FLEX_START no row is added: a zero-rate row would instead
+    resist the flexion the hand task itself asks for."""
+    if q_elbow <= ELBOW_FLEX_START:
+        return jac, target
+    row = np.zeros(jac.shape[1])
+    row[column] = weight
+    step = -min(.002, .02*(q_elbow-ELBOW_FLEX_START))
+    return np.vstack([jac, row]), np.r_[target, weight*step]
+
+
+# Standing carry pose of each palm relative to its shoulder (see _begin_carry_rise).
+# Measured shoulder-palm distance vs elbow q in this posture: .35 m at q=0
+# (90 deg), .40 m at q=.5, .42 m straight. .38 m keeps the elbow comfortably
+# bent (q~.3); a .29 m carry forced q<-.1, wrist self-contact and a turned block.
+# Forward/down split: with .30/-.24 the held block (hanging ~.19 m along the
+# fingers) sat .47 m ahead of the pelvis and touched the table face at .58 m;
+# .22/-.30 keeps ~.37 m of reach and carries it ~8 cm closer to the body.
+CARRY_PALM_FORWARD_M = .22
+CARRY_PALM_DOWN_M = -.30
+CARRY_REACH_M = float(np.hypot(CARRY_PALM_FORWARD_M, CARRY_PALM_DOWN_M))
+# Minimum clearance kept between the held block's leading edge and the table.
+CARRY_TABLE_MARGIN_M = .06
 
 
 class FactoryFloorPickup:
@@ -126,20 +161,17 @@ class FactoryFloorPickup:
                 self.pick_rotations = [self.env.palm_pose(s)[1] for s in ('left','right')]
                 self.pick_object_R = self.env.data.geom_xmat[
                     self.env.model.geom(self.env.object_geom_name).id].reshape(3, 3).copy()
-                self.pick_forward_distance = float((self.recovery.env.part_position(self.recovery.station)-
-                    self.env.data.xpos[self.posture.pelvis]) @ expert.task_rotation[:, 0])
                 self.clear_ticks = 0
                 self.env.model.opt.noslip_iterations = expert.config.hold_noslip_iterations
             elif self.tick >= 800:
                 self.failure = 'FLOOR_CONTACT_NOT_ESTABLISHED'
         if self.stage == 'PICK_CLEAR':
             clearance, held = self.recovery.lift_evidence()
-            drawn_in = True
-            if self.frog_stance:
-                distance = float((self.recovery.env.part_position(self.recovery.station)-
-                    self.env.data.xpos[self.posture.pelvis]) @ expert.task_rotation[:, 0])
-                drawn_in = distance <= self.pick_forward_distance-.04
-            self.clear_ticks = self.clear_ticks+1 if clearance >= .03 and held and drawn_in else 0
+            # Frog: no separate draw-in before rising. Measured, that 4 cm pull
+            # (hands back while crouched) straightened both elbows to their
+            # extension limit and rotated the block ~26 deg; the carry rise
+            # brings the block in with the shoulders instead.
+            self.clear_ticks = self.clear_ticks+1 if clearance >= .03 and held else 0
             if self.clear_ticks >= 30:
                 self.stage, self.tick = 'RISE', 0
                 self.lift_start = np.array([self.env.palm_pose(s)[0] for s in ('left', 'right')])
@@ -149,6 +181,8 @@ class FactoryFloorPickup:
                 self.rise_contact_gap = 0
                 self.rise_leg_ctrl = self.env.data.ctrl[self.posture.act[:12]].copy()
                 self.posture = WholeBodyPosture(self.env, self.ik_clearance_m)
+                if self.frog_stance:
+                    self._begin_carry_rise()
             elif self.tick >= 1200:
                 self.failure = 'FLOOR_INITIAL_LIFT_NOT_ACHIEVED'
         if self.stage in ('RISE', 'HOLD'):
@@ -172,6 +206,8 @@ class FactoryFloorPickup:
                 action[3:17] += self._pick_clear_action()
                 action[3:17] = np.clip(action[3:17], -.003/self.env.config.arm_action_scale,
                                        .003/self.env.config.arm_action_scale)
+        elif self.frog_stance and self.stage in ('RISE', 'HOLD'):
+            action = self._carry_rise_action(height, pitch, f, normal_loads)
         else:
             locked = (self.env.data.qpos[self.posture.qadr[12:]].copy()
                       if self.stage in ('RISE', 'HOLD') else None)
@@ -181,8 +217,6 @@ class FactoryFloorPickup:
                 # knees from the start blocks that reach with the thighs.
                 if self.stage == 'LOWER':
                     spread = .06*_quintic_scale(np.clip((progress-.75)/.25, 0., 1.))
-                elif self.stage in ('RISE', 'HOLD'):
-                    spread = .06*(1-f)
                 self.posture.knee_lateral = self.stance_knee_lateral.copy()
                 self.posture.foot_rotations = [R.copy() for R in self.stance_foot_rotations]
             planned = self._planned_with
@@ -203,13 +237,6 @@ class FactoryFloorPickup:
                 # Preserve the loaded arm targets; only contact feedback may
                 # adjust them. Re-solving their world pose released the grip.
                 action[3:17] = self._contact_action(forces, hold_legs=False)[3:17]
-                if self.frog_stance and moving_support and self.stage == 'RISE':
-                    forward = expert.task_rotation[:, 0]
-                    relative = self.recovery.env.part_position(self.recovery.station) - self.env.data.xpos[self.posture.pelvis]
-                    retreat = np.clip(.02*(relative@forward-.30), 0., .0005)
-                    action[3:17] += self._pick_clear_action(-retreat*forward, False)
-                    action[3:17] = np.clip(action[3:17], -.003/self.env.config.arm_action_scale,
-                                           .003/self.env.config.arm_action_scale)
                 action[:3] = 0.  # preserve the loaded waist target too
         synergy = (.8 - .55*_quintic_scale(np.clip((progress-.6)/.4, 0., 1.))
                    if self.stage == 'LOWER' and self.pad_grasp is None else .8)
@@ -265,6 +292,174 @@ class FactoryFloorPickup:
             row[key+'_last'] = value
         return action
 
+    def _begin_carry_rise(self):
+        """Anchor the rise on the measured pose: commanded hands, CoM, knees.
+
+        Every RISE target starts at its measured value, so the first plan does
+        not jump away from the live body (the old targets put the planned
+        pelvis 9.3 deg off the live one and kicked both ankles by .17 rad).
+        """
+        m, d, p = self.env.model, self.env.data, self.posture
+        self.carry_palm0 = self._commanded_palms()
+        # Hand orientation is carried in the TORSO frame: holding it fixed in
+        # the world while the torso straightens drove both wrists into their
+        # own link geometry (roll/yaw self-contact) before the grip was lost.
+        self.carry_torso = m.body('torso_link').id
+        torso_R = d.xmat[self.carry_torso].reshape(3, 3)
+        self.carry_R_torso = [torso_R.T @ self._carry_fk.site_xmat[sid].reshape(3, 3) for sid in p.palms]
+        self.carry_shoulders = [m.body(f'{side}_shoulder_pitch_link').id for side in ('left', 'right')]
+        R = p.base_rotation
+        # Hand targets live in the frame of the LIVE shoulders: measured here,
+        # both elbows are at their extension limit (shoulder-palm .36 m = full
+        # reach), so a world- or pelvis-fixed hand path leaves reach as soon as
+        # the torso straightens. Standing, hold the palms CARRY_PALM_* from the
+        # shoulders (elbows bent): the block rides in front of the body and is
+        # drawn in as the shoulders move back.
+        self.carry_v0 = [R.T @ (self.carry_palm0[i] - d.xpos[b]) for i, b in enumerate(self.carry_shoulders)]
+        self.carry_v_stand = [np.array([CARRY_PALM_FORWARD_M, v[1], CARRY_PALM_DOWN_M]) for v in self.carry_v0]
+        mid = .5*(self.carry_v0[0][1] + self.carry_v0[1][1])
+        for v in self.carry_v_stand:
+            v[1] -= mid  # centre the pair on the body without changing its width
+        self.carry_squeeze = 0.
+        self.carry_forward_trim = 0.
+        # The line's own table: the held block must stay clear of its face.
+        station = self.recovery.station
+        self.carry_obstacle = m.geom(fc.work_surface_geom_name(self.recovery.env.poses[station])).id
+        self.rise_com0 = d.subtree_com[p.pelvis, :2].copy()
+        self.rise_com_stand = p.com_xy.copy()
+        self.rise_knee0 = np.array(p.knee_lateral)
+        # Standing knee WIDTH as before the crouch, re-centred on the feet as
+        # they are now: they slide ~1-2 cm while crouched, and the stale centre
+        # was measured to leave the standing pelvis rolled ~5 deg.
+        lateral = p.base_rotation[:, 1]
+        feet_centre = float(np.mean([pos @ lateral for pos in p.foot_positions]))
+        stance = np.array(self.stance_knee_lateral)
+        self.rise_knee_stand = stance + (feet_centre - stance.mean())
+
+    def _block_table_gap(self):
+        """Clearance (m) from the block's leading edge to the table face,
+        along the robot's forward axis."""
+        m, d = self.env.model, self.env.data
+        forward = self.posture.base_rotation[:, 0]
+        obj = m.geom(self.env.object_geom_name).id
+        lead = d.geom_xpos[obj] @ forward + np.abs(d.geom_xmat[obj].reshape(3, 3).T @ forward) @ m.geom_size[obj]
+        t = self.carry_obstacle
+        face = d.geom_xpos[t] @ forward - np.abs(d.geom_xmat[t].reshape(3, 3).T @ forward) @ m.geom_size[t]
+        return float(face - lead)
+
+    def _commanded_palms(self):
+        """Palm positions the current arm/waist TARGETS produce on the live body."""
+        m, d, e = self.env.model, self.env.data, self.env
+        if not hasattr(self, '_carry_fk'):
+            self._carry_fk = mujoco.MjData(m)
+        s = self._carry_fk
+        s.qpos[:] = d.qpos
+        s.qpos[e._arm_qpos_adr] = e._arm_target
+        s.qpos[e._waist_qpos_adr] = e._waist_target
+        mujoco.mj_kinematics(m, s)
+        mujoco.mj_comPos(m, s)
+        return np.array([s.site_xpos[sid].copy() for sid in self.posture.palms])
+
+    def _carry_rise_action(self, height, pitch, f, normal_loads):
+        """Legs/torso from the whole-body plan; hands carried with the shoulders.
+
+        The plan owns balance and height with the upper body at its present
+        configuration. Arms are servoed in the LIVE frame: a floating-base plan
+        is ~1 cm off the real base, more than a pad squeeze.
+        """
+        p, d = self.posture, self.env.data
+        # Squeeze is common to both hands: opposing pad forces on a free block
+        # are equal, so a per-hand loop only shoves the block sideways.
+        load = min(normal_loads.values())
+        if load < self.load_low:
+            self.carry_squeeze = min(self.carry_squeeze + .0001, .01)
+        elif load > self.load_high:
+            self.carry_squeeze = max(self.carry_squeeze - .0001, -.01)
+        R = p.base_rotation
+        expert = self.recovery.expert
+        # Where the robot ended up standing sets how close the carried block
+        # comes to the table: from a start offset by 5-10 cm it touched the
+        # face and the grip rolled onto the pinkies. Draw the carry pose in
+        # while the block's leading edge is within CARRY_TABLE_MARGIN_M.
+        if self._block_table_gap() < CARRY_TABLE_MARGIN_M:
+            self.carry_forward_trim = max(self.carry_forward_trim - .0002, -CARRY_PALM_FORWARD_M + .08)
+        forward = CARRY_PALM_FORWARD_M + self.carry_forward_trim
+        down = -np.sqrt(CARRY_REACH_M**2 - forward**2)
+        stand = [np.array([forward, v[1], down]) for v in self.carry_v_stand]
+        palms = [d.xpos[b] + R @ ((1-f)*self.carry_v0[i] + f*stand[i])
+                 + self.carry_squeeze*expert._inward_direction(side)
+                 for i, (b, side) in enumerate(zip(self.carry_shoulders, ('left', 'right')))]
+        self.carry_target_block = .5*(palms[0] + palms[1])
+        p.com_xy = (1-f)*self.rise_com0 + f*self.rise_com_stand
+        knees = (1-f)*self.rise_knee0 + f*self.rise_knee_stand
+        locked = d.qpos[p.qadr[12:]].copy()
+        self.last_q = p.solve(height, np.array(palms), None, pitch, iterations=self.posture_iterations,
+                              locked_upper_q=locked, knee_lateral_targets=knees)
+        self.posture_solves += 1
+        action = p.command(self.last_q)
+        if self.stage == 'RISE' and self.tick == 0:
+            self.rise_leg_target_jump_rad = float(np.max(np.abs(
+                d.ctrl[p.act[:12]]-self.rise_leg_ctrl)))
+        action[:3] = 0.  # the loaded waist target is kept
+        action[3:17] = self._carry_arm_action(palms)
+        return action
+
+    def _carry_arm_action(self, palms):
+        """Resolved-rate step moving the COMMANDED hands toward the targets."""
+        m, e = self.env.model, self.env
+        commanded = self._commanded_palms()
+        s = self._carry_fk
+        action = np.zeros(14)
+        weights = np.array([1., .2, .3, 1., .5, 1., .5])  # shoulder-averse, as the squeeze servo
+        for i, sid in enumerate(self.posture.palms):
+            error = palms[i] - commanded[i]
+            distance = float(np.linalg.norm(error))
+            step = error if distance <= .001 else error*(.001/distance)
+            reference = self.env.data.xmat[self.carry_torso].reshape(3, 3) @ self.carry_R_torso[i]
+            rotation_error = orientation_error(s.site_xmat[sid].reshape(3, 3), reference)
+            jp, jr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
+            mujoco.mj_jacSite(m, s, jp, jr, sid)
+            cols = e._arm_dof_adr[7*i:7*i+7]
+            jac, target = _with_elbow_flexion(np.vstack([jp[:, cols], .1*jr[:, cols]]),
+                                              np.r_[step, .1*np.clip(.1*rotation_error, -.003, .003)],
+                                              e._arm_target[7*i+3])
+            jac, target = self._with_torso_clearance(jac, target, i, cols)
+            weighted = jac*weights
+            dq = weights*(weighted.T @ np.linalg.solve(weighted@weighted.T+1e-4*np.eye(len(target)), target))
+            action[7*i:7*i+7] = np.clip(dq, -.003, .003)/e.config.arm_action_scale
+        return action
+
+    def _with_torso_clearance(self, jac, target, side_index, cols, rate=.0005):
+        """Rows pushing this arm's links off the torso/pelvis along live contacts.
+
+        The whole-body posture IK keeps self-clearance, but the carry arm servo
+        is separate; without this the right shoulder was measured pressing the
+        torso at up to 232 N while the hands followed their path."""
+        m, d = self.env.model, self.env.data
+        if not hasattr(self, '_arm_link_bodies'):
+            self._arm_link_bodies = [
+                {m.body(n).id for n in (f'{side}_shoulder_pitch_link', f'{side}_shoulder_roll_link',
+                                         f'{side}_shoulder_yaw_link', f'{side}_elbow_link')}
+                for side in ('left', 'right')]
+            self._trunk_bodies = {m.body('torso_link').id, m.body('pelvis').id}
+        mine = self._arm_link_bodies[side_index]
+        rows, values = [], []
+        for c in d.contact[:d.ncon]:
+            b1, b2 = int(m.geom_bodyid[c.geom1]), int(m.geom_bodyid[c.geom2])
+            if b1 in mine and b2 in self._trunk_bodies:
+                arm, away = b1, -c.frame[:3]
+            elif b2 in mine and b1 in self._trunk_bodies:
+                arm, away = b2, c.frame[:3].copy()
+            else:
+                continue
+            jp = np.zeros((3, m.nv))
+            mujoco.mj_jac(m, d, jp, None, c.pos, arm)
+            rows.append(away @ jp[:, cols])
+            values.append(rate)
+        if not rows:
+            return jac, target
+        return np.vstack([jac, *rows]), np.r_[target, values]
+
     def begin_contact(self):
         self.stage, self.tick = 'CLOSE', 0
         d = self.env.data
@@ -283,11 +478,19 @@ class FactoryFloorPickup:
         # With long exposed pads, advancing toward the table traps the thumb
         # and then the index finger on its vertical side. Clear upward/back
         # toward the worker instead; preserve the legacy hook-grip trajectory.
-        forward = (-.00025 if self.frog_stance else -.00004) if self.pad_grasp is not None else .00004
+        forward = -.00004 if self.pad_grasp is not None else .00004
         if translation is None:
             translation = self.recovery.expert.task_rotation[:,0]*forward + np.array([0.,0.,.00008])
         for i, side in enumerate(('left','right')):
             sid = self.posture.palms[i]
+            step = translation
+            if self.frog_stance and self.stage == 'PICK_CLEAR':
+                # Lift along the palm->shoulder line. A straight-up world lift
+                # was measured to extend both elbows to their limit (a reach
+                # singularity) before the rise; this path bends them instead,
+                # lifting the block and bringing it slightly toward the body.
+                toward = d.xpos[m.body(f'{side}_shoulder_pitch_link').id] - d.site_xpos[sid]
+                step = .0001*toward/np.linalg.norm(toward)
             jp, jr = np.zeros((3,m.nv)), np.zeros((3,m.nv))
             mujoco.mj_jacSite(m,d,jp,jr,sid)
             cols = self.env._arm_dof_adr[7*i:7*i+7]
@@ -298,15 +501,17 @@ class FactoryFloorPickup:
                 reference = object_R @ self.pick_object_R.T @ reference
             rotation_error = (orientation_error(self.env.palm_pose(side)[1], reference)
                               if preserve_rotation else np.zeros(3))
-            delta = np.r_[translation, .2*np.clip(.05*rotation_error,-.002,.002)]
+            delta = np.r_[step, .2*np.clip(.05*rotation_error,-.002,.002)]
             # Use the same joint preference as the squeeze servo: summing an
             # unrestricted lift with a shoulder-averse squeeze defeats the
             # latter and can drive shoulder roll back into the torso.
             weights = (np.ones(7) if self.pad_grasp is None else
                        np.array([1., .2, .3, 1., .5, 1., .5]))
+            if self.frog_stance and self.stage == 'PICK_CLEAR':
+                jac, delta = _with_elbow_flexion(jac, delta, self.env._arm_target[7*i+3])
             weighted = jac*weights
             dq = weights*(weighted.T @ np.linalg.solve(
-                weighted@weighted.T+1e-4*np.eye(6), delta))
+                weighted@weighted.T+1e-4*np.eye(len(delta)), delta))
             action[7*i:7*i+7] = dq/self.env.config.arm_action_scale
         return action
 

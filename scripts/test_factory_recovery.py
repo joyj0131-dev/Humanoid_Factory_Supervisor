@@ -92,6 +92,41 @@ def test_posture_solve_interval_replans_on_stage_change_and_commands_every_tick(
         env.close()
 
 
+def test_elbow_flexion_row_only_nudges_a_straightish_elbow():
+    from humanoid_learning.expert.factory_floor_pickup import _with_elbow_flexion, ELBOW_FLEX_START
+    jac, target = np.ones((6, 7)), np.zeros(6)
+    same_jac, same_target = _with_elbow_flexion(jac, target, ELBOW_FLEX_START - .1)
+    assert same_jac is jac and same_target is target  # no row: flexion is not resisted
+    more_jac, more_target = _with_elbow_flexion(jac, target, 2.)
+    assert more_jac.shape == (7, 7) and np.flatnonzero(more_jac[-1]).tolist() == [3]
+    assert more_target[-1] < 0.  # toward ordinary flexion, away from hyperextension
+
+
+def test_knee_lateral_targets_are_planner_only_and_keep_feet_orientation():
+    from humanoid_learning.expert.whole_body_posture import WholeBodyPosture
+    env = FactoryEnv()
+    try:
+        env.reset(seed=0)
+        recovery = FactoryRecovery(env, RecoveryConfig())
+        posture = WholeBodyPosture(recovery.grasp)
+        live = env.data.qpos.copy()
+        height = float(env.data.xpos[posture.pelvis, 2])
+        palms = np.array([recovery.grasp.palm_pose(s)[0] for s in ('left', 'right')])
+        lateral = posture.base_rotation[:, 1]
+        wide = [posture.knee_lateral[0] + .03, posture.knee_lateral[1] - .03]
+        posture.solve(height, palms, iterations=6, knee_lateral_targets=wide)
+        knees = [float(posture.scratch.xpos[b] @ lateral) for b in posture.knees]
+        assert knees[0] > posture.knee_lateral[0] and knees[1] < posture.knee_lateral[1], knees
+        for sid, rotation in zip(posture.feet, posture.foot_rotations):
+            # No toe-out coupled in: planted feet keep their measured heading.
+            error = posture.scratch.site_xmat[sid].reshape(3, 3).T @ rotation
+            assert np.degrees(np.arccos(np.clip((np.trace(error) - 1) / 2, -1, 1))) < 2.
+        assert np.array_equal(env.data.qpos, live)  # scratch planning only
+        recovery.close()
+    finally:
+        env.close()
+
+
 def test_arrival_hands_off_only_at_low_speed_and_double_support():
     class Walker:
         def __init__(self):
