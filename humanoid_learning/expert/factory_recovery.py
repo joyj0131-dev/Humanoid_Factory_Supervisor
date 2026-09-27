@@ -481,7 +481,8 @@ class FactoryRecovery:
         e.belt.drive(e)
         for arm in e.arms:
             arm.apply(e.data)
-        self.grasp.step(action)
+        # The recovery reads info/live data only; skip the unused observation.
+        self.grasp.step(action, compute_obs=False)
         e._step_count += 1
         for arm in e.arms:
             arm.advance()

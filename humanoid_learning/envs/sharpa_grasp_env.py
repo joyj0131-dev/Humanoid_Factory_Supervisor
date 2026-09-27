@@ -204,6 +204,24 @@ class SharpaGraspEnv(gym.Env):
             b for b in range(model.nbody)
             if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b) or "").startswith("right_right_")
         }
+        # Name-based body classes, resolved once. The contact helpers below run
+        # several times per physics substep; per-contact mj_id2name string
+        # matching there dominated the controller tick. Same prefixes, same
+        # classification -- only where the lookup happens moved.
+        names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b) or "" for b in range(model.nbody)]
+        self._body_is_left_hand = np.array([n.startswith("left_left_") for n in names])
+        self._body_is_right_hand = np.array([n.startswith("right_right_") for n in names])
+        self._body_is_proximal_hand = ((self._body_is_left_hand | self._body_is_right_hand)
+                                       & np.array([not n.endswith("_DP") for n in names]))
+        # (side, group) index in sc.SIDES x sc.GROUPS order, or -1.
+        self._body_hand_group = np.full(model.nbody, -1, dtype=np.int64)
+        for side_idx, side in enumerate(sc.SIDES):
+            for g, group in enumerate(sc.GROUPS):
+                prefixes = tuple(sc.sharpa_body(side, f, "") for f in sc.GROUP_FINGERS[group])
+                for b, n in enumerate(names):
+                    if n.startswith(prefixes):
+                        assert self._body_hand_group[b] < 0, f"body {n} matches two finger groups"
+                        self._body_hand_group[b] = side_idx * N_GROUPS_PER_HAND + g
 
     # ------------------------------------------------------------------
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
@@ -319,29 +337,52 @@ class SharpaGraspEnv(gym.Env):
             peak = max(peak, float(np.linalg.norm(force6[:3])))
         return peak
 
+    def _object_contacts(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Indices of active contacts touching the object, in contact order,
+        with the other body and whether the object is geom1."""
+        contact = self.data.contact
+        b1 = self.model.geom_bodyid[contact.geom1]
+        b2 = self.model.geom_bodyid[contact.geom2]
+        obj_is_1 = b1 == self._object_body_id
+        index = np.flatnonzero(obj_is_1 | (b2 == self._object_body_id))
+        return index, np.where(obj_is_1, b2, b1)[index], obj_is_1[index]
+
+    def _group_contact_forces(self) -> tuple[np.ndarray, np.ndarray]:
+        """All (side, group) results of :meth:`_group_contact_force` from one
+        pass over the CURRENT contacts, in sc.SIDES x sc.GROUPS order.
+
+        Each group still sums its own contacts in contact order, so the
+        values are bitwise the per-group method's."""
+        model, data = self.model, self.data
+        peak = np.zeros(N_HAND_GROUPS)
+        force_sum = np.zeros((N_HAND_GROUPS, 3))
+        index, other, obj_is_1 = self._object_contacts()
+        groups = self._body_hand_group[other]
+        force6 = np.zeros(6)
+        for i, k, flip in zip(index[groups >= 0], groups[groups >= 0], obj_is_1[groups >= 0]):
+            mujoco.mj_contactForce(model, data, int(i), force6)
+            peak[k] = max(peak[k], float(np.linalg.norm(force6[:3])))
+            contact_R = np.asarray(data.contact.frame[i], dtype=np.float64).reshape(3, 3)
+            force_on_geom2 = contact_R.T @ force6[:3]
+            force_sum[k] += -force_on_geom2 if flip else force_on_geom2
+        return peak, np.array([float(np.linalg.norm(f)) for f in force_sum])
+
     def _group_contact_force(self, side: str, group: str) -> tuple[float, float]:
         """Returns (peak_single_contact_N, net_group_force_N) between
         this finger group's real bodies and the object."""
+        k = sc.SIDES.index(side) * N_GROUPS_PER_HAND + sc.GROUPS.index(group)
         model, data = self.model, self.data
-        obj_body = self._object_body_id
-        prefixes = tuple(sc.sharpa_body(side, f, "") for f in sc.GROUP_FINGERS[group])
         force_sum = np.zeros(3, dtype=np.float64)
         peak = 0.0
-        for i in range(data.ncon):
-            c = data.contact[i]
-            b1, b2 = model.geom_bodyid[c.geom1], model.geom_bodyid[c.geom2]
-            if obj_body not in (b1, b2):
-                continue
-            other = b2 if b1 == obj_body else b1
-            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, other) or ""
-            if not any(name.startswith(p) for p in prefixes):
-                continue
-            force6 = np.zeros(6)
-            mujoco.mj_contactForce(model, data, i, force6)
+        index, other, obj_is_1 = self._object_contacts()
+        mine = self._body_hand_group[other] == k
+        force6 = np.zeros(6)
+        for i, flip in zip(index[mine], obj_is_1[mine]):
+            mujoco.mj_contactForce(model, data, int(i), force6)
             peak = max(peak, float(np.linalg.norm(force6[:3])))
-            contact_R = np.asarray(c.frame, dtype=np.float64).reshape(3, 3)
+            contact_R = np.asarray(data.contact.frame[i], dtype=np.float64).reshape(3, 3)
             force_on_geom2 = contact_R.T @ force6[:3]
-            force_sum += -force_on_geom2 if b1 == obj_body else force_on_geom2
+            force_sum += -force_on_geom2 if flip else force_on_geom2
         return peak, float(np.linalg.norm(force_sum))
 
     def _torso_arm_collision_force(self) -> float:
@@ -371,16 +412,14 @@ class SharpaGraspEnv(gym.Env):
 
     def _hand_hand_contact_force(self) -> float:
         model, data = self.model, self.data
+        b1 = model.geom_bodyid[data.contact.geom1]
+        b2 = model.geom_bodyid[data.contact.geom2]
+        left, right = self._body_is_left_hand, self._body_is_right_hand
+        index = np.flatnonzero((left[b1] & right[b2]) | (left[b2] & right[b1]))
         peak = 0.0
-        for i in range(data.ncon):
-            c = data.contact[i]
-            b1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom1]) or ""
-            b2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[c.geom2]) or ""
-            if not ((b1.startswith("left_left_") and b2.startswith("right_right_")) or
-                    (b2.startswith("left_left_") and b1.startswith("right_right_"))):
-                continue
-            force6 = np.zeros(6)
-            mujoco.mj_contactForce(model, data, i, force6)
+        force6 = np.zeros(6)
+        for i in index:
+            mujoco.mj_contactForce(model, data, int(i), force6)
             peak = max(peak, float(np.linalg.norm(force6[:3])))
         return peak
 
@@ -462,26 +501,16 @@ class SharpaGraspEnv(gym.Env):
         hand body that is not a *_DP fingertip body) and the object --
         Stage 4 explicitly requires checking proximal/palm collision, not
         just fingertip contact."""
-        model, data = self.model, self.data
-        obj_body = self._object_body_id
-        max_pen = 0.0
-        for i in range(data.ncon):
-            c = data.contact[i]
-            if c.dist >= 0:
-                continue
-            b1, b2 = model.geom_bodyid[c.geom1], model.geom_bodyid[c.geom2]
-            if obj_body not in (b1, b2):
-                continue
-            other = b2 if b1 == obj_body else b1
-            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, other) or ""
-            is_hand = name.startswith("left_left_") or name.startswith("right_right_")
-            is_fingertip = name.endswith("_DP")
-            if is_hand and not is_fingertip:
-                max_pen = max(max_pen, -float(c.dist))
-        return max_pen
+        index, other, _ = self._object_contacts()
+        dist = self.data.contact.dist[index]
+        hit = (dist < 0) & self._body_is_proximal_hand[other]
+        return max(0.0, float(-dist[hit].min())) if hit.any() else 0.0
 
     # ------------------------------------------------------------------
-    def step(self, action: np.ndarray):
+    def step(self, action: np.ndarray, *, compute_obs: bool = True):
+        """Gym step. ``compute_obs=False`` is for controllers that share this
+        physics but never read the observation (factory recovery): the obs
+        slot is then None. Physics, safety feedback and info are unchanged."""
         action = np.asarray(action, dtype=np.float64)
         action = np.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
         action = np.clip(action, self.action_space.low, self.action_space.high)
@@ -549,10 +578,13 @@ class SharpaGraspEnv(gym.Env):
         self.last_safety_events = []
         for _substep_idx in range(self.config.frame_skip):
             mujoco.mj_step(self.model, self.data)
+            # Fresh census of THIS substep's contacts. ctrl writes below do
+            # not change contact forces until the next mj_step.
+            peaks, nets = self._group_contact_forces()
             for side_idx, side in enumerate(sc.SIDES):
                 for g, group in enumerate(sc.GROUPS):
-                    peak, net = self._group_contact_force(side, group)
-                    force = net if self.config.use_net_group_force else peak
+                    k = side_idx * N_GROUPS_PER_HAND + g
+                    force = nets[k] if self.config.use_net_group_force else peaks[k]
                     ids = self._group_act_ids[side][g]
                     qadr = self._group_qpos_adr[side][g]
                     unload_target = np.clip(
@@ -589,25 +621,18 @@ class SharpaGraspEnv(gym.Env):
         info["contact_streak"] = self._contact_streak
 
         truncated = self._step_count >= self.config.max_episode_steps
-        return self._get_obs(), 0.0, False, truncated, info
+        return (self._get_obs() if compute_obs else None), 0.0, False, truncated, info
 
     # ------------------------------------------------------------------
     def _hand_object_contact(self) -> tuple[bool, float]:
+        index, other, _ = self._object_contacts()
+        hand = (self._body_is_left_hand | self._body_is_right_hand)[other]
         max_force = 0.0
-        touched = False
-        for i in range(self.data.ncon):
-            c = self.data.contact[i]
-            bodies = {self.model.geom_bodyid[c.geom1], self.model.geom_bodyid[c.geom2]}
-            if self._object_body_id not in bodies:
-                continue
-            other = bodies - {self._object_body_id}
-            other_id = other.pop() if other else self._object_body_id
-            if other_id in self._left_hand_body_ids or other_id in self._right_hand_body_ids:
-                touched = True
-                force6 = np.zeros(6)
-                mujoco.mj_contactForce(self.model, self.data, i, force6)
-                max_force = max(max_force, float(np.linalg.norm(force6[:3])))
-        return touched, max_force
+        force6 = np.zeros(6)
+        for i in index[hand]:
+            mujoco.mj_contactForce(self.model, self.data, int(i), force6)
+            max_force = max(max_force, float(np.linalg.norm(force6[:3])))
+        return bool(hand.any()), max_force
 
     def _get_obs(self) -> np.ndarray:
         arm_qpos = self.data.qpos[self._arm_qpos_adr]
@@ -625,8 +650,7 @@ class SharpaGraspEnv(gym.Env):
         obj_linvel = self.data.qvel[self._object_dof_adr : self._object_dof_adr + 3]
         obj_angvel = self.data.qvel[self._object_dof_adr + 3 : self._object_dof_adr + 6]
         parts += [obj_pos, obj_quat, obj_linvel, obj_angvel]
-        group_forces = [self._group_contact_force(side, group)[1] for side in sc.SIDES for group in sc.GROUPS]
-        parts.append(np.array(group_forces))
+        parts.append(self._group_contact_forces()[1])
         return np.concatenate(parts).astype(np.float32)
 
     def _get_info(self) -> dict[str, Any]:

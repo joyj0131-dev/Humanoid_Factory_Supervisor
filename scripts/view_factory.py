@@ -231,6 +231,9 @@ def run_interactive(env, args) -> None:
         print("The G1 stands still; pass --walk-to 0 or --walk-to 1 to make it walk there.")
     print("Close the viewer to exit.")
     target_dt = env.model.opt.timestep * env.config.frame_skip
+    # Physics/control stay at 1/target_dt. Only the window refresh is thinned:
+    # viewer.sync() waits on the render thread and cost ~6.5 ms per tick.
+    display_every = max(1, round(1.0 / (args.display_hz * target_dt)))
     keys = SimpleQueue()
     with mujoco.viewer.launch_passive(env.model, env.data, key_callback=keys.put) as viewer:
         viewer.cam.lookat[:] = _camera_lookat(env.factory)
@@ -244,11 +247,13 @@ def run_interactive(env, args) -> None:
         recovery = _make_recovery(env, args)
         walk_announced: dict = {}
         rtf_samples = deque(maxlen=100)
+        ticks_since_display = display_every  # draw the first frame immediately
         while viewer.is_running():
             started = time.time()
             wall_started = time.perf_counter()
             sim_started = env.data.time
             signal = None
+            display_now = not keys.empty()  # show a key's effect without delay
             while not keys.empty():
                 key = keys.get()
                 if key == 32 and not finished:
@@ -297,12 +302,15 @@ def run_interactive(env, args) -> None:
             for event in info["mission_events"][event_count:]:
                 print(f"  step {event['step']:5d} station {event['station']}: {event['event']}")
             event_count = len(info["mission_events"])
-            with viewer.lock():
-                _update_beacons(env)
-            if rtf_samples:
-                info['viewer_rtf'] = sum(s for s, _ in rtf_samples) / sum(w for _, w in rtf_samples)
-            viewer.set_texts((None, None, *_panel(env, info, paused, walk=bundle)))
-            viewer.sync()
+            ticks_since_display += 1
+            if display_now or paused or finished or ticks_since_display >= display_every:
+                ticks_since_display = 0
+                with viewer.lock():
+                    _update_beacons(env)
+                if rtf_samples:
+                    info['viewer_rtf'] = sum(s for s, _ in rtf_samples) / sum(w for _, w in rtf_samples)
+                viewer.set_texts((None, None, *_panel(env, info, paused, walk=bundle)))
+                viewer.sync()
             remaining = target_dt - (time.time() - started)
             if remaining > 0:
                 time.sleep(remaining)
@@ -403,6 +411,8 @@ def main() -> None:
                         help='skip unused dynamics in IK scratch data only; live physics is unchanged')
     parser.add_argument('--recovery-motion', choices=('baseline', 'compact', 'direct', 'smooth'), default='smooth',
                         help='smooth uses continuous approach targets; direct preserves the previous waypoint approach')
+    parser.add_argument('--display-hz', type=float, default=50.0,
+                        help='interactive window refresh rate; physics/control always run every tick')
     parser.add_argument("--offscreen", action="store_true", help="render PNGs instead of opening a window")
     parser.add_argument("--out", default="results/factory/factory.png")
     parser.add_argument("--steps", type=int, default=400)
@@ -411,6 +421,8 @@ def main() -> None:
     parser.add_argument("--capture", type=int, nargs="+", default=[150, 400],
                         help="steps at which to save a frame in --offscreen mode")
     args = parser.parse_args()
+    if not args.display_hz > 0:
+        parser.error('--display-hz must be positive')
     if args.recover and (args.walk_to is not None or args.no_fault):
         parser.error('--recover cannot be combined with --walk-to or --no-fault')
     if args.place and not args.recover:
