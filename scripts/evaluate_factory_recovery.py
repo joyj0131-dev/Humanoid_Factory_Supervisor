@@ -39,6 +39,7 @@ def main():
                         help='floor grasp without thumb opposition/curl; --no-four-finger restores previous grip')
     parser.add_argument('--floor-grip-load', type=float, nargs=2, default=(3., 6.), metavar=('LOW', 'HIGH'))
     parser.add_argument('--posture-iterations', type=int, default=8)
+    parser.add_argument('--posture-solve-interval', type=int, default=1)
     parser.add_argument('--pad-grip', action='store_true')
     parser.add_argument('--frog-stance', action='store_true')
     parser.add_argument('--place', action='store_true', help='continue after lift into experimental place/restart')
@@ -55,6 +56,7 @@ def main():
                                                        floor_four_finger_grip=args.four_finger,
                                                        floor_grip_load_n=tuple(args.floor_grip_load),
                                                        floor_posture_iterations=args.posture_iterations,
+                                                       floor_posture_solve_interval=args.posture_solve_interval,
                                                        floor_pad_grip=args.pad_grip,
                                                        floor_frog_stance=args.frog_stance,
                                                        kinematic_ik=args.kinematic_ik,

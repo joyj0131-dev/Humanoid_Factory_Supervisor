@@ -18,6 +18,15 @@ class FactoryFloorPickup:
         self.posture_iterations = getattr(getattr(recovery, 'config', None), 'floor_posture_iterations', 8)
         if not isinstance(self.posture_iterations, int) or self.posture_iterations < 1:
             raise ValueError('floor posture iterations must be a positive integer')
+        # Re-plan the whole-body posture every N control ticks. Commanding,
+        # contact feedback and balance feedback still run every tick; a stage
+        # change or a new posture planner always re-plans immediately.
+        self.posture_solve_interval = getattr(getattr(recovery, 'config', None), 'floor_posture_solve_interval', 1)
+        if not isinstance(self.posture_solve_interval, int) or self.posture_solve_interval < 1:
+            raise ValueError('floor posture solve interval must be a positive integer')
+        self._planned_with = None  # (posture planner, stage) of the last solve
+        self._plan_age = 0
+        self.posture_solves = 0
         self.pad_grasp = (SharpaPadGrasp(self.env) if getattr(getattr(recovery, 'config', None), 'floor_pad_grip', False)
                           else None)
         if self.pad_grasp is not None:
@@ -176,8 +185,16 @@ class FactoryFloorPickup:
                     spread = .06*(1-f)
                 self.posture.knee_lateral = self.stance_knee_lateral.copy()
                 self.posture.foot_rotations = [R.copy() for R in self.stance_foot_rotations]
-            self.last_q = self.posture.solve(height, palms, rotations, pitch, iterations=self.posture_iterations,
-                                            locked_upper_q=locked, knee_outward_m=spread)
+            planned = self._planned_with
+            if (planned is None or planned[0] is not self.posture or planned[1] != self.stage
+                    or self._plan_age >= self.posture_solve_interval):
+                # command() reads static_torque and the planned pelvis frame
+                # from this same solve, so a reused plan stays self-consistent.
+                self.last_q = self.posture.solve(height, palms, rotations, pitch, iterations=self.posture_iterations,
+                                                locked_upper_q=locked, knee_outward_m=spread)
+                self._planned_with, self._plan_age = (self.posture, self.stage), 0
+                self.posture_solves += 1
+            self._plan_age += 1
             action = self.posture.command(self.last_q)
             if self.stage == 'RISE' and self.tick == 0:
                 self.rise_leg_target_jump_rad = float(np.max(np.abs(

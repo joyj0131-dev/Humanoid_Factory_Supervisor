@@ -52,6 +52,46 @@ def test_four_finger_commands_open_thumb_without_physics_changes():
         env.close()
 
 
+def test_posture_solve_interval_replans_on_stage_change_and_commands_every_tick():
+    import humanoid_learning.expert.factory_floor_pickup as ffp
+    counts = {'solve': 0, 'command': 0}
+
+    class Counting(ffp.WholeBodyPosture):
+        def solve(self, *args, **kwargs):
+            counts['solve'] += 1
+            return super().solve(*args, **kwargs)
+
+        def command(self, q):
+            counts['command'] += 1
+            return super().command(q)
+
+    env = FactoryEnv()
+    try:
+        env.reset(seed=0)
+        recovery = FactoryRecovery(env, RecoveryConfig(floor_posture_solve_interval=2))
+        recovery.station = 0
+        recovery.expert = SharpaBimanualGraspExpert(recovery.grasp)
+        with patch.object(ffp, 'WholeBodyPosture', Counting):
+            floor = FactoryFloorPickup(recovery)
+            for _ in range(6):
+                floor.step()
+            assert counts == {'solve': 3, 'command': 6}, counts  # ticks 1, 3, 5
+            floor.stage, floor.tick = 'LOWER', 0  # a stage change re-plans at once
+            floor.step()
+            assert counts == {'solve': 4, 'command': 7}, counts
+        for bad in (0, 1.5):
+            try:
+                FactoryFloorPickup(SimpleNamespace(**{**vars(recovery), 'config': RecoveryConfig(
+                    floor_posture_solve_interval=bad)}))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'interval {bad} accepted')
+        recovery.close()
+    finally:
+        env.close()
+
+
 def test_arrival_hands_off_only_at_low_speed_and_double_support():
     class Walker:
         def __init__(self):

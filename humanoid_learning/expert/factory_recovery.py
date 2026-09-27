@@ -64,6 +64,7 @@ class RecoveryConfig:
     floor_pad_grip: bool = False
     floor_frog_stance: bool = False
     floor_posture_iterations: int = 8
+    floor_posture_solve_interval: int = 1
     floor_grip_load_n: tuple[float, float] = (3., 6.)
     floor_stand_off_m: float = 0.27
     floor_support_grace_seconds: float = 0.05

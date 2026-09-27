@@ -333,6 +333,7 @@ def _make_recovery(env, args):
         floor_four_finger_grip=getattr(args, 'four_finger', True),
         floor_pad_grip=getattr(args, 'pad_grip', False),
         floor_frog_stance=getattr(args, 'frog_stance', False),
+        floor_posture_solve_interval=getattr(args, 'posture_solve_interval', 1),
         motion_profile=getattr(args, 'recovery_motion', 'baseline')))
 
 
@@ -404,6 +405,8 @@ def main() -> None:
                         help='experimental Line 2 extended-finger rubber-pad grasp')
     parser.add_argument('--frog-stance', action='store_true',
                         help='with --pad-grip: knees/toes out and retract the load while rising')
+    parser.add_argument('--posture-solve-interval', type=int, default=1,
+                        help='floor pickup: re-plan whole-body posture IK every N control ticks')
     parser.add_argument('--place', action='store_true', help='experimental place/restart after --recover lift')
     parser.add_argument('--carry', action=argparse.BooleanOptionalAction, default=True,
                         help='with --place, walk the held part to the canonical spot before lowering')
