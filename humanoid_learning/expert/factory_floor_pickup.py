@@ -67,6 +67,7 @@ class FactoryFloorPickup:
         if self.pad_grasp is not None:
             self.four_finger = True
         self.frog_stance = bool(getattr(recovery.config, 'floor_frog_stance', False))
+        self.lower_knee_spread_m = .06  # frog knee opening at the end of LOWER
         if self.frog_stance and self.pad_grasp is None:
             raise ValueError('frog stance requires the pad grip')
         self.load_low, self.load_high = getattr(getattr(recovery, 'config', None), 'floor_grip_load_n', (3., 6.))
@@ -216,7 +217,7 @@ class FactoryFloorPickup:
                 # Clear the hips with the proven reach first. Opening the
                 # knees from the start blocks that reach with the thighs.
                 if self.stage == 'LOWER':
-                    spread = .06*_quintic_scale(np.clip((progress-.75)/.25, 0., 1.))
+                    spread = self.lower_knee_spread_m*_quintic_scale(np.clip((progress-.75)/.25, 0., 1.))
                 self.posture.knee_lateral = self.stance_knee_lateral.copy()
                 self.posture.foot_rotations = [R.copy() for R in self.stance_foot_rotations]
             planned = self._planned_with

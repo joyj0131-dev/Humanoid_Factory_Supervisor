@@ -65,6 +65,15 @@ class RecoveryConfig:
     floor_frog_stance: bool = False
     floor_posture_iterations: int = 8
     floor_posture_solve_interval: int = 1
+    # Opt-in Line 2 floor -> table cycle (factory_floor_table.FloorTableCycle):
+    # pick, stand and place from ONE stance with a whole-body hip hinge. The
+    # shorter stand-off puts the feet (and so the reach) closer to the table.
+    floor_table_place: bool = False
+    floor_table_stand_off_m: float = 0.27
+    floor_table_place_backoff_m: float = 0.045
+    # After the line restarts, keep controlling the robot and record whether
+    # the restarted arm actually works (0 = end at RECOVERED as before).
+    restart_observe_steps: int = 0
     floor_grip_load_n: tuple[float, float] = (3., 6.)
     floor_stand_off_m: float = 0.27
     floor_support_grace_seconds: float = 0.05
@@ -326,9 +335,17 @@ class FactoryRecovery:
         self._transition('CARRY')
 
     def _begin_place(self):
-        from humanoid_learning.expert.factory_place import FactoryPlace
-        self.placer = FactoryPlace(self)
+        if getattr(self, 'floor_task', False) and self.config.floor_table_place:
+            # Same controller, same stance: the held stand hands on to the place.
+            self.placer = self.floor_pickup
+            self.placer.begin_place()
+        else:
+            from humanoid_learning.expert.factory_place import FactoryPlace
+            self.placer = FactoryPlace(self)
         self._transition('PLACE')
+
+    def _placer_owns_legs(self):
+        return getattr(getattr(self, 'placer', None), 'owns_legs', False)
 
     def step(self):
         if self.state in self.TERMINAL:
@@ -389,7 +406,8 @@ class FactoryRecovery:
                 self.walker.holding = False
                 self.walker._apply_policy_gains()
                 self.navigator = PrecisionApproach(self.walker, replace(
-                    self.config, stand_off_m=self.config.floor_stand_off_m,
+                    self.config, stand_off_m=(self.config.floor_table_stand_off_m if self.config.floor_table_place
+                                              else self.config.floor_stand_off_m),
                     arrival_radius_m=.04, arrival_heading_rad=.10,
                     forward_command_bias=0.0), heading=self.pick_heading)
                 self._transition('WALK')
@@ -411,7 +429,10 @@ class FactoryRecovery:
                 self.expert.config.palm_first_closure = self.config.palm_first_closure
                 self.expert.config.hold_squeeze_m = self.config.hold_squeeze_m
                 self.expert.config.contact_settle_grace_seconds = self.config.contact_settle_grace_seconds
-                if self.floor_task:
+                if self.floor_task and self.config.floor_table_place:
+                    from humanoid_learning.expert.factory_floor_table import FloorTableCycle
+                    self.floor_pickup = FloorTableCycle(self)
+                elif self.floor_task:
                     from humanoid_learning.expert.factory_floor_pickup import FactoryFloorPickup
                     self.floor_pickup = FactoryFloorPickup(self)
                 elif self.config.motion_profile == 'compact':
@@ -461,13 +482,25 @@ class FactoryRecovery:
                 self._begin_place()
         elif self.state == 'PLACE':
             action = self.placer.step()
-            self._standing_feedback()
+            if not self._placer_owns_legs():
+                self._standing_feedback()
             if self.placer.failure:
                 self.failure = self.placer.failure
                 self._transition('FAILED')
             elif self.placer.stage == 'READY_TO_VERIFY':
                 e.task_manager.signal('complete', self.station, e._step_count)
                 self._transition('VERIFY')
+        elif self.state == 'VERIFY' and self._placer_owns_legs():
+            action = self.placer.step()
+            if not self.placer._hands_clear():
+                e.task_manager.completion_requested = False
+                self.failure = 'HANDS_NOT_CLEAR_FOR_RESTART'
+                self._transition('FAILED')
+        elif self.state == 'RESTART_OBSERVE':
+            if self._placer_owns_legs():
+                action = self.placer.step()
+            else:
+                self._standing_feedback()
         elif self.state == 'VERIFY':
             self._standing_feedback()
             action[17:25] = -1.
@@ -524,18 +557,41 @@ class FactoryRecovery:
                 self._transition('FAILED')
             elif (self.hold_steps * dt >= self.config.lift_hold_seconds
                   and (not was_floor_control or e.data.xpos[self.stabilizer.pelvis_body, 2] > .65)):
-                if not self.config.place_after_lift:
+                if was_floor_control and self.config.floor_table_place:
+                    self._begin_place()
+                elif not self.config.place_after_lift:
                     self._transition('LIFTED')
                 elif self.config.carry_by_walking:
                     self._begin_carry()
                 else:
                     self._begin_place()
         if self.state == 'VERIFY' and info.get('line_state') == 'RUNNING':
-            self._transition('RECOVERED')
+            if self.config.restart_observe_steps > 0:
+                arm = e.arms[self.station]
+                self.restart_report = dict(start_step=e._step_count, waypoints=[arm.waypoint_index],
+                                           arm_q0=e.data.qpos[arm.qpos_adr].tolist(), arm_travel_rad=0.,
+                                           part_start=e.part_position(self.station).tolist())
+                self._restart_prev_q = e.data.qpos[arm.qpos_adr].copy()
+                self._transition('RESTART_OBSERVE')
+            else:
+                self._transition('RECOVERED')
+        elif self.state == 'RESTART_OBSERVE':
+            arm = e.arms[self.station]
+            q = e.data.qpos[arm.qpos_adr]
+            report = self.restart_report
+            report['arm_travel_rad'] += float(np.abs(q - self._restart_prev_q).sum())
+            self._restart_prev_q = q.copy()
+            if arm.waypoint_index != report['waypoints'][-1]:
+                report['waypoints'].append(arm.waypoint_index)
+            report.update(line_state=info.get('line_state'), arm_faulted=bool(arm.faulted),
+                          part_now=e.part_position(self.station).tolist(), steps=self.ticks)
+            if self.ticks >= self.config.restart_observe_steps:
+                self._transition('RECOVERED')
         # Low pelvis is intentional ONLY during foot-supported floor posture.
         # Keep the environment's raw fall flag, and expose the task-qualified
         # result separately. Loss of support/large tilt still stops the attempt.
-        floor_control = was_floor_control or self.state == 'FLOOR_PICKUP'
+        floor_control = (was_floor_control or self.state == 'FLOOR_PICKUP'
+                         or (self.state in ('PLACE', 'VERIFY', 'RESTART_OBSERVE') and self._placer_owns_legs()))
         foot_loads = np.zeros(2)
         if floor_control:
             ground = e.model.geom('floor').id
@@ -574,6 +630,8 @@ class FactoryRecovery:
         if self.state in self.CARRY_STATES or hasattr(self, 'placer'):
             info.update(carry_error_m=float(np.linalg.norm(self.navigator.error))
                         if self.state in self.CARRY_STATES else None)
+        if hasattr(self, 'restart_report'):
+            info.update(restart_report=self.restart_report)
         if hasattr(self, 'placer'):
             info.update(place_stage=self.placer.stage, place_error_m=self.placer.final_error_m,
                         place_commanded_rotation_deg=self.placer.commanded_rotation_deg,

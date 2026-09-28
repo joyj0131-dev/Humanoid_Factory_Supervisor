@@ -70,6 +70,21 @@ class SharpaPadGrasp:
         d = self.env.data if data is None else data
         return d.xmat[self.bodies[side, finger]].reshape(3, 3)[:, 1].copy()
 
+    def extend_fingers(self):
+        """Straight index..pinky (open and closed): the table-place pinch.
+
+        A knuckle-flexed finger tilts its pad ~35 deg toward the palm, so a
+        side-face pinch then drives the two palms into each other."""
+        m = self.env.model
+        for side in sc.SIDES:
+            for group in range(1, 4):
+                index = 0
+                for finger in sc.GROUP_FINGERS[sc.GROUPS[group]]:
+                    for suffix in sc.curl_suffixes(finger):
+                        j = m.joint(sc.sharpa_joint(side, finger, suffix))
+                        self.pad_open[side][group][index] = self.pad_close[side][group][index] = np.clip(0., *j.range)
+                        index += 1
+
     def reach_targets(self, expert, gap=.120):
         m = self.env.model
         d = mujoco.MjData(m)
