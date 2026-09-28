@@ -207,6 +207,7 @@ def run_offscreen(env, args) -> None:
         print("no frames captured; check --capture against --steps")
     if recovery is not None:
         print(f"Recovery result: {recovery.state}; failure={recovery.failure}")
+        _print_decisions(recovery)
         recovery.close()
 
 
@@ -299,6 +300,7 @@ def run_interactive(env, args) -> None:
                     print("Episode finished; scene retained. Press R to reset.")
                     if recovery is not None:
                         print(f"Recovery result: {recovery.state}; failure={recovery.failure}")
+                        _print_decisions(recovery)
             for event in info["mission_events"][event_count:]:
                 print(f"  step {event['step']:5d} station {event['station']}: {event['event']}")
             event_count = len(info["mission_events"])
@@ -334,7 +336,18 @@ def _make_recovery(env, args):
         floor_pad_grip=getattr(args, 'pad_grip', False),
         floor_frog_stance=getattr(args, 'frog_stance', False),
         floor_posture_solve_interval=getattr(args, 'posture_solve_interval', 1),
+        floor_table_place=getattr(args, 'table_place', False),
+        restart_observe_steps=getattr(args, 'restart_observe_steps', 0),
         motion_profile=getattr(args, 'recovery_motion', 'baseline')))
+
+
+def _print_decisions(recovery):
+    """Observe/select/verify records of the floor->table cycle, if any."""
+    log = getattr(getattr(recovery, 'floor_pickup', None), 'agent_log', None)
+    for record in (log.records if log is not None else []):
+        decision, result = record['decision'], record['result'] or {}
+        print(f"Decision ({'replan' if record['replan'] else 'initial'}): {decision['kind']} -- {decision['reason']}")
+        print(f"  rejected: {record['rejected']}; outcome: {result.get('outcome')} {result.get('reason') or ''}")
 
 
 def _make_walker(env, station: int):
@@ -408,6 +421,11 @@ def main() -> None:
     parser.add_argument('--posture-solve-interval', type=int, default=1,
                         help='floor pickup: re-plan whole-body posture IK every N control ticks')
     parser.add_argument('--place', action='store_true', help='experimental place/restart after --recover lift')
+    parser.add_argument('--table-place', action='store_true',
+                        help='with --pad-grip --frog-stance: experimental one-stance floor->table cycle with '
+                             'observe/select/verify/replan decisions (incomplete)')
+    parser.add_argument('--restart-observe-steps', type=int, default=0,
+                        help='after a verified restart, keep the robot standing and record the arm for N ticks')
     parser.add_argument('--carry', action=argparse.BooleanOptionalAction, default=True,
                         help='with --place, walk the held part to the canonical spot before lowering')
     parser.add_argument('--kinematic-ik', action=argparse.BooleanOptionalAction, default=True,
@@ -430,6 +448,8 @@ def main() -> None:
         parser.error('--recover cannot be combined with --walk-to or --no-fault')
     if args.place and not args.recover:
         parser.error('--place requires --recover')
+    if args.table_place and not (args.recover and args.pad_grip and args.frog_stance):
+        parser.error('--table-place requires --recover --pad-grip --frog-stance')
 
     if args.offscreen:
         os.environ.setdefault("MUJOCO_GL", "egl")
