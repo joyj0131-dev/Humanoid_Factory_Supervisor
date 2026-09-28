@@ -1,246 +1,189 @@
 # Whole-Body Humanoid Factory Supervisor
 
-MuJoCo에서 Unitree G1이 공장 자동화의 예외 상황을 복구하도록 만드는
-프로젝트다. 정상 생산은 scripted robot arm/conveyor가 담당하고, G1은
-dropped part, misalignment, jam 같은 예외에 whole-body로 개입한다.
+MuJoCo에서 Unitree G1(양손 Sharpa Wave)이 공장 자동화의 예외 상황을 복구하도록
+만드는 프로젝트다. 정상 생산은 scripted 자동화 팔과 컨베이어가 담당하고, G1은
+떨어진 부품·정렬 불량·걸림 같은 예외에 전신(whole-body)으로 개입한다.
 
-현재 개발 대상은 G1 + Sharpa Wave 양손의 fixed-base grasp다. 기본 실행에서
-12cm/0.1kg 블록을 양손으로 잡고 들어올려 공중 5초 유지한다. 실제 물체와
-테이블의 간격은 약 8.3cm이며, 추가 5초 유지와 손을 열었을 때 낙하도 검증한다.
-이는 양손의 포괄 파지이며, 각 손의 엄지까지 요구하는 기존 Gate A 통과를
-뜻하지 않는다. Phase 4.5 전체는 아직 미완료다. 과거 Dex3 연구는
-`phase4/dex3-grasp` 브랜치에 보존한다.
+```text
+고장 감지 → 라인 정지·복구 요청 → G1 이동 → 전신 자세 → 물리 복구 → 복구 검증 → 라인 재가동
+```
 
-현재 접촉에는 손가락뿐 아니라 손바닥·손목도 참여한다. 손끝만의 정밀 파지는
-아니다. 최초 버전(`hold_squeeze_m=0.012`)에서는 손바닥+손목이 지지력의 약
-84~86%, 손가락은 14~16%뿐이었다 — 팔의 양손 squeeze량이 필요 이상으로
-컸기 때문. 실측 스윕 결과 squeeze는 0.002m까지 낮춰도 성공하고(0.001m는
-실패) 새 손가락 로직 없이 `hold_squeeze_m=0.003`으로만 낮춰도 손가락
-비중이 seed0/1/2에서 약 30~38%까지 오른다(안전마진 3배). soft-contact
-관통은 hold 구간 최대 약 4.05mm로 기록한다.
+## 현재 상태 요약 (2026-09-28, seed 0)
 
-## 현재 실행
+| 기능 | 상태 | 실측 |
+|---|---|---|
+| Line 1 벨트 걸림: 보행 → 양손 파지 → 상승 → 5초 유지 | 성공 | 4934 step, 79.5 mm 상승 |
+| Line 2 바닥 낙하(기본 파지): 보행 → 앉기 → 바닥 집기 → 기립 → 5초 유지 | 성공 | 8760 step, 601.7 mm 상승 |
+| Line 2 바닥 낙하(검은 패드 + 무릎 벌림, `--pad-grip --frog-stance`) | 성공(실험 옵션) | 9576 step, 438 mm, 유지 중 하중 전부 패드 |
+| Line 2 바닥 → 테이블 안착 → 손 회수 → 복구 검증 → 라인 재가동 | **미완료** | 판단 루프는 동작, 물리 경로 미확보(아래 참고) |
+| 운반 보행(블록을 든 채 걷기) | 미확보 | 팔을 앞으로 든 자세에서 기존 보행 정책이 명령을 추종하지 못함 |
 
-Sharpa 자산은 저장소에 직접 포함되지 않는다. 처음 clone한 뒤 설치한다.
+"성공"은 해당 장면에서의 기능 성공이다. 충돌 없는 동작, 범용 복구 정책,
+학습 데모 승인을 뜻하지 않는다. 물체 고정·순간이동·숨은 외력·충돌 비활성화·
+성공 기준 완화는 쓰지 않는다. 로봇은 액추에이터 명령으로만 움직인다.
+
+## 설치
+
+Sharpa 손 자산과 G1 보행 정책(Unitree 사전학습, BSD-3, 외부 도구)은 저장소에
+직접 포함되지 않는다. 처음 clone한 뒤 설치한다.
 
 ```bash
 python3 scripts/install_sharpa_wave_assets.py
+python3 scripts/install_g1_walk_policy.py
 python3 scripts/test_sharpa_wave_model.py
 python3 scripts/test_sharpa_g1_integration.py
 ```
 
-공식 양손 grasp와 손 동작 demo:
-
-```bash
-DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --no-restart
-DISPLAY=:0 python3 scripts/view_whole_body.py --sharpa-hand-demo --no-restart
-python3 scripts/test_sharpa_bimanual_grasp.py
-OPENBLAS_NUM_THREADS=1 python3 scripts/test_sharpa_grasp_lift.py --seeds 0 1 2
-```
-
-Phase 5: 몸통을 고정하지 않고 **두 발로 선 채** 잡는 것도 볼 수 있다.
-`--free-base`가 없으면 기존과 동일한 고정 몸통이다.
-
-```bash
-DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --free-base --no-restart
-OPENBLAS_NUM_THREADS=1 MUJOCO_GL=egl python3 scripts/test_free_base_grasp.py
-```
-
-`test_sharpa_grasp_lift.py`는 실제 상승·연속 공중 유지·양손 지지·놓았을 때
-낙하를 검사한다. 기존 bimanual 테스트에는 미달성 엄지 Gate A 및 과거
-실패 상태를 고정한 낡은 assertion들이 남아 있으므로 별도로 보고한다.
-
-접촉 후에는 `SharpaContactLift`가 달성한 손가락 자세를 유지하며 양손을
-각각 3mm 더 모으고, 실제 qpos에서 IK를 다시 풀어 1cm/s로 올린다.
-MuJoCo `noslip_iterations=10`을 접촉 후 적용해 soft-contact creep를 줄인다.
-질량·마찰·충돌 geometry는 바꾸지 않으며 물체 고정/weld/teleport는 없다.
-reset 시 solver 설정도 원래 값으로 복구된다.
-
-## 위치·크기·회전 변화 평가
-
-같은 제어기/설정으로 14개 평가 조건과 별도 조합 4개에서 실제 파지·상승·
-공중 5초 유지에 성공했다. 수정 전에는 같은 14조건 중 2조건만 성공했다.
-시험 조건은 X/Y ±5·10mm, 11/12/13cm 정육면체, 10×15×10cm 직육면체,
-yaw ±5°다. 모든 조합을 시험한 것은 아니며 넓은 작업영역 보장이 아니다.
-13cm 블록은 최대 관통이 약 9.9mm여서 접촉 품질 개선 대상으로 남는다.
-성공한 18조건을 전부 깨끗한 학습 데모로 자동 채택한다는 뜻은 아니다.
-자세한 조건·한계·재현법은 [작업영역 평가](docs/SHARPA_WORKSPACE_EVALUATION.md)에 기록한다.
-
-```bash
-DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --object-size 0.10 0.15 0.10 --no-restart
-DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --object-pos-x 0.27 --object-pos-y 0.01 --no-restart
-DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --object-yaw-deg 5 --no-restart
-OPENBLAS_NUM_THREADS=1 python3 scripts/evaluate_sharpa_workspace.py --suite all --workers 3 --output results/sharpa_workspace/evaluation.jsonl
-```
-
-현재는 카메라가 아니라 시뮬레이터의 실제 물체 상태를 사용한다.
-
-## 데모 기록과 Expert 없는 재생
-
-성공하는 파지를 파일로 기록하고, Expert를 전혀 만들지 않은 채 저장된 명령만
-실행해 같은 파지가 재현되는지 검증한다. 아직 BC/PPO 학습 단계가 아니다.
-
-기록 단위는 25차원 action 하나가 아니라 **완전한 명령**(`SharpaGraspCommand`)이다.
-Expert는 반환 action 밖에서도 preshape 관절 목표와 엄지 CMC 명령(실측 16개
-actuator), 그리고 접촉 이후 solver의 `noslip_iterations`를 직접 바꾼다. action만
-저장하면 이 명령들이 빠져 재현되지 않는다. `capture_command()`가 `expert.step()`
-직후 이 보조 명령까지 함께 포착하고, `step_command()`는 보조 명령을 적용한 뒤
-기존 `env.step`을 호출하므로 중력 보상과 substep 접촉 안전 로직이 그대로 돈다.
-기존 action 25 / observation 129 계약은 바뀌지 않는다.
-
-재생은 기록된 qpos/qvel을 물리에 대입하지 않는다. 같은 seed로 reset한 뒤 저장된
-명령만 실행하고, 기록된 상태는 오직 비교용으로만 쓴다. 최대 허용 오차는 1e-6이다.
-
-```bash
-OPENBLAS_NUM_THREADS=1 python3 scripts/sharpa_demos.py collect \
-  --output datasets/sharpa_pilot_v1 --count 10 --resume --workers 3
-OPENBLAS_NUM_THREADS=1 python3 scripts/sharpa_demos.py replay \
-  --input datasets/sharpa_pilot_v1 --report results/sharpa_demos/pilot_replay.json --workers 3
-OPENBLAS_NUM_THREADS=1 python3 scripts/test_sharpa_demo.py \
-  --episode datasets/sharpa_pilot_v1/episode_0001_canonical.npz
-```
-
-파일럿 10개는 12cm 기본 장면 1개, X ±5/10mm 4개, Y ±5/10mm 4개, 11cm cube 1개로
-서로 다른 장면이다. 기록 파일은 명령·비교용 상태·Expert FSM 상태·실측 접촉
-telemetry와 함께 MuJoCo 버전, `humanoid_learning/envs/*.py` hash, 컴파일된 모델
-hash, actuator 순서를 담는다. 이 중 하나라도 다르면 재생이 거부된다.
-
-**기록된 파일은 아직 학습용으로 승인된 데모가 아니다**(`learner_ready=False`,
-`quality_review_required=True`). 재생 성공은 "같은 명령이 같은 물리를 만든다"는
-뜻이지 "이 궤적이 좋은 학습 데이터"라는 뜻이 아니다. 특히 기록된 129차원
-observation만으로는 명령을 결정할 수 없다 — Expert는 접촉력 등 관측에 없는
-정보를 쓰는 상태 기계이므로, 그대로 BC에 넣는 것은 별도 설계 문제다.
+보행은 연구 대상이 아니라 주어진 도구이며, 출처는 `assets/policies/g1_walk/NOTICE`에 있다.
 
 ## 두 작업 공간 공장 환경
 
-현재는 1.3m 통로 양쪽에 독립된 두 라인이 있다. 각 라인은 컨베이어·자동화 팔·
-테이블을 하나씩 사용한다. Line 1(index 0)은 벨트의 `jam`, Line 2(index 1)는
-테이블 밖 바닥으로 떨어지는 `arm_drop` 고장이다. Task manager가 해당 라인을
-정지시키고 G1에 복구를 요청한다.
-
-2026-09-14, 새 배치에서의 검증 상태 (seed 0, smooth):
-
-- **Line 1:** 실제 보행 → 양손 파지 → 79.53mm 상승 → 공중 지지 5초 성공
-  (4934 step, seed 0/1). 목표 근처의 과도한 옆걸음 제한을 없애 보행 종료를
-  1367→1006 step으로 앞당겼다(3.61초 단축). 도착 위치·방향·속도·양발 지지
-  기준은 그대로다. 통로 쪽 난간에는 물리적 작업 개구부가 있으며 나머지 난간의
-  충돌은 유지한다. 손–블록 최대 관통은 7.63mm, 확장 간섭 검사는 74 tick으로
-  기존 704 tick보다 줄었지만 무충돌은 아니다. HUD에서 실제 접근 목표를 표시한다.
-- **Line 2:** 실제 고장 → 보행 → 앉기 → 엄지 제외 바닥 집기 → 기립 → 5초 유지 성공
-  (8760 step, 최대 바닥 간격 589.82mm, 발–블록 접촉 0, 넘어짐 없음, seed 0).
-  앉을 때는 엄지를 접어두고 손을 내리는 후반에 편다. 엄지 접촉력은 양손 모두
-  0N이며 손바닥·손목의 물체 지지도 검출되지 않았다(접촉 기록 기준 0.01N 초과).
-  단, 네 손가락이 균등하게 받치는 것은 아니다. 유지 중 왼손 중지·약지,
-  오른손 새끼손가락 쪽에 하중이 집중되어 **접촉 분산은 미해결**이다.
-  벨트용 수평 감싸기와 달리 손목을 높게 두고 손가락을 위에서 양옆으로 내리는
-  바닥 전용 접근을 사용한다. 먼저 조금 들어 올린 후 팔의 파지 자세를 유지하며
-  다리로 일어선다. 손–블록 최대 관통은 기존 3.23→4.45mm로 증가했고,
-  최종 블록 기울기도 약 20.8→29.4°로 증가했다. 자세 계획은 별도 모델의 8mm
-  자기충돌 여유를 사용하며, 실제 모델의 충돌 형상·마찰·질량은 바꾸지 않는다.
-  확장 간섭은 기존 2423→2917 tick, 최대 힘은 63.83→38.64N이다. 따라서
-  엄지 제외 집기의 기능 성공이지 전반적인 안정성·접촉 품질 개선 완료는 아니다.
-  `--no-four-finger`로 이전 성공 파지를 비교할 수 있다(이전 경로는 동일 조건 2회 재현).
-  힘 목표 3–6N은 유지했다. 5–9N 후보는 들어올리지만 관통 5.23mm로 더 나빠져
-  채택하지 않았다. 잡은 뒤 손목 보정은 전복, 잡기 전 손가락 줄 정렬은 초기
-  들어올림 실패로 제거했다. 마찰을 높이거나 손가락 충돌을 끄는 변경은 없다.
-  8mm는 계획상의 여유이지 실제 무충돌 보장이 아니다. 바닥 자세 계산도 느리며
-  전체 headless 실행 RTF 약 0.17이었다(하드웨어·동시 부하에 따라 달라짐).
-  2026-09-15에는 계획용 모델에서 불필요한 환경 접촉과, 팔·다리 변수로는
-  바꿀 수 없는 같은 손 내부 접촉 계산을 제외했다. 실제 물리 충돌은 유지한다.
-  100 tick 프로파일에서 자세 계산은 약 65.7→19.8ms/tick으로 감소했다.
-  8회 IK 반복을 유지한 전체 Line 2 재검증은 8760 step, 601.67mm 상승,
-  5초 유지에 성공했다(headless RTF 0.409, floor 구간 평균 38.1ms/tick).
-  GUI의 RTF를 보장하는 수치는 아니다. 2회 반복 후보는 빠르지만 파지를
-  놓쳤으므로 기본값으로 채택하지 않았다. Line 1도 4934 step 성공을 유지했다.
-- **검은 패드 파지는 아직 실험 기능이다.** `--pad-grip`은 손가락 끝의
-  두 관절을 거의 편 채 실제 elastomer 면을 물체 쪽으로 정렬한다. 위의
-  601.67mm/5초 결과는 이 옵션이 아니라 기존 파지의 성능 최적화 결과다.
-  패드 전용 힘 측정은 단단한 손가락 껍질의 접촉력을 제외하며, 전체 평가에는
-  껍질·엄지·몸통 접촉도 별도로 기록한다. 패드 후보는 실제 접촉과 부분 상승은
-  가능했으나 기립 중 접촉 유실이 남아 있어 기본 파지를 대체하지 않았다.
-  최신 3–6N 후보(seed 0)는 246.46mm 상승 후 접촉 유실로 실패했다.
-  이 실행의 어깨–몸통 및 엄지–물체 접촉은 0이었다(전체 무충돌 주장은 아님).
-  6–10N 후보는 378.10mm 상승 후 전복되어 채택하지 않았다. 기립 중에는
-  저장된 손 위치·각도를 추종하기보다 실제로 잡힌 팔 명령을 유지하며 힘을
-  보정하지만, 안정적인 기립·5초 유지까지 해결된 상태는 아니다.
-  확인 명령은 `DISPLAY=:0 python3 scripts/view_factory.py --recover --fault-workcell 1 --pad-grip`.
-  이 옵션은 손가락 명령 매핑도 바꾸므로 기존 데모와 동일한 학습 계약으로
-  간주하지 않는다. 마찰·질량·실제 충돌을 바꾸거나 물체를 붙이는 방식은 쓰지 않는다.
-- **무릎 벌림·후퇴 실험:** `--pad-grip --frog-stance`로 실행한다. 발의 위치를
-  순간이동시키거나 모델을 바꾸지 않고, 발끝 회전과 무릎 측면 목표를 IK에
-  추가한다. 실제 시험에서 무릎 사이 폭은 약 22→39cm로 늘었다. 처음부터
-  벌리는 후보는 손의 하강 경로와 간섭해, 현재는 하강 후반에 벌리도록 한다.
-  잡은 물체를 몸쪽으로 당기는 명령도 추가했으나 **안정적인 기립은 미완료**다.
-  다리 벌림 자체의 구현과 파지·기립 성공을 구분하며 기본값은 OFF로 유지한다.
-  `floor_stance_metrics`에는 단계별 실제 무릎 폭과 물체–골반 앞뒤 거리를 기록한다.
-  선택한 후보는 무릎 폭 38.7cm, 물체–골반 거리 44.7→32.1cm를 실측했으나,
-  기립 중 다시 앞으로 움직여 16.0cm 상승 후 접촉을 잃었다(seed 0).
-  손목을 초기 월드 각도로 고정하지 않고 물체와의 상대 각도를 유지해 당긴다.
-  몸통 수평이동 보상과 다리 제어 인계 보정 후보는 오히려 충돌이 증가해 제외했다.
-  이 옵션은 기립 완료 기능이 아니며, 기존 Line 1은 4934 step/5초 유지 성공을 재확인했다.
-  2026-09-25 추가 비교에서도 기립·5초 유지는 미달성이다. 팔 강성 램프,
-  양손 상대 자세/월드 방향 유지, 패드 기준 통합 제어(회전 추종 유/무)
-  5개 후보는 모두 접촉을 잃어 되돌렸다. 통합 제어의 최대 높이 52.8cm는
-  뒤로 기울어지는 동작이 섞인 값으로 정상 들어올림 성공이 아니다.
-  평가 JSON의 `floor_motion_samples`는 당김/기립/유지 중 10 tick마다 골반,
-  물체, 양손 위치, 골반 기울기·각속도(`tilt`), 팔 목표 오차, 패드 힘을 기록한다.
-  기록 추가 전후 기본 frog 경로의 qpos/qvel/ctrl 궤적 해시는 동일하다.
-- 운반·내려놓기 코드는 실험 단계이며, 새 배치에서 **복구 → 생산 재가동까지
-  완결된 성공은 없다**. `--recover --place`는 완료 기능으로 간주하지 않는다.
-
-이는 현재 장면에서의 기능 성공이며, **충돌 없는 동작·범용 복구 정책·학습 데모
-승인을 뜻하지 않는다**. 평가 결과의 `additional_contact_pairs`는 기존 pelvis/torso
-검사에 없는 팔·다리·손–환경 접촉도 기록한다(0.5N 초과, 손 내부 접촉 별도 분류).
-뷰어는 결과 자세에서
-멈추며 `R`로 다시 실행한다. 수치 재검증에는
-`scripts/evaluate_factory_recovery.py --station 0 --motion-profile smooth`를 사용한다.
-Line 2는 `--station 1`로 검사한다. `--place` 없이 실행하면 들어 올린 상태에서
-끝나며 task manager는 `RECOVERING`을 유지한다. 복구 완료 신호를 가짜로 보내지 않는다.
-
-Navigation Gate는 **보행 정책이 생기기 전에 미리** 못박았다: 위치 0.10m, heading
-0.15rad, 1.0초 유지, 넘어짐/금지 접촉 없음, 올바른 셀 먼저, 1500 step 이내, 그리고
-step당 base 이동 0.05m 초과는 보행이 아니므로 실격. 테스트로 순간이동·엉뚱한 셀
-경유·넘어짐이 실제로 걸러지는 것을 확인했다.
-
-G1은 Unitree 사전학습 G1 정책(BSD-3, 외부 도구)으로 실제로 걷는다.
-과거 배치에서 측정한 위치 오차 34.8mm / 46.8mm는 새 배치의 검증값이 아니다.
-보행은 연구 대상이 아니라 주어진
-도구이며 출처는 `assets/policies/g1_walk/NOTICE`에 기록했다.
+1.3 m 통로 양쪽에 독립된 두 라인이 있고, 각 라인은 컨베이어·자동화 팔·테이블을
+하나씩 쓴다. Line 1(index 0)은 벨트 `jam`, Line 2(index 1)는 자동화 팔이 부품을
+테이블 밖 바닥으로 떨어뜨리는 `arm_drop` 고장이다. Task manager가 라인을 멈추고
+G1에 복구를 요청한다. 복구 완료는 신호만으로 인정하지 않는다. 부품이 지정 위치
+(허용 60 mm, yaw ±0.15 rad는 90° 대칭 기준)에 기울지 않고 정지 상태로 작업면에
+놓인 것을 물리적으로 50 tick 확인한 뒤에야 팔과 벨트를 다시 가동한다.
 
 ```bash
-python3 scripts/install_g1_walk_policy.py
-DISPLAY=:0 python3 scripts/view_factory.py --recover --fault-workcell 0
-DISPLAY=:0 python3 scripts/view_factory.py --recover --fault-workcell 1
-DISPLAY=:0 python3 scripts/view_factory.py --walk-to 0
-DISPLAY=:0 python3 scripts/view_factory.py --walk-to 1 --scenario arm_drop
-DISPLAY=:0 python3 scripts/view_factory.py
-DISPLAY=:0 python3 scripts/view_factory.py --scenario arm_drop --fault-workcell 1
-DISPLAY=:0 python3 scripts/view_factory.py --scenario jam --fault-workcell 0
-DISPLAY=:0 python3 scripts/view_factory.py --no-fault
+DISPLAY=:0 python3 scripts/view_factory.py                                   # 고장 장면
+DISPLAY=:0 python3 scripts/view_factory.py --recover --fault-workcell 0      # Line 1 복구
+DISPLAY=:0 python3 scripts/view_factory.py --recover --fault-workcell 1      # Line 2 복구(기본 파지)
+DISPLAY=:0 python3 scripts/view_factory.py --recover --fault-workcell 1 --pad-grip --frog-stance
 OPENBLAS_NUM_THREADS=1 python3 scripts/view_factory.py --offscreen \
   --seed 0 --out results/factory/scene.png --steps 400 --capture 150 400
-OPENBLAS_NUM_THREADS=1 MUJOCO_GL=egl python3 scripts/test_factory.py
 ```
 
-`--walk-to`는 종전 스테이션 마커까지 걷는 기능이고 `--recover`는 실제 고장 부품을
-향해 이동한 뒤 잡는 경로다. 동시에 지정하지 않는다. 파지 목표와 안쪽 접근 방향은
-작업 heading 좌표계로 변환하지만 임의 방향·배치의 성공을 보장하지 않는다. `envs/` 변경으로 기존 데모
-hash가 달라지므로 예전 데이터의 hash를 고치지 말고 새 버전에 재기록해야 한다.
-자세한 내용은
-[공장 환경](docs/FACTORY_ENVIRONMENT.md) 참고.
+Navigation Gate는 보행 정책 도입 전에 정해 두었다. 위치 0.10 m, heading 0.15 rad,
+1.0초 유지, 넘어짐·금지 접촉 없음, 올바른 셀 먼저 방문, 1500 step 이내 조건이다.
+step당 base 이동이 0.05 m를 넘으면 순간이동으로 보고 실격시킨다.
 
-## 문서 안내
+### Line 1 (벨트 걸림)
 
-- [현재 구조](docs/ARCHITECTURE.md)
-- [두 작업 공간 공장 환경](docs/FACTORY_ENVIRONMENT.md)
-- [Phase 0~13 로드맵](docs/PHASE_ROADMAP.md)
-- [Sharpa Wave 통합](docs/END_EFFECTOR_SHARPA_WAVE.md)
-- [Dex3 legacy 경계](docs/LEGACY_DEX3.md)
-- [리팩터링 감사와 파일 분류](docs/REFACTOR_AUDIT.md)
-- [Git 브랜치·태그](docs/GIT_WORKFLOW.md)
+실제 보행 → 양손 파지 → 79.5 mm 상승 → 공중 5초 유지(4934 step, seed 0/1).
+손–블록 최대 관통은 7.6 mm이며 확장 간섭 검사도 0 tick은 아니다.
 
-`PROJECT_CONTEXT.md`는 로컬 작업 인수인계용이며 Git에 올리지 않는다.
-세션 원문은 로컬 `docs/history/`에 보존하고 평소 작업에서는 읽지 않는다.
+### Line 2 (바닥 낙하) — 기본 파지
+
+실제 고장 → 보행 → 앉기 → 엄지를 제외한 바닥 집기 → 기립 → 5초 유지
+(8760 step, 최대 바닥 간격 601.7 mm, 발–블록 접촉 0, 넘어짐 없음). 앉을 때는
+엄지를 접어 두고, 손을 내리는 후반에 편다. 손목을 높게 두고 손가락을 위에서
+양옆으로 내리는 바닥 전용 접근이다. 네 손가락이 하중을 균등하게 받치지는 않는다.
+
+### Line 2 — 검은 패드 + 무릎 벌림 (`--pad-grip --frog-stance`, 실험 옵션)
+
+손가락 끝 두 관절을 거의 편 채 elastomer 패드 면으로 블록 옆면을 잡는다. 앉을 때는
+발끝을 돌리고 무릎을 벌린다(실측 무릎 폭 약 22 → 39 cm). 기립 중에는 손을
+실제 어깨 좌표계에서 추종하고, 명령 손 위치를 기준으로 서보해 squeeze를 유지한다.
+
+- 실측(seed 0): 9576 step에 LIFTED, 바닥 간격 438 mm, 약 11.9초 직립 유지,
+  접촉 유실 0 tick, 손–물체 관통 3.1 mm. 유지 중 손–물체 하중은 전부 패드였고
+  엄지·손가락 껍질 하중은 0이었다.
+- 초기 조건 변형(부품 x ±2 cm, y −2 cm, 로봇 ±5 cm·±0.1 rad) 5개도 LIFTED.
+- 남은 문제: 부품 +2 cm y(블록 yaw 32.6°)는 PICK_CLEAR에서 실패한다.
+  어깨–몸통 접촉(최대 9.5~33 N)도 남아 있다.
+- 패드 힘 측정은 단단한 손가락 껍질의 접촉력을 제외한다. 이 옵션은 손가락 명령
+  매핑을 바꾸므로 기존 데모와 같은 학습 계약으로 보지 않는다.
+
+### Line 2 — 바닥 → 테이블: 관측·선택·실행·검증·재계획 루프 (`--table-place`, 미완료)
+
+바닥 블록을 테이블 지정 위치에 놓고 라인을 재가동하는 전체 복구를 위해, 기존
+복구 FSM을 유지한 채 그 둘레에 폐루프 판단 구조를 붙였다(`humanoid_learning/expert/recovery_agent.py`,
+`factory_floor_table.py`). LLM이나 외부 API는 쓰지 않는다. 선택 담당은
+인터페이스로 분리해 나중에 교체·비교할 수 있게 했다.
+
+- **관측**: 블록의 실제 위치·방향·속도, pelvis 기울기, 양발 하중, 패드 하중,
+  손–다리 거리, 계획 오차.
+- **후보 평가**(실제 데이터를 건드리지 않는 복사본에서): 안착 도달 → 파지 자세 도달 →
+  들어 올려 테이블 앞면을 넘기는 **이송 경로** → 손 **진입 경로** 순으로 연결을 확인한다.
+  끝점만이 아니라 경로 전체를 보고, 손–다리·손–블록 거리와 경로 도중의
+  팔 해 뒤집힘(분기 전환)도 검사한다. 경로 허용치는 물리적으로 성공한 기존 진입
+  경로를 같은 검사기로 결정 때마다 측정해 보정한다.
+- **선택**: 모든 연결이 되는 후보만 고른다. 없으면 이유를 붙여 제어된 중단(ABORT)을 한다.
+- **실행 중 감시와 재계획**: 블록이 밀리거나 돌거나, 손이 다리를 계속 밀거나,
+  계획 팔 자세가 급변하거나, 패드 하중이 형성되지 않으면 실패로 본다. 이때 이미
+  안정하게 지나온 진입 경로를 거꾸로 되감아 물러난 뒤, 다시 관측하고 실패한
+  계획을 빼고 재선택한다(최대 3회).
+- **기록**: 판단마다 관측값, 후보별 탈락 이유, 선택과 근거, 실행 결과를 남긴다.
+
+물리로 확인된 것:
+- 기존 진입 자세를 거친 손 진입, 8개 패드 접촉(껍질 지지 아님), 바닥 위에서 블록을
+  −31~−34° 돌려 테이블 축에 정렬(잔차 3~4°), 3 cm 들어 올림.
+- 감시가 실제로 동작함: 블록 13 mm 밀림을 감지해 물러난 뒤 재판단했다. 넘어짐 없음.
+
+막힌 원인: 이 장면에서 패드 파지 하나로 바닥 파지와 테이블 앞면 통과를 함께
+만족할 수 없다.
+- 웅크린 채 바닥 블록을 잡으려면 손가락이 수평에서 약 55° 이상 아래를 향해야 한다.
+- 발을 고정한 채 블록을 몸 가까이 높이 들어 테이블 앞면을 넘기려면 약 50° 이하가 필요하다.
+- 이 판단이 들어가기 전 실행한 기립 4회는 모두 같은 구간(블록 높이 0.45~0.5 m)에서
+  팔 관절 한계로 파지를 잃었다. 지금은 선택기가 이를 실행 전에 판단해 ABORT하고,
+  로봇은 선 채로 멈추며 블록은 바닥에 그대로 있다.
+
+운반 보행의 근거 범위: 블록 없이 팔을 앞으로 든 자세만 두고 시험했다. 0.3 m/s 명령
+1.5초 동안 거의 전진하지 않다가 명령 없이 0.15 m 밀려 나갔고, 피치 12°에서 정지하지
+못했다. 팔을 내리면 정상 보행한다. 실제 블록을 든 보행, 명령 신호 조정, 정책 입력
+보정은 시험하지 않았다. 다음 단계에는 발 위치를 바꾸는 수단(준정적 한 걸음 제어기,
+운반 자세 보행 재학습, 손 안 재파지 중 하나)이 필요하며 결정 대기 중이다.
+
+```bash
+DISPLAY=:0 python3 scripts/view_factory.py --recover --fault-workcell 1 \
+  --pad-grip --frog-stance --table-place          # 종료 시 판단 기록 출력
+python3 scripts/test_recovery_agent.py
+```
+
+`--table-place`는 기본값 OFF다. 옵션을 켜지 않으면 Line 1과 Line 2의 궤적
+(qpos/qvel/ctrl)은 이전 커밋과 매 tick 비트 단위로 같다.
+
+### 성능 옵션
+
+- `--display-hz`(기본 50): 창 갱신 주기만 줄인다. 물리·제어는 매 tick 실행한다.
+- `--posture-solve-interval`(기본 1): 바닥 자세 IK를 N tick마다 다시 푼다. 명령과
+  균형·접촉 피드백은 매 tick 유지된다. N=2는 기본 파지에서 성공을 유지했지만
+  패드 경로에서는 접촉을 더 일찍 잃어 기본값으로 채택하지 않았다.
+- 접촉 집계는 한 번의 순회로 처리하며, 궤적은 변경 전과 비트 단위로 같다.
+
+## 기반 작업: 고정 몸통 양손 파지 (Phase 4.5)
+
+G1 + Sharpa Wave 양손으로 12 cm / 0.1 kg 블록을 잡고 들어 올려 공중 5초 유지한다
+(물체–테이블 간격 약 8.3 cm, 손을 열면 낙하까지 검증). 이는 양손의 포괄 파지이며,
+각 손의 엄지까지 요구하는 기존 Gate A 통과를 뜻하지 않는다. 손바닥·손목도 접촉에
+참여한다. `hold_squeeze_m=0.003`에서 손가락 하중 비중은 약 30~38%(seed 0/1/2)다.
+Dex3 연구는 `phase4/dex3-grasp` 브랜치에 보존한다.
+
+```bash
+DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --no-restart
+DISPLAY=:0 python3 scripts/view_whole_body.py --grasp --free-base --no-restart   # 두 발로 선 채
+DISPLAY=:0 python3 scripts/view_whole_body.py --sharpa-hand-demo --no-restart
+OPENBLAS_NUM_THREADS=1 python3 scripts/test_sharpa_grasp_lift.py --seeds 0 1 2
+```
+
+- 위치·크기·회전 변화: 같은 제어기로 14개 평가 조건과 조합 4개에서 파지·상승·5초
+  유지에 성공했다(수정 전 14개 중 2개). X/Y ±5·10 mm, 11/12/13 cm 정육면체,
+  10×15×10 cm 직육면체, yaw ±5° 범위이며 넓은 작업영역 보장은 아니다.
+  13 cm 블록은 관통 약 9.9 mm로 개선 대상이다.
+  (`scripts/evaluate_sharpa_workspace.py --suite all`)
+- 데모 기록·재생: 25차원 action만이 아니라 preshape·엄지 명령과 solver 설정을 포함한
+  완전한 명령을 기록한다. Expert 없이 저장된 명령만 실행해 1e-6 이내로 재현된다.
+  파일럿 10개는 학습용으로 승인된 데이터가 아니다(`learner_ready=False`).
+  (`scripts/sharpa_demos.py collect|replay`)
+
+## 테스트
+
+```bash
+python3 scripts/test_factory.py
+python3 scripts/test_factory_recovery.py
+python3 scripts/test_floor_pad_planning.py
+python3 scripts/test_factory_place.py
+python3 scripts/test_recovery_agent.py
+```
+
+알려진 문제: `scripts/test_factory_task_frames.py`는 테스트의 가짜 객체가 현재 바닥
+파지 코드보다 오래되어 실패한다(이번 변경 이전부터 동일).
+
+## 문서와 기록
+
+설계 메모, 실험 기록, 세션 인수인계(`PROJECT_CONTEXT.md`, `docs/`)는 로컬 전용이며
+Git에 올리지 않는다. 저장소에 올리는 Markdown은 이 README 하나다.
 
 ## 고정 개발 순서
 
@@ -250,5 +193,5 @@ hash가 달라지므로 예전 데이터의 hash를 고치지 말고 새 버전�
 Environment -> Expert -> Demonstrations -> BC -> Evaluation -> PPO
 ```
 
-최종 목표는 planar-base 데모가 아니라 실제 G1 whole-body locomotion과
+최종 목표는 planar-base 데모가 아니라, 실제 G1 whole-body locomotion과
 manipulation이 결합된 recovery mission이다.
