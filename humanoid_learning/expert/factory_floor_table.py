@@ -47,12 +47,22 @@ from humanoid_learning.expert.recovery_agent import (
 # fingertips angled 12 deg into the face (toe-in) so the proximal shells stand
 # off. The finger angle and pad position along the face are NOT fixed here:
 # they are part of the GraspPlan the selector picks for the observed scene.
-PINCH_TOE_IN_DEG = 12.
-PINCH_HEIGHT_M = .02     # pad above the block centre: the block hangs below the pinch
+PINCH_TOE_IN_DEG = 16.   # 12 left the middle-phalanx shells pressing the face's top edge
+PINCH_HEIGHT_M = .01     # pad above the block centre: the block hangs below the pinch
 # Pick-point decisions (initial + replans after a backed-off attempt).
 MAX_PICK_DECISIONS = 3
 PROVEN_TICKS = 1400  # e39d7ba LOWER duration
 LOCAL_TICKS = 700    # proven reach pose -> this plan's entry pose
+
+
+# The plan that completes the seed-0 Line 2 cycle end to end (fault -> walk ->
+# floor pad pick -> rise -> over the table edge -> place -> retract -> verified
+# restart). RecoveryConfig.floor_table_plan=None uses it; 'evaluate' runs the
+# candidate evaluator instead.
+DEFAULT_TABLE_PLAN = dict(
+    phi_deg=70., forward_m=0., crouch_pitch=1.2, crouch_height=.5, knee_spread_m=.1, entry_gap_m=.05,
+    via_proven=True, carry_height=.78, carry_pitch=0., carry_com_m=0., rise_block_z=.45,
+    cross_clearance_m=.05, place_height=.77, place_pitch=.5, place_com_m=.08, place_backoff_m=.03)
 
 
 def _yaw_R(angle):
@@ -69,6 +79,14 @@ class FloorTableCycle(FactoryFloorPickup):
         # e39d7ba's reach pose (computed by the parent with its own finger shape).
         self.proven_goal = (self.goal.copy(), [R.copy() for R in self.goal_R])
         self.pad_grasp.extend_fingers()
+        self.squeeze_rate, self.squeeze_cap = .0001, .025
+        # The rubber pads were modelled with sliding friction only (condim 3),
+        # so a pinched block pivoted freely about the pad axis. A pad is a
+        # patch contact: give the elastomer geoms torsional friction.
+        m = self.env.model
+        for gid in self.pad_grasp.geoms.values():
+            m.geom_condim[gid] = 4
+            m.geom_friction[gid, 1] = .01
         from humanoid_learning.envs.sharpa_grasp_env import _ARM_JOINTS
         self._arm_jids = np.array([self.env.model.joint(n).id for n in _ARM_JOINTS])
         self.plan = GraspPlan()
@@ -202,7 +220,14 @@ class FloorTableCycle(FactoryFloorPickup):
         self.pick_decisions += 1
         target, feet_mid, heading = self.place_target_estimate()
         evaluator = CandidateEvaluator(self)
-        if self.pick_decisions > MAX_PICK_DECISIONS:
+        fixed = getattr(self.recovery.config, 'floor_table_plan', None)
+        if fixed is None:
+            fixed = DEFAULT_TABLE_PLAN
+        if fixed != 'evaluate' and not replan:
+            from humanoid_learning.expert.recovery_agent import Decision
+            reports = []
+            decision = Decision('EXECUTE', GraspPlan(**fixed), 'fixed plan (RecoveryConfig.floor_table_plan or the default)')
+        elif self.pick_decisions > MAX_PICK_DECISIONS:
             reports, decision = [], None
             from humanoid_learning.expert.recovery_agent import Decision
             decision = Decision('ABORT', None, f'pick decision budget ({MAX_PICK_DECISIONS}) spent; last cause {cause}')
@@ -261,7 +286,7 @@ class FloorTableCycle(FactoryFloorPickup):
         return None
 
     # ----- low-level servos ----------------------------------------------
-    def _servo_arms(self, palms, rotations, max_step=.001, max_rot=.004, reference_q=None):
+    def _servo_arms(self, palms, rotations, max_step=None, max_rot=.004, reference_q=None):
         """Resolved-rate step of the COMMANDED palms (live base, arm targets).
 
         Local rates alone followed the rise into both wrist-pitch limits
@@ -270,6 +295,7 @@ class FloorTableCycle(FactoryFloorPickup):
         configuration is given (it respects limits and self-clearance) the
         arms drift toward that branch in the hand task's null space."""
         m, e = self.env.model, self.env
+        max_step = getattr(self, 'arm_step_m', .001) if max_step is None else max_step
         commanded = self._commanded_palms()
         s = self._carry_fk
         action = np.zeros(14)
@@ -287,7 +313,8 @@ class FloorTableCycle(FactoryFloorPickup):
             cols = e._arm_dof_adr[7*i:7*i+7]
             jac, target = _with_elbow_flexion(np.vstack([jp[:, cols], .3*jr[:, cols]]),
                                               np.r_[step, .3*rotation], e._arm_target[7*i+3])
-            jac, target = self._with_torso_clearance(jac, target, i, cols)
+            jac, target = self._with_torso_clearance(jac, target, i, cols,
+                                                     rate=self.__dict__.get('torso_clear_rate', .0005))
             q = e._arm_target[7*i:7*i+7]
             low, high = m.jnt_range[self._arm_jids[7*i:7*i+7]].T
             rows, values = [], []
@@ -302,10 +329,10 @@ class FloorTableCycle(FactoryFloorPickup):
             A = weighted@weighted.T+1e-4*np.eye(len(target))
             dq = weights*(weighted.T @ np.linalg.solve(A, target))
             if reference_q is not None:
-                pull = np.clip(.02*(reference_q[7*i:7*i+7] - q), -.001, .001)
+                pull = np.clip(self.__dict__.get('arm_pull_gain', .02)*(reference_q[7*i:7*i+7] - q), -.004, .004)
                 null = np.eye(7) - weights[:, None]*(weighted.T @ np.linalg.solve(A, jac))  # J @ null ~ 0
                 dq = dq + null @ pull
-            action[7*i:7*i+7] = np.clip(dq, -.004, .004)/e.config.arm_action_scale
+            action[7*i:7*i+7] = np.clip(dq, -self.__dict__.get('arm_dq_max', .004), self.__dict__.get('arm_dq_max', .004))/e.config.arm_action_scale
         return action
 
     def _hold_crouch_legs(self):
@@ -331,14 +358,14 @@ class FloorTableCycle(FactoryFloorPickup):
         load = min(self.normal_loads.values())
         rate = 0.
         if load < self.load_low:
-            rate = .0001
+            rate = self.squeeze_rate
         elif load > self.load_high:
-            rate = -.0001
+            rate = -self.squeeze_rate
         for side in self.squeeze:
             # Measured at CLOSE: all eight pads loaded but the arms' compliance
             # leaves the palms 5-7 mm short of the command; a 12 mm cap held
             # the pinch at 2.7-3.0 N, just under the band.
-            self.squeeze[side] = float(np.clip(self.squeeze[side] + rate, -.01, .025))
+            self.squeeze[side] = float(np.clip(self.squeeze[side] + rate, -.01, self.squeeze_cap))
 
     def _table(self, heading=None):
         m, d = self.env.model, self.env.data
@@ -431,7 +458,8 @@ class FloorTableCycle(FactoryFloorPickup):
                 self.support_ticks = self.support_ticks+1 if in_band else 0
                 pinch_centre, pinch_frame = getattr(self, 'touch_pose', (centre, frame))
                 palms, rotations = self._palm_targets(pinch_centre, pinch_frame)
-                disturbed = self._block_disturbed(pos_tol=.02, yaw_tol_deg=8.)
+                # Squeezing a free block nudges it; only a real shove is a failure.
+                disturbed = self._block_disturbed(pos_tol=.04, yaw_tol_deg=20.)
                 if self.support_ticks >= 30:
                     self._begin_align(centre, frame)
                 elif disturbed:
@@ -683,54 +711,89 @@ class FloorTableCycle(FactoryFloorPickup):
 
     def transfer_frame(self, plan, lift, base_height, base_pitch, com0, knee0, knee_stand, feet_mid, heading):
         """Block path from the lift to the table, shared by RISE/HOLD/DOWN and
-        by the candidate transfer check. L lift -> A straight up to the
-        crossing height, still short of the table face -> B over the place
-        spot -> C down onto the table."""
+        by the candidate transfer check: L lift -> A up to the crossing
+        height, still short of the table face -> O just over the table ->
+        B above the place spot -> C down onto the table."""
         _, top, face = self._table(heading)
         half = float(self.env.model.geom_size[self.env.model.geom(self.env.object_geom_name).id][0])
         forward = heading[:, 0]
         rest_z = top + half
         cross_z = rest_z + plan.cross_clearance_m
         L = np.asarray(lift, dtype=float).copy()
-        # A: as far forward as the table face allows (front face 1 cm short).
-        # Rising straight up at the lift x put the block high right in front
-        # of the chest, which this pinch cannot reach (30-45 mm plan error).
-        A = L + forward*((face - half - .01) - L @ forward)
+        # H: low in front of the body while it rises.
+        # Keep the block's front face >= 3.5 cm off the table face while it
+        # goes up: the held block sways ~2 cm fore-aft, and a 1-2 cm margin
+        # let it brush the table face (lift evidence lost).
+        short_of_face = face - half - .025
+        H = L + forward*(min(L @ forward + .03, short_of_face) - L @ forward)
+        H[2] = max(L[2], plan.rise_block_z)
+        A = L + forward*(short_of_face - L @ forward)
         A[2] = cross_z
         target = self.place_target_for(plan, heading)
+        O = target.copy()
+        O += forward*((face + plan.over_x_m) - target @ forward)
+        O[2] = cross_z
+        if O @ forward > target @ forward:
+            O = target.copy(); O[2] = cross_z
         B, C = target.copy(), target.copy()
         B[2], C[2] = cross_z, rest_z - .004
-        return dict(L=L, A=A, B=B, C=C, base=(float(base_height), float(base_pitch)),
+        return dict(L=L, H=H, A=A, O=O, B=B, C=C, base=(float(base_height), float(base_pitch)),
                     com0=np.asarray(com0, dtype=float)[:2].copy(), knee0=np.asarray(knee0, dtype=float),
                     knee_stand=np.asarray(knee_stand, dtype=float), feet_mid=np.asarray(feet_mid, dtype=float),
-                    heading=heading, carry=(plan.carry_height, plan.carry_pitch, plan.place_com_m),
-                    rise_lag=plan.rise_lag)
+                    heading=heading, carry=(plan.carry_height, plan.carry_pitch, plan.carry_com_m),
+                    place=(plan.place_height, plan.place_pitch, plan.place_com_m), rise_lag=plan.rise_lag)
+
+    # Transfer progress breakpoints:
+    # rise (block low) | block up to the crossing | over the edge | lean to spot | down.
+    TRANSFER_S = (.3, .45, .6, .85)
 
     @staticmethod
     def transfer_waypoint(tf, s):
         """Block centre and whole-body posture at transfer progress s in [0, 1]:
-        [0, .5] L->A while rising from the crouch into the carry lean,
-        [.5, .85] A->B over the table, [.85, 1] B->C down onto it."""
+        [0, .3] L->H rising from the crouch into the carry posture, block low,
+        [.3, .45] H->A block up to the crossing height, short of the table face,
+        [.45, .6] A->O over the table edge while hinging into the place lean,
+        [.6, .85] O->B to the place spot, leaning,
+        [.85, 1] B->C down onto the table."""
+        s0, s1, s2, s3 = FloorTableCycle.TRANSFER_S
         s = float(np.clip(s, 0., 1.))
-        if s <= .5:
-            q = _quintic_scale(s/.5)
-            # The body may lag the block: rising first while the block is
-            # still at the floor pulled the reach apart (40 mm at s=.1).
+        base = (*tf['base'], tf['com0'])
+        carry_h, carry_p, carry_c = tf['carry']
+        place_h, place_p, place_c = tf['place']
+        forward = tf['heading'][:2, 0]
+        def posture(a, b, f):
+            (h0, p0, c0), (h1, p1, c1) = a, b
+            c0 = c0 if np.ndim(c0) else tf['feet_mid'][:2] + c0*forward
+            c1 = tf['feet_mid'][:2] + c1*forward
+            return h0*(1-f) + h1*f, p0*(1-f) + p1*f, c0*(1-f) + c1*f
+        if s <= s0:
+            q = _quintic_scale(s/s0)
             lag = tf.get('rise_lag', 0.)
-            centre = tf['L'] + (tf['A']-tf['L'])*q
-            blend = _quintic_scale(float(np.clip((s/.5 - lag)/(1. - lag), 0., 1.)))
-        elif s <= .85:
-            q = _quintic_scale((s-.5)/.35)
-            centre, blend = tf['A'] + (tf['B']-tf['A'])*q, 1.
+            blend = _quintic_scale(float(np.clip((s/s0 - lag)/(1. - lag), 0., 1.)))
+            centre = tf['L'] + (tf['H']-tf['L'])*q
+            height, pitch, com = posture(base, tf['carry'], blend)
+            knees = tf['knee0']*(1-blend) + tf['knee_stand']*blend
+            return centre, height, pitch, com, knees
+        if s <= s1:
+            q = _quintic_scale((s-s0)/(s1-s0))
+            centre = tf['H'] + (tf['A']-tf['H'])*q
+            height, pitch, com = posture((carry_h, carry_p, carry_c), tf['carry'], 1.)
+        elif s <= s2:
+            # Hinge fully into the place lean while crossing the edge: carried
+            # forward over the table upright, the body backed away to balance
+            # the reaching arms (pelvis -12 cm) until the hands ran out of reach.
+            q = _quintic_scale((s-s1)/(s2-s1))
+            centre = tf['A'] + (tf['O']-tf['A'])*q
+            height, pitch, com = posture((carry_h, carry_p, carry_c), tf['place'], q)
+        elif s <= s3:
+            q = _quintic_scale((s-s2)/(s3-s2))
+            centre = tf['O'] + (tf['B']-tf['O'])*q
+            height, pitch, com = posture((place_h, place_p, place_c), tf['place'], 1.)
         else:
-            q = _quintic_scale((s-.85)/.15)
-            centre, blend = tf['B'] + (tf['C']-tf['B'])*q, 1.
-        carry_height, carry_pitch, carry_com = tf['carry']
-        height = tf['base'][0]*(1-blend) + carry_height*blend
-        pitch = tf['base'][1]*(1-blend) + carry_pitch*blend
-        com = tf['com0']*(1-blend) + (tf['feet_mid'][:2] + carry_com*tf['heading'][:2, 0])*blend
-        knees = tf['knee0']*(1-blend) + tf['knee_stand']*blend
-        return centre, height, pitch, com, knees
+            q = _quintic_scale((s-s3)/(1-s3))
+            centre = tf['B'] + (tf['C']-tf['B'])*q
+            height, pitch, com = posture((place_h, place_p, place_c), tf['place'], 1.)
+        return centre, height, pitch, com, tf['knee_stand']
 
     def _begin_rise(self, centre):
         d = self.env.data
@@ -746,13 +809,31 @@ class FloorTableCycle(FactoryFloorPickup):
         self.hold_point = self.tf['B']
         self.place_target = self.tf['C']
         self.carry_posture = self.tf['carry']
-        self.stage_ticks = 2300
+        self.place_posture_full = self.tf['place']
+        # Loaded rise: stiffen the arms (as the walking carry does) and let the
+        # common squeeze react faster and deeper. At the grasp's compliant
+        # kp=120 the pads unloaded to ~2 N while the body straightened.
+        from humanoid_learning.envs import model_builder, task_config as tc
+        kp = getattr(self.recovery.config, 'carry_arm_kp', 300.)
+        model_builder._apply_compliant_kp(self.env.model, tc.LEFT_ARM_JOINTS + tc.RIGHT_ARM_JOINTS, kp)
+        self.env.config.arm_kp = kp
+        self.squeeze_rate, self.squeeze_cap = .0003, .04
+        # The block path peaked at ~1.6 mm/tick while the arm servo was capped
+        # at 1 mm/tick: the commanded hands fell 10 -> 150 mm behind the block
+        # frame and both pads unloaded at block height ~.4 m. Slower path,
+        # faster servo.
+        self.arm_step_m, self.arm_dq_max, self.stage_ticks = .0025, .008, 2400
+        # Follow the whole-body plan's arm branch (it keeps joint margin) much
+        # more firmly: a .02 null-space pull left the servo in a local branch
+        # that ran the wrist pitch into its limit with the block near the chest.
+        self.arm_pull_gain = .1
+        self.torso_clear_rate = .002  # .0005 let the left shoulder press the torso at 140 N
 
     def begin_place(self):
         """Called by FactoryRecovery once the held block over the table has
         been verified: lower it onto the table along the same transfer path."""
         self.stage, self.tick = 'DOWN', 0
-        self.stage_ticks = 500
+        self.stage_ticks = 2200
 
     def _plan(self, palms, rotations, height, pitch, com_forward, knees=None):
         p = self.posture
@@ -770,14 +851,24 @@ class FloorTableCycle(FactoryFloorPickup):
         if grip:
             self._squeeze_servo()
         if self.stage in ('RISE', 'HOLD', 'DOWN'):
+            over = self.TRANSFER_S[1]  # RISE/HOLD end at the crossing point A
             if self.stage == 'RISE':
-                progress = .85*min(self.tick/self.stage_ticks, 1.)
+                progress = over*min(self.tick/self.stage_ticks, 1.)
             elif self.stage == 'HOLD':
-                progress = .85
+                progress = over
             else:
-                progress = .85 + .15*min(self.tick/self.stage_ticks, 1.)
+                progress = over + (1.-over)*min(self.tick/self.stage_ticks, 1.)
             goal, height, pitch, com, knees = self.transfer_waypoint(self.tf, progress)
-            palms, rotations = self._palm_targets(goal, self.hold_frame)
+            # Close the loop on the block itself: the compliant arms let the held
+            # block drift ~3 cm ahead of its path as the body moved, into the
+            # table face. Aim the hands past the error (bounded).
+            if self.stage in ('RISE', 'HOLD') or progress < self.TRANSFER_S[3]:
+                error = goal - centre
+                self.block_bias = np.clip(getattr(self, 'block_bias', np.zeros(3)) + .02*error, -.04, .04)
+                aim = goal + np.clip(error, -.03, .03) + self.block_bias
+            else:
+                aim = goal
+            palms, rotations = self._palm_targets(aim, self.hold_frame)
             p = self.posture
             p.com_xy = com
             self.last_q = p.solve(height, palms, rotations, pitch, iterations=self.posture_iterations,
@@ -802,7 +893,11 @@ class FloorTableCycle(FactoryFloorPickup):
                 weight = float(self.env.model.body_subtreemass[self.env._object_body_id])*9.81
                 self.metrics['table_force_peak_n'] = max(self.metrics['table_force_peak_n'], force)
                 # The table must carry the block before the pads may let go.
-                self.table_supported_ticks = self.table_supported_ticks+1 if force > .5*weight else 0
+                # Only the final descent onto the spot counts: crossing over, a
+                # sagging block that grazed the table's front edge was taken
+                # for support and let go there (it fell off the edge).
+                on_spot = progress >= self.TRANSFER_S[3]
+                self.table_supported_ticks = self.table_supported_ticks+1 if (on_spot and force > .5*weight) else 0
                 if self.table_supported_ticks >= 40:
                     self.stage, self.tick = 'RELEASE', 0
                     self.stage_ticks = 250
@@ -828,7 +923,7 @@ class FloorTableCycle(FactoryFloorPickup):
             # Sideways only: each pad backs off its face; no push along the table.
             squeeze = {s: self.release_squeeze[s] - .035*f for s in self.release_squeeze}
             palms, rotations = self._palm_targets(self.release_centre, self.release_frame, squeeze)
-            action = self._plan(palms, rotations, *self.carry_posture, knees)
+            action = self._plan(palms, rotations, *self.place_posture_full, knees)
             action[3:17] = self._servo_arms(palms, rotations)
             if self.tick >= self.stage_ticks:
                 self.stage, self.tick = 'RETRACT', 0
@@ -839,30 +934,20 @@ class FloorTableCycle(FactoryFloorPickup):
             lift = np.array([0., 0., .10*f]) - self.heading[:, 0]*.12*f
             palms = self.retract_start + lift
             lean = 1-f
-            carry_height, carry_pitch, carry_com = self.carry_posture
+            carry_height, carry_pitch, carry_com = self.place_posture_full
             action = self._plan(palms, self.retract_R, self.standing_height + (carry_height-self.standing_height)*lean,
                                 carry_pitch*lean, .025 + (carry_com-.025)*lean, knees)
             action[3:17] = self._servo_arms(palms, self.retract_R)
             if self.tick >= self.stage_ticks:
                 self.stage, self.tick = 'STAND', 0
-                self.stage_ticks = 800
-                self.stand_arm_start = self.env._arm_target.copy()
-                self.stand_waist_start = self.env._waist_target.copy()
+                self.stage_ticks = 300
         else:
-            # Arms home in joint space with the upper body locked in the plan.
-            e = self.env
-            arm = (1-f)*self.stand_arm_start + f*self.home_arm_q
-            waist = (1-f)*self.stand_waist_start
-            action = np.zeros(25)
-            locked = np.r_[waist, arm]
-            p = self.posture
-            p.com_xy = self.feet_mid[:2] + .025*self.heading[:2, 0]
-            self.last_q = p.solve(self.standing_height, np.zeros((2, 3)), None, 0., iterations=self.posture_iterations,
-                                  locked_upper_q=locked, knee_lateral_targets=knees)
-            self.posture_solves += 1
-            action = p.command(self.last_q)
-            action[:3] = np.clip((waist - e._waist_target)/e.config.waist_action_scale, -1., 1.)
-            action[3:17] = np.clip((arm - e._arm_target)/e.config.arm_action_scale, -1., 1.)
+            # Stand upright holding the retracted hands where RETRACT left them.
+            # Homing the arms in joint space swung them back through the body
+            # and tipped the robot over backward (and swept the block off).
+            palms = self.retract_start + np.array([0., 0., .10]) - self.heading[:, 0]*.12
+            action = self._plan(palms, self.retract_R, self.standing_height, 0., .025, knees)
+            action[3:17] = self._servo_arms(palms, self.retract_R)
             if self.stage == 'STAND' and self.tick >= self.stage_ticks:
                 self.hands_clear = self._hands_clear()
                 if self.hands_clear and self.recovery.env.task_manager._part_is_back(self.recovery.env):

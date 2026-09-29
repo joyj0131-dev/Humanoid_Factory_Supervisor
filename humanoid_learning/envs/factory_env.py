@@ -371,9 +371,20 @@ class FactoryTaskManager:
         if abs(float(part[2]) - env._part_rest_pos(index)[2]) > 0.05:
             return False
         rotation = env.data.xmat[env._part_body_ids[index]].reshape(3, 3)
-        if rotation[2, 2] < np.cos(0.15):
-            return False
-        yaw = np.arctan2(rotation[1, 0], rotation[0, 0])
+        size = env.model.geom_size[env.model.geom(fcfg.part_geom_name(index)).id]
+        if np.ptp(size) < 1e-9:
+            # An unmarked cube rests the same on any face (a parallel gripper
+            # takes it either way): measure the tilt of whichever axis is
+            # vertical and the yaw of a horizontal one.
+            up = int(np.argmax(np.abs(rotation[2])))
+            if abs(rotation[2, up]) < np.cos(0.15):
+                return False
+            side = (up + 1) % 3
+            yaw = np.arctan2(rotation[1, side], rotation[0, side])
+        else:
+            if rotation[2, 2] < np.cos(0.15):
+                return False
+            yaw = np.arctan2(rotation[1, 0], rotation[0, 0])
         # A cube's quarter-turns are equivalent for this parallel gripper.
         if abs((yaw + np.pi / 4) % (np.pi / 2) - np.pi / 4) > 0.15:
             return False

@@ -69,20 +69,24 @@ def main():
 
         _, feet, heading = cycle.place_target_estimate()
         tf = cycle.transfer_frame(plan, cycle._block()[0], .5, 1.2, feet[:2], np.zeros(2), np.ones(2), feet, heading)
+        s_rise, s_cross, s_over, s_spot = FloorTableCycle.TRANSFER_S
         start, h0, p0, _, k0 = cycle.transfer_waypoint(tf, 0.)
-        cross, _, _, _, _ = cycle.transfer_waypoint(tf, .5)
-        over, _, _, _, _ = cycle.transfer_waypoint(tf, .85)
+        risen, hr, pr, _, kr = cycle.transfer_waypoint(tf, s_rise)
+        cross, _, _, _, _ = cycle.transfer_waypoint(tf, s_cross)
+        over, ho, po, _, _ = cycle.transfer_waypoint(tf, s_over)
+        spot, _, _, _, _ = cycle.transfer_waypoint(tf, s_spot)
         end, h1, p1, _, k1 = cycle.transfer_waypoint(tf, 1.)
-        np.testing.assert_allclose(start, tf['L'], atol=1e-12)
-        np.testing.assert_allclose(cross, tf['A'], atol=1e-12)
-        np.testing.assert_allclose(over, tf['B'], atol=1e-12)
-        np.testing.assert_allclose(end, tf['C'], atol=1e-12)
-        assert (h0, p0) == (.5, 1.2) and (h1, p1) == (plan.carry_height, plan.carry_pitch)
+        for got, key in ((start, 'L'), (risen, 'H'), (cross, 'A'), (over, 'O'), (spot, 'B'), (end, 'C')):
+            np.testing.assert_allclose(got, tf[key], atol=1e-12)
+        assert (h0, p0) == (.5, 1.2)
+        _, hc, pc, _, _ = cycle.transfer_waypoint(tf, s_cross)
+        assert (hr, pr) == (hc, pc) == (plan.carry_height, plan.carry_pitch)   # upright up to the crossing
+        assert (ho, po) == (h1, p1) == (plan.place_height, plan.place_pitch)   # leaning once over the table
         np.testing.assert_allclose(k0, 0.) and np.testing.assert_allclose(k1, 1.)
         _, top, face = cycle._table(heading)
         assert tf['A'] @ heading[:, 0] + .06 <= face + 1e-9   # still short of the table face
         assert tf['A'][2] - .06 >= top                       # bottom above the table top
-        print('PASS transfer path: lift, rise short of the table face, over, down onto the table')
+        print('PASS transfer path: rise with the block low, raise short of the table face, over, lean, down')
 
         evaluator = CandidateEvaluator(cycle)
         evaluator.place_error(plan, None, feet, heading)
@@ -105,6 +109,31 @@ def main():
         np.testing.assert_array_equal(d.qpos, qpos)
         print('PASS decision records keep observation, candidates, choice and the later outcome')
         recovery.close()
+    finally:
+        env.close()
+
+    # Verification treats the unmarked cube by symmetry: any face flat counts,
+    # a real tilt still does not. (Test-only pose writes on a fresh env.)
+    import mujoco
+    from humanoid_learning.envs import factory_config as fc
+    from humanoid_learning.expert.pose_ik import so3_exp
+    env = FactoryEnv()
+    try:
+        env.reset(seed=0, options={'fault_workcell': 1})
+        m, d = env.model, env.data
+        adr = m.jnt_qposadr[m.joint(fc.part_joint_name(1)).id]
+        rest = env._part_rest_pos(1) - np.array([0., 0., .003])  # rest height sits 2 mm above the top
+        def place(R):
+            q = np.zeros(4); mujoco.mju_mat2Quat(q, R.ravel())
+            d.qpos[adr:adr+3] = rest; d.qpos[adr+3:adr+7] = q
+            d.qvel[:] = 0.; mujoco.mj_forward(m, d)
+            return env.task_manager._part_is_back(env)
+        env.task_manager.fault_station = 1
+        assert place(np.eye(3))
+        assert place(so3_exp(np.array([np.pi, 0., 0.])))          # upside down: another flat face
+        assert place(so3_exp(np.array([0., np.pi/2, 0.])))        # on its side
+        assert not place(so3_exp(np.array([np.radians(20.), 0., 0.])))  # tilted
+        print('PASS cube verification accepts any flat face, rejects a tilted cube')
     finally:
         env.close()
 

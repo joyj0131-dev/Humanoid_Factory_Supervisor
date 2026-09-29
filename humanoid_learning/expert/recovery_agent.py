@@ -51,18 +51,30 @@ class GraspPlan:
     # (the verification gate accepts 60 mm).
     place_com_m: float = .07
     place_backoff_m: float = .045
-    # Carry lean held from the rise through the place (pelvis height/pitch)
-    # and the block's bottom clearance over the table edge.
-    carry_height: float = .77
-    carry_pitch: float = .5
+    # Carry posture while the block crosses the table edge. Measured from the
+    # standing pick stance: UPRIGHT (pitch 0) holds the pinched block high
+    # near the body with .32 rad joint margin, while a .5 rad forward lean
+    # ran the same crossing into the arm joint limits.
+    carry_height: float = .76
+    carry_pitch: float = 0.
     cross_clearance_m: float = .03
     rise_lag: float = 0.   # fraction of the lift the body waits before rising
+    # Lean only for the final reach onto the place spot (hip hinge).
+    place_height: float = .77
+    place_pitch: float = .5
+    over_x_m: float = .06  # block beyond the table face where the lean starts
+    # Block height held while the body rises (low and close, where this pinch
+    # keeps wide joint margins); it is raised to the crossing height only once
+    # the body is up.
+    rise_block_z: float = .45
+    carry_com_m: float = .03   # CoM lead while carrying upright (place_com_m only for the place lean)
 
     def key(self):
         return (self.phi_deg, self.forward_m, self.crouch_pitch, self.crouch_height,
                 self.knee_spread_m, self.entry_gap_m, self.via_height_m, self.via_out_m, self.via_proven,
                 self.place_com_m, self.place_backoff_m, self.carry_height, self.carry_pitch, self.cross_clearance_m,
-                self.rise_lag)
+                self.rise_lag, self.place_height, self.place_pitch, self.over_x_m, self.rise_block_z,
+                self.carry_com_m)
 
     def end_key(self):
         return self.key()[:6]
@@ -72,10 +84,11 @@ class GraspPlan:
 
     def place_key(self):
         return (self.phi_deg, self.forward_m, self.place_com_m, self.place_backoff_m,
-                self.carry_height, self.carry_pitch)
+                self.place_height, self.place_pitch)
 
     def transfer_key(self):
-        return self.place_key() + (self.cross_clearance_m, self.rise_lag)
+        return self.place_key() + (self.cross_clearance_m, self.rise_lag, self.carry_height,
+                                   self.carry_pitch, self.over_x_m)
 
 
 @dataclass
@@ -257,7 +270,7 @@ class CandidateEvaluator:
         frame = c.aligned_frame()
         palms, rotations = c._palm_targets(target, frame, {'left': 0., 'right': 0.}, offsets)
         best, posture = float('inf'), None
-        for height, pitch in ((plan.carry_height, plan.carry_pitch),):
+        for height, pitch in ((plan.place_height, plan.place_pitch),):
             p = WholeBodyPosture(self.shaped_env(), c.ik_clearance_m)
             p.com_xy = feet_mid[:2] + plan.place_com_m*heading[:2, 0]
             p.solve(height, palms, rotations, pitch, iterations=150)

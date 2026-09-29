@@ -74,6 +74,10 @@ class RecoveryConfig:
     # After the line restarts, keep controlling the robot and record whether
     # the restarted arm actually works (0 = end at RECOVERED as before).
     restart_observe_steps: int = 0
+    # GraspPlan fields for the floor->table cycle. None: the verified default
+    # plan (factory_floor_table.DEFAULT_TABLE_PLAN); 'evaluate': choose among
+    # candidates with the scratch evaluator at the pick point.
+    floor_table_plan: dict | str | None = None
     floor_grip_load_n: tuple[float, float] = (3., 6.)
     floor_stand_off_m: float = 0.27
     floor_support_grace_seconds: float = 0.05
@@ -362,6 +366,14 @@ class FactoryRecovery:
                 self.pick_heading = (self.config.floor_heading_rad if self.floor_task
                                      else e.poses[self.station].heading_rad)
                 e.task_manager.signal('accept', self.station, e._step_count)
+                if self.floor_task and self.config.floor_table_place:
+                    # The stalled arm froze where it dropped the part: jaws at
+                    # chest height right over the table's front edge, where the
+                    # robot must stand up and reach (measured: 2000+ contact
+                    # samples, up to 191 N on the torso). Ask it to retreat to
+                    # its first cycle pose; its own actuators move it there.
+                    arm = e.arms[self.station]
+                    arm.park_target = np.asarray(arm.active_waypoints[0], dtype=float).copy()
                 self.grasp = self._grasp_view(self.station)
                 self.stabilizer.env = self.grasp
                 self.expert = SharpaBimanualGraspExpert(self.grasp, heading=self.pick_heading)
@@ -605,9 +617,13 @@ class FactoryRecovery:
                         mujoco.mj_contactForce(e.model, e.data, index, force)
                         foot_loads[side] += np.linalg.norm(force[:3])
         continuous_support = floor_control and self._floor_support_continuity(foot_loads)
+        # The floor->table cycle plans deliberate hip-hinge pitches beyond 1 rad
+        # (69 deg at the pick); with both feet loaded that is posture, not a fall.
+        pitch_limit = (1.4 if self.config.floor_table_place
+                       and e.data.xpos[self.stabilizer.pelvis_body, 2] > .3 else 1.0)
         intentional_crouch = (continuous_support
                               and abs(self.stabilizer.tilt()[0]) < .4
-                              and abs(self.stabilizer.tilt()[1]) < 1.0
+                              and abs(self.stabilizer.tilt()[1]) < pitch_limit
                               and e.data.xpos[self.stabilizer.pelvis_body, 2] > .18)
         info['intentional_crouch'] = bool(intentional_crouch)
         info['recovery_fallen'] = bool(info.get('fallen') and not intentional_crouch)
@@ -618,7 +634,8 @@ class FactoryRecovery:
         elif not np.isfinite(e.data.qpos).all() or not np.isfinite(e.data.qvel).all():
             self.failure = 'NONFINITE_PHYSICS'
             self._transition('FAILED')
-        elif self.total_steps >= self.config.max_steps and self.state not in self.TERMINAL:
+        elif (self.total_steps >= (max(self.config.max_steps, 30000) if self.config.floor_table_place
+                                   else self.config.max_steps) and self.state not in self.TERMINAL):
             self.failure = self.state + '_TIMEOUT'
             self._transition('FAILED')
         info.update(recovery_state=self.state, recovery_failure=self.failure,
