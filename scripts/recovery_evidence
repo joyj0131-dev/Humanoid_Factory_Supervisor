@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""Independent PPO evidence recorder. Extensionless to keep the running
+experiment's recursive *.py fingerprint unchanged. Never modifies training.
+
+watch: archive atomic checkpoints and update charts; optionally evaluate after
+the training process exits. record: deterministic policy evaluation, not a
+replay of the stochastic training episode. plot: read-only training-log charts.
+"""
+import argparse
+import csv
+import hashlib
+from io import BytesIO
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT))
+os.environ.setdefault('OPENBLAS_NUM_THREADS','1')
+os.environ.setdefault('OMP_NUM_THREADS','1')
+
+
+def atomic_json(path, obj):
+    path=Path(path);tmp=path.with_suffix(path.suffix+'.tmp')
+    tmp.write_text(json.dumps(obj,ensure_ascii=False,indent=2,default=str));tmp.replace(path)
+
+
+def archive(run):
+    import torch
+    src=run/'policy.pt'
+    if not src.exists():return None
+    # Training atomically renames its checkpoint. An open fd stays on that inode.
+    data=src.read_bytes()
+    ck=torch.load(BytesIO(data),map_location='cpu',weights_only=True)
+    folder=run/'evidence'/'checkpoints';folder.mkdir(parents=True,exist_ok=True)
+    dest=folder/f"step_{ck['steps']:08d}.pt"
+    if not dest.exists():
+        tmp=dest.with_suffix('.tmp');tmp.write_bytes(data);tmp.replace(dest)
+        atomic_json(dest.with_suffix('.json'),dict(steps=ck['steps'],checkpoint_sha256=hashlib.sha256(data).hexdigest(),
+                    source_sha256=ck['source_sha256'],captured_at=time.time()))
+        print('ARCHIVED',dest,flush=True)
+    return dest
+
+
+def rows(path, jsonlines=False):
+    if not path.exists():return []
+    # Ignore incomplete concurrent writes, not entire valid earlier records.
+    text=path.read_text();lines=text.splitlines()
+    if text and not text.endswith('\n'):lines=lines[:-1]
+    if jsonlines:
+        return [json.loads(line) for line in lines if line.strip()]
+    return list(csv.DictReader(lines))
+
+
+def plot_training(run):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    updates=rows(run/'train.csv');episodes=rows(run/'episodes.jsonl',True)
+    folder=run/'evidence';folder.mkdir(parents=True,exist_ok=True)
+    fig,axes=plt.subplots(2,2,figsize=(11,7))
+    for ax,key,title in zip(axes.flat[:3],['reward_mean','loss','approx_kl'],
+                           ['Training reward / policy step','PPO loss (not success)','Policy change (KL)']):
+        if updates:ax.plot([int(r['steps']) for r in updates],[float(r[key]) for r in updates],marker='o',ms=3)
+        else:ax.text(.5,.5,'Waiting for first update',ha='center',transform=ax.transAxes)
+        ax.set_title(title);ax.set_xlabel('Training policy steps');ax.grid(alpha=.25)
+    ax=axes.flat[3]
+    if episodes:
+        successes=[bool(e.get('success',False)) for e in episodes]
+        rate=[100*sum(successes[:i+1])/(i+1) for i in range(len(episodes))]
+        ax.plot(range(1,len(episodes)+1),rate,marker='o');ax.set_ylim(-5,105)
+        ax.set_ylabel('Cumulative success (%)');ax.set_xlabel('Completed training episodes')
+    else:ax.text(.5,.5,'No completed episodes yet\nNot a 0% success estimate',ha='center',transform=ax.transAxes)
+    ax.set_title('Exploratory training episodes, not held-out evaluation');ax.grid(alpha=.25)
+    fig.suptitle(run.name+' | live training log (no reward-term history in this run)')
+    fig.tight_layout();tmp=folder/'learning_curves.tmp.png';fig.savefig(tmp,dpi=130);plt.close(fig)
+    tmp.replace(folder/'learning_curves.png')
+    atomic_json(folder/'status.json',dict(updates=len(updates),latest_steps=int(updates[-1]['steps']) if updates else 0,
+        completed_training_episodes=len(episodes),successful_training_episodes=sum(bool(e.get('success')) for e in episodes),
+        evaluation_success_rate=None,updated_at=time.time()))
+
+
+def reward_terms(env, before, action, reward, terminated):
+    """Reconstruct the UNCHANGED v1 reward from measured state differences.
+    Assert equality: new reward versions must update this independent adapter.
+    These are evaluation rewards, not reconstructed historical training rewards.
+    """
+    import numpy as np
+    from humanoid_learning.reinforcement.recovery_env import MILESTONES
+    after=env._info()
+    terms=dict(time=-.001*(after['physics_steps']-before['physics_steps']),
+        contact=-.01*(after['forbidden_contact_ticks']-before['forbidden_contact_ticks']),
+        magnitude=-.002*float(np.square(action).mean())*(after['residual_ticks']-before['residual_ticks']),
+        smoothness=-.01*float(np.square(action-before['previous_action']).mean()),
+        progress=sum(MILESTONES[s] for s in env.seen-before['seen']),
+        distance=5*(before['distance']-env.previous_distance),
+        outcome=(100. if env._success() else -25.) if terminated else 0.)
+    if not np.isclose(sum(terms.values()),reward,rtol=1e-6,atol=1e-6):
+        raise ValueError(f'reward decomposition mismatch: {sum(terms.values())} vs {reward}')
+    return terms
+
+
+def plot_evaluation(output):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+    data=rows(output/'reward_terms.csv')
+    if not data:return
+    keys=['time','contact','magnitude','smoothness','progress','distance','outcome']
+    fig,axes=plt.subplots(1,2,figsize=(12,4))
+    x=[float(r['sim_seconds']) for r in data]
+    for key in keys:axes[0].plot(x,np.cumsum([float(r[key]) for r in data]),label=key)
+    axes[0].set_title('Evaluation: cumulative reward by term');axes[0].set_xlabel('Simulation seconds');axes[0].legend(fontsize=8)
+    axes[1].bar(keys,[sum(float(r[key]) for r in data) for key in keys]);axes[1].tick_params(axis='x',rotation=40)
+    axes[1].set_title('Evaluation reward totals (not training history)')
+    fig.tight_layout();fig.savefig(output/'reward_breakdown.png',dpi=130);plt.close(fig)
+
+
+def record(args):
+    # Set GL before importing MuJoCo. Does not change the training process env.
+    os.environ['MUJOCO_GL']=args.backend
+    if args.backend=='glfw':
+        os.environ.setdefault('__NV_PRIME_RENDER_OFFLOAD','1')
+        os.environ.setdefault('__GLX_VENDOR_LIBRARY_NAME','nvidia')
+    import torch
+    import numpy as np
+    import mujoco
+    from PIL import Image,ImageDraw,ImageFont
+    from dataclasses import asdict
+    from humanoid_learning.reinforcement.ppo import load_policy,source_fingerprint
+    from humanoid_learning.reinforcement.recovery_env import RecoveryResidualEnv,ResidualConfig
+    torch.set_num_threads(1)
+    out=Path(args.output)
+    if out.exists():raise FileExistsError(out)
+    out.mkdir(parents=True)
+    ck=None
+    if args.checkpoint:
+        raw=Path(args.checkpoint).read_bytes()
+        (out/'evaluated_policy.pt').write_bytes(raw)  # immutable episode-specific copy
+        ck=torch.load(BytesIO(raw),map_location='cpu',weights_only=True)
+        if ck['task']!='recovery' or ck['source_sha256']!=source_fingerprint():
+            raise ValueError('task/source mismatch; recording will not bypass checkpoint validation')
+        cfg=ResidualConfig(**dict(ck['env_config'],start_at_lower=False))
+    elif args.config_from:
+        cfg=ResidualConfig(**dict(json.loads(Path(args.config_from).read_text())['env_config'],start_at_lower=False))
+    else:cfg=ResidualConfig(start_at_lower=False)
+    label='SCRIPTED BASELINE (zero residual)' if ck is None else f"PPO checkpoint {ck['steps']} (deterministic evaluation)"
+    metadata=dict(label=label,seed=args.seed,config=asdict(cfg),camera='fixed_line2_v1',
+        source_sha256=source_fingerprint(),checkpoint_sha256=None if ck is None else hashlib.sha256(raw).hexdigest(),
+        evidence_tool_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        evaluation_mode='independent evaluation, NOT training replay',playback_speed=1.,
+        max_policy_steps=args.max_policy_steps,status='running',started_at=time.time())
+    atomic_json(out/'result.json',metadata)
+    env=RecoveryResidualEnv(cfg);renderer=encoder=None
+    images=[];latest_frame=None;error=None;complete=False
+    try:
+        condition=json.loads(args.condition) if args.condition else None
+        obs,info=env.reset(seed=args.seed,options=dict(condition=condition) if condition else None)
+        metadata.update(condition=getattr(env,'condition',None))
+        policy=None if ck is None else load_policy(out/'evaluated_policy.pt',len(obs),4,'recovery',asdict(cfg))[0]
+        renderer=mujoco.Renderer(env.factory.model,height=480,width=848)
+        camera=mujoco.MjvCamera();camera.lookat[:]=[.35,.85,.65]
+        camera.distance=3.6;camera.azimuth=45.;camera.elevation=-32.
+        dt=env.factory.model.opt.timestep*env.factory.config.frame_skip*cfg.action_repeat
+        fps=1./dt  # one image per policy step; never label sped-up action as real-time
+        metadata.update(fps=fps,resolution=[848,480])
+        encoder=subprocess.Popen(['ffmpeg','-v','error','-y','-f','rawvideo','-pix_fmt','rgb24',
+            '-s','848x480','-r',str(fps),'-i','-','-an','-c:v','libx264','-preset','veryfast',
+            '-pix_fmt','yuv420p',str(out/'evaluation.mp4')],stdin=subprocess.PIPE,
+            stderr=(out/'encoder.log').open('w'))
+        font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',14)
+        def capture(info, outcome='IN PROGRESS'):
+            renderer.update_scene(env.factory.data,camera=camera)
+            image=Image.fromarray(renderer.render());draw=ImageDraw.Draw(image)
+            draw.rectangle((0,0,848,66),fill=(20,23,28))
+            draw.text((10,5),label,font=font,fill='white')
+            draw.text((10,25),f"{args.title or 'seed '+str(args.seed)} | sim {env.factory.data.time:.2f}s | {info['recovery_state']} / {info['floor_stage']}",font=font,fill='white')
+            draw.text((10,45),f"{outcome} | return {info['episode_return']:.2f} | 1x simulation time",font=font,fill=(120,220,220))
+            encoder.stdin.write(np.asarray(image).tobytes());return image
+        latest_frame=capture(info);latest_frame.save(out/'start.png')
+        images.append(out/'start.png');last_phase=None
+        columns=['policy_step','sim_seconds','reward','time','contact','magnitude','smoothness','progress','distance','outcome','state','stage']
+        with (out/'reward_terms.csv').open('w',newline='') as log:
+            writer=csv.DictWriter(log,fieldnames=columns);writer.writeheader()
+            for step in range(args.max_policy_steps or 1000000):
+                action=np.zeros(4) if policy is None else policy.act(obs,True)[0]
+                before=dict(env._info(),previous_action=env.previous_action.copy(),seen=env.seen.copy(),distance=env.previous_distance)
+                obs,reward,term,trunc,info=env.step(action)
+                terms=reward_terms(env,before,action,reward,term)
+                writer.writerow(dict(policy_step=step+1,sim_seconds=env.factory.data.time,reward=reward,
+                    **terms,state=info['recovery_state'],stage=info['floor_stage']));log.flush()
+                ended=term or trunc
+                outcome=('SUCCESS' if info['success'] else 'TIME LIMIT' if trunc else 'FAILED') if ended else 'IN PROGRESS'
+                latest_frame=capture(info,outcome)
+                phase=(info['recovery_state'],info['floor_stage'])
+                if phase!=last_phase:
+                    name=out/f"frame_{info['physics_steps']:06d}_{phase[0]}_{phase[1]}.png"
+                    latest_frame.save(name);images.append(name);last_phase=phase
+                    print('EVALUATION',out.name,step+1,phase,flush=True)
+                if ended:complete=True;break
+        metadata.update(info,complete_episode=complete,status='finished' if complete else 'preview_only',
+                        sim_seconds=float(env.factory.data.time),success=bool(info['success']) if complete else None)
+        if not complete:
+            latest_frame=capture(info,'PREVIEW ONLY - not a completed evaluation')
+        latest_frame.save(out/'final.png');images.append(out/'final.png')
+    except BaseException as exc:
+        metadata.update(status='error',error=repr(exc),success=None,complete_episode=False);error=exc
+    finally:
+        if encoder:
+            encoder.stdin.close();code=encoder.wait()
+            if code and error is None:
+                error=RuntimeError(f'ffmpeg exit {code}')
+                metadata.update(status='error',error=str(error),success=None)
+        if renderer:renderer.close()
+        env.close();metadata['finished_at']=time.time();atomic_json(out/'result.json',metadata)
+    if images:
+        selected=[images[i] for i in np.linspace(0,len(images)-1,min(6,len(images))).astype(int)]
+        sheet=Image.new('RGB',(1272,240*((len(selected)+2)//3)),(245,245,245))
+        for i,path in enumerate(selected):
+            im=Image.open(path);im.thumbnail((424,240));sheet.paste(im,(i%3*424,i//3*240))
+        sheet.save(out/'contact_sheet.png')
+    plot_evaluation(out)
+    if error:raise error
+    print('RECORDED',out,metadata['status'],flush=True)
+
+
+def process_token(pid):
+    try:
+        text=Path(f'/proc/{pid}/stat').read_text().split(') ',1)[1].split()
+        return None if text[0]=='Z' else text[19]
+    except (FileNotFoundError,ProcessLookupError):return None
+
+
+def watch(args):
+    run=Path(args.run);folder=run/'evidence';folder.mkdir(parents=True,exist_ok=True)
+    import fcntl
+    lock=(folder/'watch.lock').open('w')
+    fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)  # no duplicate worker on the same run
+    token=process_token(args.train_pid) if args.train_pid else None
+    started=time.monotonic();reason='watch_timeout'
+    while time.monotonic()-started<args.max_hours*3600:
+        archive(run);plot_training(run)
+        manifest=run/'manifest.json'
+        logs=rows(run/'train.csv')
+        if manifest.exists() and logs:
+            target=json.loads(manifest.read_text())['ppo_config']['total_steps']
+            if int(logs[-1]['steps'])>=target:
+                # csv is flushed immediately before atomic checkpoint replacement.
+                import torch
+                latest=archive(run)
+                if latest and torch.load(latest,map_location='cpu',weights_only=True)['steps']>=target:
+                    reason='training_budget_complete';break
+        if args.train_pid and (token is None or process_token(args.train_pid)!=token):
+            archive(run);plot_training(run);reason='training_process_exited';break
+        time.sleep(args.poll)
+    atomic_json(folder/'watch_result.json',dict(reason=reason,finished_at=time.time()))
+    if args.record_after and reason!='watch_timeout':
+        checkpoints=sorted((folder/'checkpoints').glob('step_*.pt'))
+        if not checkpoints:return
+        picks=list(dict.fromkeys([checkpoints[0],checkpoints[len(checkpoints)//2],checkpoints[-1]]))
+        jobs=[('baseline',None)]+[(p.stem,p) for p in picks]
+        # Sequential, low-priority evaluations only after the trainer is done.
+        for name,checkpoint in jobs:
+            output=folder/'evaluations'/name
+            if output.exists():continue
+            cmd=[sys.executable,str(Path(__file__).resolve()),'record','--output',str(output),
+                 '--seed',str(args.seed),'--backend',args.backend]
+            cmd+=['--checkpoint',str(checkpoint)] if checkpoint else ['--zero','--config-from',str(run/'manifest.json')]
+            result=subprocess.run(cmd,check=False)
+            if result.returncode:print('EVALUATION_FAILED',name,result.returncode,flush=True)
+    print('WATCH_FINISHED',reason,flush=True)
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__);sub=parser.add_subparsers(dest='mode',required=True)
+    p=sub.add_parser('plot');p.add_argument('--run',required=True)
+    w=sub.add_parser('watch');w.add_argument('--run',required=True);w.add_argument('--train-pid',type=int)
+    w.add_argument('--poll',type=float,default=15.);w.add_argument('--max-hours',type=float,default=24.)
+    w.add_argument('--record-after',action='store_true');w.add_argument('--seed',type=int,default=0)
+    w.add_argument('--backend',choices=['egl','glfw'],default='egl')
+    r=sub.add_parser('record');r.add_argument('--output',required=True)
+    g=r.add_mutually_exclusive_group(required=True);g.add_argument('--checkpoint');g.add_argument('--zero',action='store_true')
+    r.add_argument('--config-from');r.add_argument('--seed',type=int,default=0)
+    r.add_argument('--backend',choices=['egl','glfw'],default='egl')
+    r.add_argument('--max-policy-steps',type=int,default=0,help='0=whole episode; positive=labelled preview only')
+    r.add_argument('--condition',help='JSON fixed condition, e.g. {"part_offset_mm":[15,0],"part_mass_scale":1}')
+    r.add_argument('--title',help='condition label drawn on every frame')
+    args=parser.parse_args()
+    if args.mode=='plot':plot_training(Path(args.run))
+    elif args.mode=='watch':
+        if args.poll<=0 or args.max_hours<=0:parser.error('poll and hours must be positive')
+        watch(args)
+    else:
+        if args.max_policy_steps<0:parser.error('negative preview budget')
+        record(args)
+
+if __name__=='__main__':main()
