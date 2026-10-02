@@ -84,6 +84,8 @@ class WholeBodyPosture:
         self.geom_is_robot = robot.copy()
         self.scratch = mujoco.MjData(self.ik_model)
         self.solution = None
+        # Feet carrying load (static feedforward); one foot while stepping.
+        self.support = (0, 1)
         self.last_error = {}
         self.last_command = d.qpos[self.qadr].copy()
         self.command_velocity = np.zeros(len(self.names))
@@ -207,12 +209,12 @@ class WholeBodyPosture:
         bias = np.zeros(m.nv)
         mujoco.mj_rne(m, d, 0, bias)
         contact_jacobians = []
-        for sid in self.feet:
+        for k in self.support:
             jp, jr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
-            mujoco.mj_jacSite(m, d, jp, jr, sid)
+            mujoco.mj_jacSite(m, d, jp, jr, self.feet[k])
             contact_jacobians.append(np.vstack([jp, jr]))
         contact_j = np.vstack(contact_jacobians)
-        scale = np.tile([1., 1., 1., .04, .04, .01], 2)
+        scale = np.tile([1., 1., 1., .04, .04, .01], len(self.support))
         base_balance = contact_j[:, self.cols[:6]].T * scale
         wrench = scale * np.linalg.lstsq(base_balance, bias[self.cols[:6]], rcond=None)[0]
         self.static_torque = bias[self.dadr] - contact_j[:, self.dadr].T @ wrench

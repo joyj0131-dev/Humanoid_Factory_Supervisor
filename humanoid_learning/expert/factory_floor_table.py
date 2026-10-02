@@ -894,6 +894,72 @@ class FloorTableCycle(FactoryFloorPickup):
         self.stage, self.tick = 'DOWN', 0
         self.stage_ticks = 2200
         self.place_press = 0.
+        self.stance_plan = self._plan_stance_step()
+
+    # The stance follows the block on the floor, whose landing varies by
+    # +-8 cm: from a far stance the arms ran into their elbow limits reaching
+    # the place spot and let go, or set the block 7 cm short. Standing with the
+    # block raised short of the table, step both feet (quasi-statically, one at
+    # a time) to the feet-to-table-face distance of the runs that placed well.
+    # Off: in the 3 of 15 full runs that needed >2 cm, the single-support
+    # phases unloaded one pad (11 N / 2 N), dropped the block and tipped the
+    # robot backward; the runs that missed the place spot needed <2 cm.
+    stance_step = False
+    place_stance_m = .39       # feet mid to table face, along the heading
+    STEP_PHASES = (('shift', 400), ('lift', 150), ('move', 250), ('lower', 150), ('settle', 300))
+    stance_plan = None
+
+    def _plan_stance_step(self):
+        if not self.stance_step:
+            return None
+        _, _, face = self._table(self.heading)
+        delta = float(np.clip(face - self.feet_mid @ self.heading[:, 0] - self.place_stance_m, -.10, .10))
+        self.metrics['stance_step_m'] = delta
+        if abs(delta) < .02:
+            return None
+        p = self.posture
+        return dict(delta=delta, foot=0, phase=0, tick=0,
+                    start=[q.copy() for q in p.foot_positions],
+                    mid=.5*(p.foot_positions[0][:2] + p.foot_positions[1][:2]))
+
+    def _stance_step_tick(self):
+        """One tick of the stance step; returns the CoM target, moves the swing foot."""
+        st, p = self.stance_plan, self.posture
+        i = st['foot']
+        j = 1 - i
+        name, ticks = self.STEP_PHASES[st['phase']]
+        st['tick'] += 1
+        f = _quintic_scale(min(st['tick']/ticks, 1.))
+        stance = p.foot_positions[j][:2].copy()
+        start = st['start'][i]
+        moved = start + self.heading[:, 0]*st['delta']
+        moved[2] = start[2]
+        p.support = (j,) if name in ('lift', 'move', 'lower') else (0, 1)
+        if name == 'shift':
+            com = st['mid'] + f*(stance - st['mid'])
+        elif name == 'lift':
+            p.foot_positions[i] = start + np.array([0., 0., .03*f])
+            com = stance
+        elif name == 'move':
+            p.foot_positions[i] = start + (moved - start)*f + np.array([0., 0., .03])
+            com = stance
+        elif name == 'lower':
+            p.foot_positions[i] = moved + np.array([0., 0., .03*(1. - f)])
+            com = stance
+        else:
+            mid = .5*(p.foot_positions[0][:2] + p.foot_positions[1][:2])
+            com = stance + f*(mid - stance)
+        if st['tick'] >= ticks:
+            st['phase'], st['tick'] = st['phase'] + 1, 0
+            if st['phase'] == len(self.STEP_PHASES):
+                st['foot'], st['phase'] = st['foot'] + 1, 0
+                st['mid'] = .5*(p.foot_positions[0][:2] + p.foot_positions[1][:2])
+                if st['foot'] == 2:
+                    self.feet_mid = np.mean(p.foot_positions, axis=0)
+                    self.tf['feet_mid'] = self.feet_mid.copy()
+                    p.support = (0, 1)
+                    self.stance_plan = None
+        return com
 
     # Measured: fingers kept 70 deg below forward drove the wrist pitches into
     # their limits (margin .14 rad) from the crossing raise to the release; the
@@ -901,13 +967,19 @@ class FloorTableCycle(FactoryFloorPickup):
     # relative mass change dropped it. Rolled by -1.2 rad about the lateral
     # axis (fingers toward forward) the wrist margin stayed .35-.42 rad.
     carry_roll_rad = -1.2
+    # Transfer progress over which the roll is undone. Undone while still
+    # reaching out over the table (.45-.85) the palms moved ~10 cm further
+    # forward as the block did: both elbows reached their limits and 2 of 3
+    # such runs let go; undone on the way down (.6-1) 5 of 6 recovered.
+    unroll_s = (.6, 1.)
 
     def _carry_frame(self, progress):
         """Hold frame along the transfer: rolled while the block is raised in
         front of the chest, unrolled over the table so it lands on a face."""
-        s0, s1, _, s3 = self.TRANSFER_S
+        s0, s1, _, _ = self.TRANSFER_S
+        b0, b1 = self.unroll_s
         up = _quintic_scale(float(np.clip((progress - s0)/(s1 - s0), 0., 1.)))
-        back = _quintic_scale(float(np.clip((progress - s1)/(s3 - s1), 0., 1.)))
+        back = _quintic_scale(float(np.clip((progress - b0)/(b1 - b0), 0., 1.)))
         angle = self.carry_roll_rad*up*(1. - back)
         return so3_exp(self.heading[:, 1]*angle) @ self.hold_frame
 
@@ -984,8 +1056,10 @@ class FloorTableCycle(FactoryFloorPickup):
             over = self.TRANSFER_S[1]  # RISE/HOLD end at the crossing point A
             if self.stage == 'RISE':
                 progress = over*min(self.tick/self.stage_ticks, 1.)
-            elif self.stage == 'HOLD':
+            elif self.stage == 'HOLD' or (self.stage == 'DOWN' and self.stance_plan is not None):
                 progress = over
+                if self.stage == 'DOWN':
+                    self.tick = 0  # the place path waits for the stance step
             else:
                 progress = over + (1.-over)*min(self.tick/self.stage_ticks, 1.)
             goal, height, pitch, com, knees = self.transfer_waypoint(self.tf, progress)
@@ -1003,6 +1077,8 @@ class FloorTableCycle(FactoryFloorPickup):
             palms, rotations = self._palm_targets(aim, self._carry_frame(progress))
             p = self.posture
             p.com_xy = com
+            if self.stage == 'DOWN' and self.stance_plan is not None:
+                p.com_xy = self._stance_step_tick()
             self.last_q = p.solve(height, palms, rotations, pitch, iterations=self.posture_iterations,
                                   knee_lateral_targets=knees)
             self.posture_solves += 1
