@@ -62,7 +62,10 @@ LOCAL_TICKS = 700    # proven reach pose -> this plan's entry pose
 DEFAULT_TABLE_PLAN = dict(
     phi_deg=70., forward_m=0., crouch_pitch=1.2, crouch_height=.5, knee_spread_m=.1, entry_gap_m=.05,
     via_proven=True, carry_height=.78, carry_pitch=0., carry_com_m=0., rise_block_z=.45,
-    cross_clearance_m=.05, place_height=.77, place_pitch=.5, place_com_m=.08, place_backoff_m=.03)
+    cross_clearance_m=.05, place_height=.77, place_pitch=.5, place_com_m=.08,
+    # Rolled carry + guarded descent land the block 2-3 cm short of the aim
+    # on their own (12 perturbed runs: -42..-64 mm with a 3 cm backoff).
+    place_backoff_m=0.)
 
 
 def _yaw_R(angle):
@@ -104,6 +107,7 @@ class FloorTableCycle(FactoryFloorPickup):
         self.tilt_deg = 0.
         self.hands_clear = False
         self.table_supported_ticks = 0
+        self.table_yaw = None  # on-table quarter-turn correction before release
         self.metrics = {'align_rotation_deg': None, 'table_force_peak_n': 0.,
                         'max_block_tilt_deg_held': 0.}
 
@@ -286,6 +290,18 @@ class FloorTableCycle(FactoryFloorPickup):
         return None
 
     # ----- low-level servos ----------------------------------------------
+    def _rl_adjust_palms(self, palms):
+        """Optional hand residual shared by whole-body reach and arm servos."""
+        residual = getattr(self, 'rl_hand_residual_m', None)
+        if residual is not None and np.any(residual):
+            self.rl_applied_calls = getattr(self, 'rl_applied_calls', 0) + 1
+            palms = np.array(palms, copy=True)
+            heading = self.recovery.expert.task_rotation
+            for i, side in enumerate(('left', 'right')):
+                palms[i] += heading @ residual[:3]
+                palms[i] += residual[3] * self.recovery.expert._inward_direction(side)
+        return palms
+
     def _servo_arms(self, palms, rotations, max_step=None, max_rot=.004, reference_q=None):
         """Resolved-rate step of the COMMANDED palms (live base, arm targets).
 
@@ -296,6 +312,7 @@ class FloorTableCycle(FactoryFloorPickup):
         arms drift toward that branch in the hand task's null space."""
         m, e = self.env.model, self.env
         max_step = getattr(self, 'arm_step_m', .001) if max_step is None else max_step
+        palms = self._rl_adjust_palms(palms)
         commanded = self._commanded_palms()
         s = self._carry_fk
         action = np.zeros(14)
@@ -332,8 +349,15 @@ class FloorTableCycle(FactoryFloorPickup):
                 pull = np.clip(self.__dict__.get('arm_pull_gain', .02)*(reference_q[7*i:7*i+7] - q), -.004, .004)
                 null = np.eye(7) - weights[:, None]*(weighted.T @ np.linalg.solve(A, jac))  # J @ null ~ 0
                 dq = dq + null @ pull
-            action[7*i:7*i+7] = np.clip(dq, -self.__dict__.get('arm_dq_max', .004), self.__dict__.get('arm_dq_max', .004))/e.config.arm_action_scale
-        return action
+            action[7*i:7*i+7] = dq
+        # One common scale for both arms. Clipping each arm on its own let the
+        # arm that hit the rate limit fall behind the other: the hands' spacing
+        # swung 195-255 mm around the 6 cm block and the pinch slipped.
+        dq_max = self.__dict__.get('arm_dq_max', .004)
+        peak = float(np.abs(action).max())
+        if peak > dq_max:
+            action *= dq_max/peak
+        return action/e.config.arm_action_scale
 
     def _hold_crouch_legs(self):
         """Crouched legs as closed, with the same tilt/CoM feedback as CLOSE."""
@@ -353,19 +377,36 @@ class FloorTableCycle(FactoryFloorPickup):
         self.normal_loads = {side: float(abs(forces[side] @ frame[:, 1])) for side in forces}
         return self.normal_loads
 
+    balanced_squeeze = True
+
     def _squeeze_servo(self):
         """Common squeeze once both pads touch: equal and opposite on a free block."""
-        load = min(self.normal_loads.values())
+        left, right = self.normal_loads['left'], self.normal_loads['right']
+        balanced = self.balanced_squeeze and self.stage in ('RISE', 'HOLD', 'DOWN')
+        # Held off-centre between the hands (1-4 N / 7-21 N), the weaker pad
+        # kept the common squeeze winding up to its cap; the hands then
+        # crushed the block with their finger links (40-60 N) and twisted it
+        # 10-17 deg as they opened. Once lifted: squeeze on the mean load and
+        # shift both hands toward the weaker pad's side instead.
+        load = .5*(left + right) if balanced else min(left, right)
         rate = 0.
         if load < self.load_low:
             rate = self.squeeze_rate
         elif load > self.load_high:
             rate = -self.squeeze_rate
+        shift = {'left': 0., 'right': 0.}
+        offset = getattr(self, 'squeeze_shift', 0.)
+        if balanced and abs(left - right) > 1.:
+            # Bounded: load swings while the grasp rolled wound an unbounded
+            # shift to +40/-10 mm and pushed the block out sideways.
+            step = float(np.clip(offset + self.squeeze_rate*np.sign(right - left), -.01, .01)) - offset
+            self.squeeze_shift = offset + step
+            shift = {'left': step, 'right': -step}
         for side in self.squeeze:
             # Measured at CLOSE: all eight pads loaded but the arms' compliance
             # leaves the palms 5-7 mm short of the command; a 12 mm cap held
             # the pinch at 2.7-3.0 N, just under the band.
-            self.squeeze[side] = float(np.clip(self.squeeze[side] + rate, -.01, self.squeeze_cap))
+            self.squeeze[side] = float(np.clip(self.squeeze[side] + rate + shift[side], -.01, self.squeeze_cap))
 
     def _table(self, heading=None):
         m, d = self.env.model, self.env.data
@@ -414,7 +455,11 @@ class FloorTableCycle(FactoryFloorPickup):
         if self.stage == 'LOWER':
             action = self._lower_step()
             if self.stage == 'LOWER':
-                cause = self._block_disturbed() or self._hand_leg_contact()
+                # Hand-leg gates set on one successful run (2.4 N) tripped 6 of 12
+                # perturbed runs at 11-65 N brushes (the nominal run itself
+                # brushes 10 N); only a real push on the legs aborts now.
+                cause = self._block_disturbed() or self._hand_leg_contact(peak_n=80., sustained_n=25.,
+                                                                           sustained_ticks=50)
                 error = max(self.posture.last_error.get('palm_m', [0.]))
                 self.entry_bad_ticks = self.entry_bad_ticks+1 if error > .02 else 0
                 if cause is None and self.entry_bad_ticks >= 25:
@@ -427,7 +472,7 @@ class FloorTableCycle(FactoryFloorPickup):
                 if len(history) > 20:
                     history.pop(0)
                     swing = float(np.abs(history[-1] - history[0]).max())
-                    if cause is None and swing > .5:
+                    if cause is None and swing > 1.:  # .52-.62 rad swings completed fine
                         cause = f'PLAN_BRANCH_SWITCH(arm joint swing {swing:.2f} rad in 20 ticks)'
                 if cause:
                     self._begin_backoff(cause)
@@ -582,6 +627,7 @@ class FloorTableCycle(FactoryFloorPickup):
 
     def _reach_step(self, palms, rotations, height, pitch, spread):
         """Crouched whole-body reach, exactly as LOWER plans it."""
+        palms = self._rl_adjust_palms(palms)
         p = self.posture
         p.knee_lateral = self.stance_knee_lateral.copy()
         p.foot_rotations = [R.copy() for R in self.stance_foot_rotations]
@@ -664,6 +710,12 @@ class FloorTableCycle(FactoryFloorPickup):
         if self.stage != 'ABORT':
             self.stage, self.tick = 'LOWER', 0
 
+    # Thumb CMC flexion while letting go. At the preshape's 1.05 rad both thumb
+    # tips came to rest on the block's top as the opened hands sagged, and
+    # dragged it 0.3-0.5 rad off square on the way out; extended, 5/5 runs
+    # that had failed that way were verified.
+    release_thumb_fe = -.17
+
     def _finger_and_thumb_commands(self, action):
         e = self.env
         opening = 1.
@@ -674,10 +726,14 @@ class FloorTableCycle(FactoryFloorPickup):
         self.pad_grasp.apply_shape(opening)
         for i in (0, 4):
             action[17+i] = np.clip((.7-e._group_synergy[i])/e.config.hand_synergy_action_scale, -.1, .1)
+        releasing = self.stage in ('RELEASE', 'RETRACT', 'STAND', 'READY_TO_VERIFY')
         for side in sc.SIDES:
             for suffix in sc.preshape_suffixes('thumb'):
                 aid = e.model.actuator(sc.sharpa_actuator(side, 'thumb', suffix)).id
-                e.data.ctrl[aid] = np.clip(sc.PRESHAPE_TARGETS['thumb'][suffix], *e.model.actuator_ctrlrange[aid])
+                target = sc.PRESHAPE_TARGETS['thumb'][suffix]
+                if releasing and suffix == 'CMC_FE' and self.release_thumb_fe is not None:
+                    target = self.release_thumb_fe
+                e.data.ctrl[aid] = np.clip(target, *e.model.actuator_ctrlrange[aid])
 
     def _begin_close(self):
         # super().begin_contact() already latched the crouched legs/hands.
@@ -823,6 +879,9 @@ class FloorTableCycle(FactoryFloorPickup):
         # frame and both pads unloaded at block height ~.4 m. Slower path,
         # faster servo.
         self.arm_step_m, self.arm_dq_max, self.stage_ticks = .0025, .008, 2400
+        # The rolled raise swings the palms ~19 cm round the block while it goes
+        # up 40 cm; in 800 ticks one pad unloaded in 4 of 15 full runs.
+        self.stage_ticks = 3600
         # Follow the whole-body plan's arm branch (it keeps joint margin) much
         # more firmly: a .02 null-space pull left the servo in a local branch
         # that ran the wrist pitch into its limit with the block near the chest.
@@ -834,6 +893,77 @@ class FloorTableCycle(FactoryFloorPickup):
         been verified: lower it onto the table along the same transfer path."""
         self.stage, self.tick = 'DOWN', 0
         self.stage_ticks = 2200
+        self.place_press = 0.
+
+    # Measured: fingers kept 70 deg below forward drove the wrist pitches into
+    # their limits (margin .14 rad) from the crossing raise to the release; the
+    # block twisted 15-40 deg in the pads and a 1 mm hand offset or a 1e-6
+    # relative mass change dropped it. Rolled by -1.2 rad about the lateral
+    # axis (fingers toward forward) the wrist margin stayed .35-.42 rad.
+    carry_roll_rad = -1.2
+
+    def _carry_frame(self, progress):
+        """Hold frame along the transfer: rolled while the block is raised in
+        front of the chest, unrolled over the table so it lands on a face."""
+        s0, s1, _, s3 = self.TRANSFER_S
+        up = _quintic_scale(float(np.clip((progress - s0)/(s1 - s0), 0., 1.)))
+        back = _quintic_scale(float(np.clip((progress - s1)/(s3 - s1), 0., 1.)))
+        angle = self.carry_roll_rad*up*(1. - back)
+        return so3_exp(self.heading[:, 1]*angle) @ self.hold_frame
+
+    def _quarter_yaw_error(self):
+        """Block yaw off the nearest quarter turn, any face up (as verified)."""
+        R = self._block()[1]
+        up = int(np.argmax(np.abs(R[2])))
+        side = (up + 1) % 3
+        yaw = float(np.arctan2(R[1, side], R[0, side]))
+        return (yaw + np.pi/4) % (np.pi/2) - np.pi/4
+
+    # Measured: set down on the spot, the block was still 8-23 deg off the
+    # line's quarter turn (verification allows 8.6 deg) and held 9-16 deg
+    # tilted on one edge after twisting in the pads on the way over; turning
+    # only the yaw left it to drop flat and twist again when the pads opened.
+    # Supported by the table it turns with the pads as it did on the floor at
+    # ALIGN: lay it flat and square before letting go.
+    TABLE_TURN_TOL = .03
+
+    def _table_turn_error(self):
+        """World rotation vector taking the block to the nearest flat face and
+        quarter turn (any face up, as verified)."""
+        R = self._block()[1]
+        up = int(np.argmax(np.abs(R[2])))
+        v = R[:, up]*np.sign(R[2, up])
+        axis = np.cross(v, np.array([0., 0., 1.]))
+        sin = float(np.linalg.norm(axis))
+        tilt = axis/sin*np.arctan2(sin, v[2]) if sin > 1e-9 else np.zeros(3)
+        return tilt - np.array([0., 0., self._quarter_yaw_error()])
+
+    def _table_yaw_step(self):
+        """One tick of the on-table flatten/square turn; True while it runs."""
+        state = self.table_yaw
+        if state is not None and state.get('done'):
+            return False
+        if state is None:
+            error = self._table_turn_error()
+            if np.linalg.norm(error) <= self.TABLE_TURN_TOL:
+                return False
+            state = self.table_yaw = dict(left=error, settle=0, tries=1)
+        self.table_yaw_ticks = getattr(self, 'table_yaw_ticks', 0) + 1
+        remaining = float(np.linalg.norm(state['left']))
+        if remaining > 1e-9:
+            step = state['left']*min(1., .0012/remaining)
+            self.hold_frame = so3_exp(step) @ self.hold_frame
+            state['left'] = state['left'] - step
+            return True
+        state['settle'] += 1
+        if state['settle'] < 60:
+            return True
+        error = self._table_turn_error()
+        if np.linalg.norm(error) > self.TABLE_TURN_TOL and state['tries'] < 3:
+            state.update(left=error, settle=0, tries=state['tries'] + 1)
+            return True
+        self.metrics['table_turn_residual_deg'] = float(np.degrees(np.linalg.norm(error)))
+        return False
 
     def _plan(self, palms, rotations, height, pitch, com_forward, knees=None):
         p = self.posture
@@ -859,6 +989,8 @@ class FloorTableCycle(FactoryFloorPickup):
             else:
                 progress = over + (1.-over)*min(self.tick/self.stage_ticks, 1.)
             goal, height, pitch, com, knees = self.transfer_waypoint(self.tf, progress)
+            if self.stage == 'DOWN':
+                goal = goal - np.array([0., 0., self.place_press])
             # Close the loop on the block itself: the compliant arms let the held
             # block drift ~3 cm ahead of its path as the body moved, into the
             # table face. Aim the hands past the error (bounded).
@@ -868,7 +1000,7 @@ class FloorTableCycle(FactoryFloorPickup):
                 aim = goal + np.clip(error, -.03, .03) + self.block_bias
             else:
                 aim = goal
-            palms, rotations = self._palm_targets(aim, self.hold_frame)
+            palms, rotations = self._palm_targets(aim, self._carry_frame(progress))
             p = self.posture
             p.com_xy = com
             self.last_q = p.solve(height, palms, rotations, pitch, iterations=self.posture_iterations,
@@ -898,13 +1030,28 @@ class FloorTableCycle(FactoryFloorPickup):
                 # for support and let go there (it fell off the edge).
                 on_spot = progress >= self.TRANSFER_S[3]
                 self.table_supported_ticks = self.table_supported_ticks+1 if (on_spot and force > .5*weight) else 0
-                if self.table_supported_ticks >= 40:
+                # Guarded descent: at the end of the path the block hung 0-3 cm
+                # above the table (slipped up in the pads / hands short of the
+                # plan) with no support at all; keep lowering until it lands.
+                if self.tick >= self.stage_ticks and force <= .5*weight:
+                    self.place_press = min(self.place_press + 2e-5, .04)
+                # Dropped on the way over (pads unloaded, block resting on the
+                # table): measured, the hands kept descending and pressed the
+                # loose block at 30-65 N until the robot tipped over. Let go.
+                loose = max(loads.values()) < .5 and force > .5*weight
+                self.loose_ticks = getattr(self, 'loose_ticks', 0) + 1 if loose else 0
+                if self.loose_ticks >= 30:
+                    self.table_supported_ticks = max(self.table_supported_ticks, 40)
+                    self.table_yaw = dict(done=True)
+                if self.table_supported_ticks >= 40 and self._table_yaw_step():
+                    pass  # still turning the supported block onto a quarter turn
+                elif self.table_supported_ticks >= 40:
                     self.stage, self.tick = 'RELEASE', 0
                     self.stage_ticks = 250
                     self.release_frame = self.hold_frame.copy()
                     self.release_centre = goal.copy()
                     self.release_squeeze = dict(self.squeeze)
-                elif self.tick >= self.stage_ticks + 400:
+                elif self.tick >= self.stage_ticks + 2400 + getattr(self, 'table_yaw_ticks', 0):
                     self.failure = 'PLACE_SUPPORT_NOT_ESTABLISHED'
         else:
             action = self._release_stage(f, knees)
@@ -918,21 +1065,68 @@ class FloorTableCycle(FactoryFloorPickup):
         self.tilt_deg = float(np.degrees(np.arccos(np.clip(np.max(np.abs(R[2])), -1., 1.))))
         return action
 
+    # Retracted hands relative to the release pose (up, back toward the body).
+    # Up .10/back .12 left the hands 0-8 cm from the restarted industrial arm,
+    # which struck the left hand at 20-64 N and knocked the robot over.
+    retract_up_m, retract_back_m = .02, .25
+    retract_lower_m = .15  # STAND: hands down out of the arm's reach
+    stand_back_m = .10  # STAND: further back so the fingertips clear the table face
+    retract_clear_m = .08  # RETRACT: straight-up clearance before moving back
+    release_open_m = -.035  # pad gap at the end of RELEASE (negative = open)
+
+    def _hand_object_force(self):
+        m, d = self.env.model, self.env.data
+        hands = SharpaContactLift.hand_wrist_body_ids(self.env)
+        hand_ids = hands['left'] | hands['right']
+        obj = self.env._object_body_id
+        total = 0.
+        for i, c in enumerate(d.contact[:d.ncon]):
+            bodies = {int(m.geom_bodyid[c.geom1]), int(m.geom_bodyid[c.geom2])}
+            if obj in bodies and bodies & hand_ids:
+                f = np.zeros(6)
+                mujoco.mj_contactForce(m, d, i, f)
+                total += abs(f[0])
+        return total
+
     def _release_stage(self, f, knees):
         if self.stage == 'RELEASE':
             # Sideways only: each pad backs off its face; no push along the table.
-            squeeze = {s: self.release_squeeze[s] - .035*f for s in self.release_squeeze}
-            palms, rotations = self._palm_targets(self.release_centre, self.release_frame, squeeze)
+            # Open to a fixed gap, not by a fixed amount: the common squeeze had
+            # wound up to its 40 mm cap on a lopsided pinch (2 N / 10 N), a 35 mm
+            # opening still pressed the block at 7-9 N and the retract carried
+            # it 17 cm off the spot.
+            extra = max(0., self.tick - self.stage_ticks)/200.
+            squeeze = {s: self.release_squeeze[s] + (self.release_open_m - self.release_squeeze[s])*f
+                       - .02*min(extra, 1.) for s in self.release_squeeze}
+            # And lift clear: opened sideways only, a finger link stayed on the
+            # block's top at 6-20 N and dragged it 7-23 deg off square.
+            centre = self.release_centre + np.array([0., 0., .015*f])
+            palms, rotations = self._palm_targets(centre, self.release_frame, squeeze)
             action = self._plan(palms, rotations, *self.place_posture_full, knees)
             action[3:17] = self._servo_arms(palms, rotations)
-            if self.tick >= self.stage_ticks:
+            touching = self._hand_object_force() > .5
+            self.release_free_ticks = 0 if touching else getattr(self, 'release_free_ticks', 0) + 1
+            if self.tick >= self.stage_ticks and (self.release_free_ticks >= 20 or extra >= 2.):
                 self.stage, self.tick = 'RETRACT', 0
                 self.stage_ticks = 500
                 self.retract_start = palms.copy()
                 self.retract_R = rotations
+                # Clear the block by height, not by a fixed lift: hands pressed
+                # down to the table top (guarded descent) lifted 8 cm and swept
+                # it off the table with the fingertips on the way back.
+                need = float(self._block()[0][2]) + .14 - float(np.min(palms[:, 2]))
+                self.retract_lift = max(self.retract_clear_m, need)
         elif self.stage == 'RETRACT':
-            lift = np.array([0., 0., .10*f]) - self.heading[:, 0]*.12*f
-            palms = self.retract_start + lift
+            # Straight up first, then back: the opened hands sagged 5-8 cm
+            # below their command with both thumb tips resting on the block's
+            # top (1-1.5 N); pulled up and back together they dragged it round
+            # by 40 deg.
+            s = min(self.tick/max(self.stage_ticks, 1), 1.)
+            lift = getattr(self, 'retract_lift', self.retract_clear_m)
+            up = (lift*_quintic_scale(min(s/.3, 1.))
+                  - (lift - self.retract_up_m)*_quintic_scale(float(np.clip((s-.8)/.2, 0., 1.))))
+            back = self.retract_back_m*_quintic_scale(float(np.clip((s-.3)/.5, 0., 1.)))
+            palms = self.retract_start + np.array([0., 0., up]) - self.heading[:, 0]*back
             lean = 1-f
             carry_height, carry_pitch, carry_com = self.place_posture_full
             action = self._plan(palms, self.retract_R, self.standing_height + (carry_height-self.standing_height)*lean,
@@ -945,7 +1139,23 @@ class FloorTableCycle(FactoryFloorPickup):
             # Stand upright holding the retracted hands where RETRACT left them.
             # Homing the arms in joint space swung them back through the body
             # and tipped the robot over backward (and swept the block off).
-            palms = self.retract_start + np.array([0., 0., .10]) - self.heading[:, 0]*.12
+            # Then lower them in front of the thighs: the restarted industrial
+            # arm comes down over the canonical spot at 1.0-1.1 m and struck
+            # hands left at chest height (80-170 N) when the block sat forward.
+            # Further back only once upright: pulled 35 cm back while still
+            # rising out of the lean, 4 of 15 runs tipped over in RETRACT.
+            g = f if self.stage == 'STAND' else 1.
+            lower = self.retract_lower_m*g
+            palms = (self.retract_start + np.array([0., 0., self.retract_up_m - lower])
+                     - self.heading[:, 0]*(self.retract_back_m + self.stand_back_m*g))
+            # Not down into the table: with the block set far forward the
+            # retracted hands (fingertips ~14 cm ahead of the palm) were still
+            # over or against it and pressed it at 30-60 N (one run tipped
+            # over sideways).
+            _, top, face = self._table(self.heading)
+            for i in range(2):
+                if palms[i] @ self.heading[:, 0] + .14 > face - .02:
+                    palms[i, 2] = max(palms[i, 2], top + .14)
             action = self._plan(palms, self.retract_R, self.standing_height, 0., .025, knees)
             action[3:17] = self._servo_arms(palms, self.retract_R)
             if self.stage == 'STAND' and self.tick >= self.stage_ticks:
@@ -957,5 +1167,3 @@ class FloorTableCycle(FactoryFloorPickup):
             elif self.stage == 'READY_TO_VERIFY':
                 self.hands_clear = self._hands_clear()
         return action
-
-
