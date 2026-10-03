@@ -76,8 +76,13 @@ def load_policy(path, obs_dim, action_dim, task, env_config):
     if ck['source_sha256']!=source_fingerprint():
         raise ValueError('source fingerprint changed: re-evaluate/retrain as a new experiment')
     # Full-episode evaluation changes reset timing only, not the policy contract.
+    # Run modes (where the episode starts, run-through filming, training-only
+    # skipping) change sampling, not the policy's inputs or actions.
     left,right=dict(ck['env_config']),dict(env_config)
-    for cfg in (left,right):cfg.pop('start_at_lower',None)
+    for cfg in (left,right):
+        for key in ('start_at_lower','skip_inactive','skip_near_table_gap_m'):cfg.pop(key,None)
+        for key,val in cfg.items():
+            if isinstance(val,list):cfg[key]=tuple(val)
     if left!=right:raise ValueError('checkpoint environment configuration mismatch')
     p=ActorCritic(obs_dim,action_dim);p.load_state_dict(ck['policy']);p.eval()
     return p,ck
@@ -216,12 +221,16 @@ def train_parallel(workers, config, output, *, env_config, obs_dim, n_workers, u
         t0=time.monotonic()
         res=workers.evaluate(weights,eval_conditions,seed=config.seed)
         ok=[bool(r['success']) for r in res]
+        reach=[bool(r['success']) for r in res if not r.get('near_table')]
         row=dict(update=update,steps=steps,label=label,success_rate=float(np.mean(ok)),successes=int(sum(ok)),n=len(ok),
+                 reachable_successes=int(sum(reach)),reachable_n=len(reach),
                  wall_seconds=time.monotonic()-t0,results=[dict(condition=r.get('condition_request'),success=r['success'],
                  state=r['recovery_state'],failure=r['failure'],stage=r['floor_stage'],return_=r['episode_return'],
-                 physics_steps=r['physics_steps'],reward_terms=r.get('reward_terms')) for r in res])
+                 physics_steps=r['physics_steps'],reward_terms=r.get('reward_terms'),table_gap_m=r.get('table_gap_m'),
+                 near_table=r.get('near_table'),ended_before_policy=r.get('ended_before_policy')) for r in res])
         with (output/'eval.jsonl').open('a') as f:f.write(json.dumps(row,default=str)+'\n')
-        print(json.dumps(dict(eval=label,update=update,success_rate=row['success_rate'],successes=row['successes'],n=row['n'])),flush=True)
+        print(json.dumps(dict(eval=label,update=update,success_rate=row['success_rate'],successes=row['successes'],n=row['n'],
+                              reachable=f"{row['reachable_successes']}/{row['reachable_n']}")),flush=True)
 
     if not resume and eval_every:
         evaluate(0,'zero_residual_baseline',None)
@@ -236,6 +245,8 @@ def train_parallel(workers, config, output, *, env_config, obs_dim, n_workers, u
                 adv,ret=advantages(b['reward'],b['value'],b['next_value'],b['term'],b['done'],config.gamma,config.gae_lambda)
                 obs.append(b['obs']);raws.append(b['raw']);logps.append(b['logp']);advs.append(adv);rets.append(ret)
                 rewards.append(b['reward']);finished+=b['finished'];skipped+=len(b['skipped'])
+                with (output/'skipped.jsonl').open('a') as sk:
+                    for item in b['skipped']:sk.write(json.dumps(dict(item,update=update))+'\n')
             adv=np.concatenate(advs);adv=(adv-adv.mean())/(adv.std()+1e-8)
             x=torch.as_tensor(np.concatenate(obs),dtype=torch.float32);u=torch.as_tensor(np.concatenate(raws),dtype=torch.float32)
             old=torch.as_tensor(np.concatenate(logps),dtype=torch.float32)

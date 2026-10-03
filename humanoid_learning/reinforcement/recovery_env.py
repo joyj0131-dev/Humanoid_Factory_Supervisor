@@ -13,7 +13,7 @@ from humanoid_learning.envs.factory_config import FactoryConfig
 from humanoid_learning.envs.factory_env import FactoryEnv
 from humanoid_learning.expert.factory_recovery import FactoryRecovery, RecoveryConfig
 
-SCHEMA = 'line2_hand_residual_v2'
+SCHEMA = 'line2_hand_residual_v3'
 STAGES = ('NONE','CROUCH','LOWER','CLOSE','ALIGN','PICK_CLEAR','RISE','HOLD',
           'DOWN','RELEASE','RETRACT','STAND','READY_TO_VERIFY','BACKOFF','ABORT')
 STATES = ('WAIT_FAULT','PREPARE_HANDS','AISLE_APPROACH','TURN','WALK','SETTLE',
@@ -21,6 +21,11 @@ STATES = ('WAIT_FAULT','PREPARE_HANDS','AISLE_APPROACH','TURN','WALK','SETTLE',
 ACTIVE = {'LOWER','CLOSE','ALIGN','PICK_CLEAR','RISE','HOLD','DOWN'}
 MILESTONES = {'CLOSE':2.,'ALIGN':2.,'PICK_CLEAR':3.,'RISE':5.,'DOWN':5.,
               'RELEASE':5.,'RETRACT':3.,'READY_TO_VERIFY':3.}
+TERMS = ('time','contact','magnitude','smoothness','progress','distance','outcome','grip','place','disturb')
+
+
+class SkippedEpisode(RuntimeError):
+    """A training sample outside what the hand residual can change."""
 
 @dataclass
 class ResidualConfig:
@@ -38,6 +43,17 @@ class ResidualConfig:
     # validated on 'smooth' motion; keep the training scene identical.
     part_offset_mm: float = 0.
     motion_profile: str = 'smooth'
+    # v3 (2026-10-03): the residual acts only where v1's failures happened
+    # (carry over the table, set-down, release), the stages before it are run
+    # through inside reset/step, and dense terms score how well it went.
+    # 'v1' with ACTIVE stages and no skipping reproduces the first run's env.
+    reward_version: str = 'v3'
+    active_stages: tuple = ('HOLD','DOWN','RELEASE')
+    skip_inactive: bool = True
+    # Training only: blocks that land this close to the table face (front
+    # face gap, m) make the crouched torso hit the table; no hand offset
+    # changes that. Such seeds are skipped (counted). 0 disables.
+    skip_near_table_gap_m: float = .062
 
     def __post_init__(self):
         if min(self.action_repeat,self.history,self.max_physics_steps)<1:
@@ -46,6 +62,9 @@ class ResidualConfig:
             raise ValueError('invalid smoothing or mass jitter')
         if min(self.position_scale_m,self.squeeze_scale_m)<=0:
             raise ValueError('positive residual scales required')
+        if self.reward_version not in ('v1','v3'):
+            raise ValueError('reward_version must be v1 or v3')
+        self.active_stages=tuple(self.active_stages)
 
 class RecoveryResidualEnv(gym.Env):
     metadata = {'render_modes': []}
@@ -82,15 +101,34 @@ class RecoveryResidualEnv(gym.Env):
         self.seen = set()
         self.done = False
         self.episode_return = 0.
-        self.terms = dict(time=0.,contact=0.,magnitude=0.,smoothness=0.,progress=0.,distance=0.,outcome=0.)
+        self.terms = dict.fromkeys(TERMS,0.)
+        self.last_terms = dict.fromkeys(TERMS,0.)
         self.policy_steps = self.residual_ticks = 0
+        self.table_gap_m = None
+        self.place_scored = set()
+        self.ended_before_policy = False
         if self.config.start_at_lower:
             while self._stage()!='LOWER':
                 self.recovery.step()
                 if self.recovery.state in self.recovery.TERMINAL or self.recovery.total_steps>=self.config.max_physics_steps:
                     raise RuntimeError(f'prefix failed: {self.recovery.state}: {self.recovery.failure}')
-        self.prefix_steps = self.recovery.total_steps
+            self._measure_table_gap()
+            if (not forced and self.config.skip_near_table_gap_m > 0
+                    and self.table_gap_m < self.config.skip_near_table_gap_m):
+                raise SkippedEpisode(f'near table: block front face {self.table_gap_m*1000:.0f} mm from the table')
         self.previous_distance = self._distance()
+        if self.config.start_at_lower and self.config.skip_inactive:
+            # Up to the first stage the residual acts in, with zero residual:
+            # identical to the scripted controller, so not a policy sample.
+            scratch = dict.fromkeys(TERMS,0.)
+            while self._stage() not in self.config.active_stages and not self._ended():
+                self._tick(np.zeros(4),scratch)
+            if self._ended():
+                if not forced:
+                    raise SkippedEpisode(f'failed before the policy window: {self.recovery.failure}')
+                self.ended_before_policy = self.done = True
+            self.previous_distance = self._distance()
+        self.prefix_steps = self.recovery.total_steps
         first = self._frame()
         self.frames.clear()
         self.frames.extend(first.copy() for _ in range(self.config.history))
@@ -100,6 +138,59 @@ class RecoveryResidualEnv(gym.Env):
 
     def _stage(self):
         return getattr(getattr(self.recovery,'floor_pickup',None),'stage','NONE')
+
+    def _ended(self):
+        r = self.recovery
+        return r.state in r.TERMINAL or r.total_steps >= self.config.max_physics_steps
+
+    def _measure_table_gap(self):
+        floor = getattr(self.recovery,'floor_pickup',None)
+        if floor is None:
+            return
+        heading = self.recovery.expert.task_rotation
+        _, _, face = floor._table(heading)
+        centre, _, half = floor._block()
+        self.table_gap_m = float(face - centre @ heading[:, 0] - half[0])
+
+    def _place_score(self, floor):
+        """Block on the spot (position within the 6 cm tolerance, yaw within
+        the 0.15 rad tolerance): 0..10, linear inside the tolerances."""
+        f = self.factory
+        error = float(np.linalg.norm(f.part_position(1)[:2] - f.poses[1].canonical_part_xy))
+        yaw = abs(floor._quarter_yaw_error())
+        return 5*max(0., 1-error/.06) + 5*max(0., 1-yaw/.15)
+
+    def _tick(self, residual, terms, action=None):
+        """One physics tick with the given residual target; accumulates reward terms."""
+        floor = getattr(self.recovery,'floor_pickup',None)
+        stage = self._stage()
+        active = floor is not None and stage in (self.config.active_stages if self.config.reward_version == 'v3' else ACTIVE)
+        target = residual*self.scale if active else np.zeros(4)
+        self.filtered += self.config.smoothing*(target-self.filtered)
+        if floor is not None:
+            floor.rl_hand_residual_m = self.filtered.copy() if active else np.zeros(4)
+        if active and action is not None:
+            self.residual_ticks += 1
+            terms['magnitude'] -= .002*float(np.square(action).mean())
+        before = self.recovery.forbidden_contact_ticks
+        self.recovery.step()
+        terms['time'] -= .001
+        terms['contact'] -= .01*(self.recovery.forbidden_contact_ticks-before)
+        stage = self._stage()
+        if stage in MILESTONES and stage not in self.seen:
+            terms['progress'] += MILESTONES[stage]
+            self.seen.add(stage)
+        if self.config.reward_version == 'v3' and floor is not None:
+            if stage in ('HOLD','DOWN') and getattr(floor,'table_supported_ticks',0) == 0:
+                loads = floor.normal_loads
+                left, right = loads.get('left',0.), loads.get('right',0.)
+                terms['grip'] -= .002*abs(left-right)/max(left+right, 1.)
+            for when in ('RELEASE','STAND'):
+                if stage == when and when not in self.place_scored:
+                    self.place_scored.add(when)
+                    terms['place'] += self._place_score(floor)
+            if stage in ('RETRACT','STAND') and floor._hand_object_force() > .5:
+                terms['disturb'] -= .01
 
     def _distance(self):
         f=self.factory
@@ -133,6 +224,9 @@ class RecoveryResidualEnv(gym.Env):
             prefix_steps=self.prefix_steps,target_distance_m=self._distance(),
             episode_return=self.episode_return,policy_steps=self.policy_steps,residual_ticks=self.residual_ticks,
             condition=getattr(self,'condition',None),reward_terms=dict(getattr(self,'terms',{})),
+            table_gap_m=getattr(self,'table_gap_m',None),
+            near_table=(self.table_gap_m is not None and self.table_gap_m < .062) if getattr(self,'table_gap_m',None) is not None else None,
+            ended_before_policy=getattr(self,'ended_before_policy',False),
             applied_residual_calls=getattr(getattr(r,'floor_pickup',None),'rl_applied_calls',0),
             max_penetration_m=r.max_object_hand_penetration_m,
             forbidden_contact_ticks=r.forbidden_contact_ticks,restart_report=getattr(r,'restart_report',None))
@@ -153,27 +247,15 @@ class RecoveryResidualEnv(gym.Env):
         if action.shape!=(4,) or not np.isfinite(action).all() or np.any(np.abs(action)>1.000001):
             raise ValueError('expected finite bounded action (4,)')
         action=np.clip(action,-1,1)
-        terms=dict(time=0.,contact=0.,magnitude=0.,smoothness=0.,progress=0.,distance=0.,outcome=0.)
+        terms=dict.fromkeys(TERMS,0.)
         for _ in range(self.config.action_repeat):
-            floor=getattr(self.recovery,'floor_pickup',None)
-            active=floor is not None and self._stage() in ACTIVE
-            target=action*self.scale if active else np.zeros(4)
-            self.filtered+=self.config.smoothing*(target-self.filtered)
-            if floor is not None:
-                floor.rl_hand_residual_m=self.filtered.copy() if active else np.zeros(4)
-            if active:
-                self.residual_ticks+=1
-                terms['magnitude']-=.002*float(np.square(action).mean())
-            before=self.recovery.forbidden_contact_ticks
-            self.recovery.step()
-            terms['time']-=.001
-            terms['contact']-=.01*(self.recovery.forbidden_contact_ticks-before)
-            stage=self._stage()
-            if stage in MILESTONES and stage not in self.seen:
-                terms['progress']+=MILESTONES[stage]
-                self.seen.add(stage)
-            if self.recovery.state in self.recovery.TERMINAL or self.recovery.total_steps>=self.config.max_physics_steps:
+            self._tick(action,terms,action)
+            if self._ended():
                 break
+        if self.config.reward_version == 'v3' and self.config.skip_inactive:
+            # Stages the residual does not act in run through inside this step.
+            while not self._ended() and self._stage() not in self.config.active_stages:
+                self._tick(np.zeros(4),terms)
         distance=self._distance()
         terms['distance']=5*(self.previous_distance-distance)
         self.previous_distance=distance
@@ -187,6 +269,7 @@ class RecoveryResidualEnv(gym.Env):
         terms['smoothness']=-.01*float(np.square(action-self.previous_action).mean())
         reward=sum(terms.values())
         for k,v in terms.items():self.terms[k]+=v
+        self.last_terms=terms
         self.previous_action=action.copy()
         self.policy_steps+=1
         self.episode_return+=reward

@@ -84,21 +84,12 @@ def plot_training(run):
 
 
 def reward_terms(env, before, action, reward, terminated):
-    """Reconstruct the UNCHANGED v1 reward from measured state differences.
-    Assert equality: new reward versions must update this independent adapter.
-    These are evaluation rewards, not reconstructed historical training rewards.
-    """
+    """Per-step reward terms. v2+ environments report their own terms; check
+    that they add up to the returned reward. v1 checkpoints are filmed with
+    the code saved next to their run."""
     import numpy as np
-    from humanoid_learning.reinforcement.recovery_env import MILESTONES
-    after=env._info()
-    terms=dict(time=-.001*(after['physics_steps']-before['physics_steps']),
-        contact=-.01*(after['forbidden_contact_ticks']-before['forbidden_contact_ticks']),
-        magnitude=-.002*float(np.square(action).mean())*(after['residual_ticks']-before['residual_ticks']),
-        smoothness=-.01*float(np.square(action-before['previous_action']).mean()),
-        progress=sum(MILESTONES[s] for s in env.seen-before['seen']),
-        distance=5*(before['distance']-env.previous_distance),
-        outcome=(100. if env._success() else -25.) if terminated else 0.)
-    if not np.isclose(sum(terms.values()),reward,rtol=1e-6,atol=1e-6):
+    terms=dict(getattr(env,'last_terms',{}))
+    if not terms or not np.isclose(sum(terms.values()),reward,rtol=1e-6,atol=1e-6):
         raise ValueError(f'reward decomposition mismatch: {sum(terms.values())} vs {reward}')
     return terms
 
@@ -110,7 +101,7 @@ def plot_evaluation(output):
     import numpy as np
     data=rows(output/'reward_terms.csv')
     if not data:return
-    keys=['time','contact','magnitude','smoothness','progress','distance','outcome']
+    keys=[k for k in data[0] if k not in ('policy_step','sim_seconds','reward','state','stage')]
     fig,axes=plt.subplots(1,2,figsize=(12,4))
     x=[float(r['sim_seconds']) for r in data]
     for key in keys:axes[0].plot(x,np.cumsum([float(r[key]) for r in data]),label=key)
@@ -144,10 +135,13 @@ def record(args):
         ck=torch.load(BytesIO(raw),map_location='cpu',weights_only=True)
         if ck['task']!='recovery' or ck['source_sha256']!=source_fingerprint():
             raise ValueError('task/source mismatch; recording will not bypass checkpoint validation')
-        cfg=ResidualConfig(**dict(ck['env_config'],start_at_lower=False))
+        cfg=dict(ck['env_config'])
     elif args.config_from:
-        cfg=ResidualConfig(**dict(json.loads(Path(args.config_from).read_text())['env_config'],start_at_lower=False))
-    else:cfg=ResidualConfig(start_at_lower=False)
+        cfg=dict(json.loads(Path(args.config_from).read_text())['env_config'])
+    else:cfg={}
+    # Film the whole mission one frame per policy step: no run-through steps,
+    # no training-only skipping. The residual still acts only in its stages.
+    cfg=ResidualConfig(**dict(cfg,start_at_lower=False,skip_inactive=False,skip_near_table_gap_m=0.))
     label='SCRIPTED BASELINE (zero residual)' if ck is None else f"PPO checkpoint {ck['steps']} (deterministic evaluation)"
     metadata=dict(label=label,seed=args.seed,config=asdict(cfg),camera='fixed_line2_v1',
         source_sha256=source_fingerprint(),checkpoint_sha256=None if ck is None else hashlib.sha256(raw).hexdigest(),
@@ -183,7 +177,8 @@ def record(args):
             encoder.stdin.write(np.asarray(image).tobytes());return image
         latest_frame=capture(info);latest_frame.save(out/'start.png')
         images.append(out/'start.png');last_phase=None
-        columns=['policy_step','sim_seconds','reward','time','contact','magnitude','smoothness','progress','distance','outcome','state','stage']
+        from humanoid_learning.reinforcement.recovery_env import TERMS
+        columns=['policy_step','sim_seconds','reward',*TERMS,'state','stage']
         with (out/'reward_terms.csv').open('w',newline='') as log:
             writer=csv.DictWriter(log,fieldnames=columns);writer.writeheader()
             for step in range(args.max_policy_steps or 1000000):

@@ -70,6 +70,13 @@ def main():
                              label=f"scripted controller (zero residual) {base[0]['successes']}/{base[0]['n']}")
         if pol:
             ax[1, 0].plot([e['steps'] for e in pol], [100*e['success_rate'] for e in pol], 'o-', label='PPO policy (deterministic)')
+        if 'reachable_n' in evals[0]:
+            rate = lambda e: 100*e['reachable_successes']/max(e['reachable_n'], 1)
+            if base:
+                ax[1, 0].axhline(rate(base[0]), color='gray', ls=':',
+                                 label=f"scripted, hand-fixable conditions {base[0]['reachable_successes']}/{base[0]['reachable_n']}")
+            if pol:
+                ax[1, 0].plot([e['steps'] for e in pol], [rate(e) for e in pol], 's--', label='PPO, hand-fixable conditions')
         ax[1, 0].legend()
     ax[1, 0].set(title=f'Fixed-condition evaluation ({len(names)} conditions)', xlabel='training policy steps',
                  ylabel='success (%)', ylim=(-5, 105))
@@ -108,10 +115,13 @@ def main():
         a.imshow(mat, cmap='RdYlGn', vmin=0, vmax=1, aspect='auto')
         a.set_xticks(range(len(names)), names, rotation=30, ha='right')
         a.set_yticks(range(len(evals)), [f"{e['label']} ({e['successes']}/{e['n']})" for e in evals])
+        for j, r in enumerate(evals[0]['results']):
+            if r.get('near_table'):
+                a.add_patch(plt.Rectangle((j-.5, -.5), 1, len(evals), fill=False, hatch='//', ec='k', lw=0))
         for i, e in enumerate(evals):
             for j, r in enumerate(e['results']):
                 a.text(j, i, 'OK' if r['success'] else (r['failure'] or '')[:10], ha='center', va='center', fontsize=6)
-        a.set_title('Fixed-condition evaluations (green = verified recovery and line restart)')
+        a.set_title('Fixed-condition evaluations (green = verified recovery and line restart; hatched = block near the table)')
         fig.tight_layout()
         fig.savefig(out/'eval_matrix.png', dpi=130)
         plt.close(fig)
@@ -128,6 +138,9 @@ def main():
             ('learning rate', ppo['learning_rate']), ('epochs / batch', f"{ppo['epochs']} / {ppo['batch_size']}"),
             ('gamma / lambda', f"{ppo['gamma']} / {ppo['gae_lambda']}"), ('clip / target KL', f"{ppo['clip']} / {ppo['target_kl']}"),
             ('initial log std', ppo['init_log_std']), ('entropy coef', ppo['entropy_coef']),
+            ('policy window', ', '.join(env.get('active_stages') or []) + (' (other stages run through)' if env.get('skip_inactive') else '')),
+            ('excluded in training', f"blocks < {1000*env.get('skip_near_table_gap_m', 0):.0f} mm from the table face"
+             if env.get('skip_near_table_gap_m') else 'none'),
             ('reward', manifest.get('reward', '')), ('git commit', (manifest.get('git_commit') or '')[:12])]
     import textwrap
     cells = [[k, '\n'.join(textwrap.wrap(str(v), 95))] for k, v in rows]

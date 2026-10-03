@@ -40,7 +40,8 @@ def test_checkpoint_roundtrip_and_contract():
         else:raise AssertionError('action period mismatch accepted')
 
 def test_real_residual():
-    e=RecoveryResidualEnv()
+    # v1 window (from LOWER) to check authority through the whole-body reach too.
+    e=RecoveryResidualEnv(ResidualConfig(reward_version='v1',skip_inactive=False,skip_near_table_gap_m=0.))
     try:
         obs,info=e.reset(seed=0)
         assert e.observation_space.contains(obs) and info['floor_stage']=='LOWER'
@@ -61,7 +62,19 @@ def test_real_residual():
         print('physics contract:',obs.shape,info,flush=True)
     finally:e.close()
 
+def test_v3_window_and_terms():
+    e=RecoveryResidualEnv(ResidualConfig())
+    try:
+        obs,info=e.reset(seed=0,options=dict(condition=dict(part_offset_mm=[0,0],part_mass_scale=1.)))
+        assert info['floor_stage'] in e.config.active_stages and not info['near_table'],info
+        for _ in range(3):
+            obs,reward,t,tr,info=e.step(np.array([.2,0,0,.1]))
+            assert np.isclose(sum(e.last_terms.values()),reward) and np.isfinite(obs).all()
+        assert info['residual_ticks']>0 and not info['success']
+        print('v3 contract:',info['floor_stage'],info['reward_terms'],flush=True)
+    finally:e.close()
+
 if __name__=='__main__':
     tests=[test_timeout_bootstrap,test_rollout_bootstrap,test_policy_bounds_and_update,test_checkpoint_roundtrip_and_contract]
-    if '--physics' in sys.argv:tests.append(test_real_residual)
+    if '--physics' in sys.argv:tests+=[test_real_residual,test_v3_window_and_terms]
     for test in tests:test();print('PASS',test.__name__,flush=True)

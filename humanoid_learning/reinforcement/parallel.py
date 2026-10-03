@@ -88,11 +88,12 @@ def _worker(conn, env_config, worker_id, base_seed, start_episode=0, max_resets=
                     policy = ActorCritic(len(o), 4)
                     policy.load_state_dict(weights)
                     policy.eval()
-                while True:
+                # The scripted stages before the policy window can already end
+                # the episode (e.g. a block near the table): same for any policy.
+                term, trunc, info = env.done, False, env._info()
+                while not (term or trunc):
                     a = np.zeros(4) if weights is None else policy.act(o, deterministic=True)[0]
                     o, _, term, trunc, info = env.step(a)
-                    if term or trunc:
-                        break
                 obs = None  # the interrupted training episode restarts with a new seed
                 episode += 1
                 retire = resets >= max_resets
