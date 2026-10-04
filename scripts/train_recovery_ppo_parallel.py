@@ -45,9 +45,11 @@ def main():
     p.add_argument('--workers', type=int, default=4)
     p.add_argument('--updates', type=int, default=100)
     p.add_argument('--rollout', type=int, default=64, help='policy steps per worker per update')
-    p.add_argument('--reward-version', choices=['v1', 'v3'], default='v3')
+    p.add_argument('--reward-version', choices=['v1', 'v3', 'v4'], default='v4')
+    p.add_argument('--speed-range', type=float, default=.3, help='v4: pace of scripted stages 1 +- this')
     p.add_argument('--active-stages', default='HOLD,DOWN,RELEASE', help='v3: stages the residual acts in')
-    p.add_argument('--skip-near-table-gap-m', type=float, default=.062, help='v3 training: skip blocks this close to the table (0: off)')
+    p.add_argument('--skip-near-table-gap-m', type=float, default=None,
+                   help='skip blocks this close to the table in training (default: .062 for v3, 0 for v4 — the controller now handles them)')
     p.add_argument('--learning-rate', type=float, default=1e-4)
     p.add_argument('--init-log-std', type=float, default=-2.3)
     p.add_argument('--epochs', type=int, default=4)
@@ -63,11 +65,14 @@ def main():
     args = p.parse_args()
     if not 1 <= args.workers <= 6:
         p.error('1-6 workers (each needs ~1.5-2 GB of RAM)')
-    v3 = args.reward_version == 'v3'
+    v3 = args.reward_version in ('v3', 'v4')
+    v4 = args.reward_version == 'v4'
+    skip_gap = args.skip_near_table_gap_m if args.skip_near_table_gap_m is not None else (0. if v4 else .062)
     env_cfg = ResidualConfig(part_offset_mm=args.part_offset_mm, mass_jitter=args.mass_jitter,
                              reward_version=args.reward_version,
                              active_stages=tuple(args.active_stages.split(',')) if v3 else ('HOLD', 'DOWN', 'RELEASE'),
-                             skip_inactive=v3, skip_near_table_gap_m=args.skip_near_table_gap_m if v3 else 0.)
+                             skip_inactive=v3, skip_near_table_gap_m=skip_gap if v3 else 0.,
+                             speed_range=args.speed_range, start_stage='CROUCH' if v4 else 'LOWER')
     ppo = PPOConfig(total_steps=args.updates*args.workers*args.rollout, rollout_steps=args.rollout,
                     epochs=args.epochs, batch_size=args.batch_size, learning_rate=args.learning_rate,
                     seed=args.seed, init_log_std=args.init_log_std)
@@ -80,13 +85,21 @@ def main():
     conditions = [{k: v for k, v in c.items() if k != 'name'} for c in chosen]
     workers = RolloutWorkers(asdict(env_cfg), args.workers, base_seed=10000*(args.seed+1), max_resets=args.max_resets)
     try:
-        obs_dim = 704  # 2 frames x 352 (checked against the env on the first rollout)
+        from humanoid_learning.reinforcement.recovery_env import action_dim
+        n_act = action_dim(env_cfg)
+        obs_dim = 2*(344 + 2*n_act)  # 2 frames: 344 state values + filtered and previous action
         train_parallel(workers, ppo, args.output, env_config=asdict(env_cfg), obs_dim=obs_dim,
                        n_workers=args.workers, updates=args.updates, eval_conditions=conditions,
-                       eval_every=args.eval_every, resume=args.resume, min_free_mb=args.min_free_mb,
+                       eval_every=args.eval_every, resume=args.resume, min_free_mb=args.min_free_mb, action_dim=n_act,
                        extra_manifest=dict(git_commit=commit, command=sys.argv, max_resets=args.max_resets,
                                            eval_condition_names=[c['name'] for c in chosen],
-                                           reward=('v3: v1 terms + grip -0.002*|L-R|/(L+R) per held tick, place 0..10 '
+                                           reward=('v4: +100 verified restart / -50 failure; time -0.004 per tick '
+                                                   'from crouch to verify; collision -0.001*N on pelvis/torso; grip force '
+                                                   '-0.0005*(hand-block N - 20); sway -0.002*|pelvis angular velocity|; '
+                                                   'place 0..10 at set-down and after retract; grip balance; hand-block '
+                                                   'contact while retracting; stage milestones; action size/smoothness. '
+                                                   'Action adds the pace of the scripted stages (1 +- speed range).') if v4 else
+                                                  ('v3: v1 terms + grip -0.002*|L-R|/(L+R) per held tick, place 0..10 '
                                                    'at set-down and again after retract (position within 6 cm, yaw within '
                                                    '0.15 rad), disturb -0.01 per tick of hand-block contact while '
                                                    'retracting. v1: +100 verified restart / -25 failure, first-time stage '

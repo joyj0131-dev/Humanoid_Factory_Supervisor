@@ -155,7 +155,7 @@ def record(args):
         condition=json.loads(args.condition) if args.condition else None
         obs,info=env.reset(seed=args.seed,options=dict(condition=condition) if condition else None)
         metadata.update(condition=getattr(env,'condition',None))
-        policy=None if ck is None else load_policy(out/'evaluated_policy.pt',len(obs),4,'recovery',asdict(cfg))[0]
+        policy=None if ck is None else load_policy(out/'evaluated_policy.pt',len(obs),env.action_space.shape[0],'recovery',asdict(cfg))[0]
         renderer=mujoco.Renderer(env.factory.model,height=480,width=848)
         camera=mujoco.MjvCamera();camera.lookat[:]=[.35,.85,.65]
         camera.distance=3.6;camera.azimuth=45.;camera.elevation=-32.
@@ -182,7 +182,7 @@ def record(args):
         with (out/'reward_terms.csv').open('w',newline='') as log:
             writer=csv.DictWriter(log,fieldnames=columns);writer.writeheader()
             for step in range(args.max_policy_steps or 1000000):
-                action=np.zeros(4) if policy is None else policy.act(obs,True)[0]
+                action=np.zeros(env.action_space.shape[0]) if policy is None else policy.act(obs,True)[0]
                 before=dict(env._info(),previous_action=env.previous_action.copy(),seen=env.seen.copy(),distance=env.previous_distance)
                 obs,reward,term,trunc,info=env.step(action)
                 terms=reward_terms(env,before,action,reward,term)

@@ -52,7 +52,7 @@ def _worker(conn, env_config, worker_id, base_seed, start_episode=0, max_resets=
                 skipped = []
                 if obs is None:
                     obs, skipped = fresh(base_seed + 1000*episode + worker_id)
-                policy = ActorCritic(len(obs), 4)
+                policy = ActorCritic(len(obs), env.action_space.shape[0])
                 policy.load_state_dict(weights)
                 policy.eval()
                 buf = dict(obs=[], raw=[], logp=[], value=[], next_value=[], reward=[], term=[], done=[])
@@ -85,14 +85,14 @@ def _worker(conn, env_config, worker_id, base_seed, start_episode=0, max_resets=
                 weights, condition, seed = arg
                 o, _ = fresh(seed, options=dict(condition=condition))
                 if weights is not None:
-                    policy = ActorCritic(len(o), 4)
+                    policy = ActorCritic(len(o), env.action_space.shape[0])
                     policy.load_state_dict(weights)
                     policy.eval()
                 # The scripted stages before the policy window can already end
                 # the episode (e.g. a block near the table): same for any policy.
                 term, trunc, info = env.done, False, env._info()
                 while not (term or trunc):
-                    a = np.zeros(4) if weights is None else policy.act(o, deterministic=True)[0]
+                    a = np.zeros(env.action_space.shape[0]) if weights is None else policy.act(o, deterministic=True)[0]
                     o, _, term, trunc, info = env.step(a)
                 obs = None  # the interrupted training episode restarts with a new seed
                 episode += 1

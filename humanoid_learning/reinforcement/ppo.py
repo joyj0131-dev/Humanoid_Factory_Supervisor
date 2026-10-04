@@ -185,7 +185,7 @@ def wait_for_memory(min_free_mb, log=print):
 
 
 def train_parallel(workers, config, output, *, env_config, obs_dim, n_workers, updates, eval_conditions,
-                   eval_every=0, checkpoint_every=1, resume=None, extra_manifest=None, min_free_mb=1500):
+                   eval_every=0, checkpoint_every=1, resume=None, extra_manifest=None, min_free_mb=1500, action_dim=4):
     """Collect config.rollout_steps per worker per update in parallel, then PPO.
 
     Writes manifest.json (all parameters), train.csv (per update), episodes.jsonl
@@ -194,7 +194,7 @@ def train_parallel(workers, config, output, *, env_config, obs_dim, n_workers, u
     first) and checkpoints/step_*.pt (never overwritten)."""
     output=Path(output);ck_dir=output/'checkpoints'
     np.random.seed(config.seed);torch.manual_seed(config.seed);torch.set_num_threads(1)
-    policy=ActorCritic(obs_dim,4,config.init_log_std)
+    policy=ActorCritic(obs_dim,action_dim,config.init_log_std)
     optimizer=torch.optim.Adam(policy.parameters(),lr=config.learning_rate)
     steps=episodes=successes=start_update=0
     if resume:
@@ -203,12 +203,12 @@ def train_parallel(workers, config, output, *, env_config, obs_dim, n_workers, u
         steps,episodes,successes,start_update=ck['steps'],ck['episodes'],ck['successes'],ck['update']
     else:
         output.mkdir(parents=True,exist_ok=False);ck_dir.mkdir()
-        manifest=dict(task='recovery',env_config=env_config,ppo_config=asdict(config),obs_dim=obs_dim,action_dim=4,
+        manifest=dict(task='recovery',env_config=env_config,ppo_config=asdict(config),obs_dim=obs_dim,action_dim=action_dim,
                       n_workers=n_workers,updates=updates,samples_per_update=n_workers*config.rollout_steps,
                       eval_every=eval_every,eval_conditions=eval_conditions,source_sha256=source_fingerprint(),
                       created_at=time.time(),**(extra_manifest or {}))
         (output/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2,default=str))
-    base=dict(task='recovery',env_config=env_config,ppo_config=asdict(config),obs_dim=obs_dim,action_dim=4,
+    base=dict(task='recovery',env_config=env_config,ppo_config=asdict(config),obs_dim=obs_dim,action_dim=action_dim,
               source_sha256=source_fingerprint())
     fields=['update','steps','episodes','update_episodes','update_successes','success_rate_update','success_rate_cum',
             'reward_mean','episode_return_mean','policy_loss','value_loss','entropy','clip_frac','approx_kl',
@@ -227,7 +227,12 @@ def train_parallel(workers, config, output, *, env_config, obs_dim, n_workers, u
                  wall_seconds=time.monotonic()-t0,results=[dict(condition=r.get('condition_request'),success=r['success'],
                  state=r['recovery_state'],failure=r['failure'],stage=r['floor_stage'],return_=r['episode_return'],
                  physics_steps=r['physics_steps'],reward_terms=r.get('reward_terms'),table_gap_m=r.get('table_gap_m'),
-                 near_table=r.get('near_table'),ended_before_policy=r.get('ended_before_policy')) for r in res])
+                 near_table=r.get('near_table'),ended_before_policy=r.get('ended_before_policy'),
+                 metrics=r.get('metrics')) for r in res])
+        good=[r['metrics'] for r in res if r['success'] and r.get('metrics')]
+        if good:
+            row['metrics_mean_successful']={k:float(np.mean([g[k] for g in good if g.get(k) is not None]))
+                                            for k in good[0] if any(g.get(k) is not None for g in good)}
         with (output/'eval.jsonl').open('a') as f:f.write(json.dumps(row,default=str)+'\n')
         print(json.dumps(dict(eval=label,update=update,success_rate=row['success_rate'],successes=row['successes'],n=row['n'],
                               reachable=f"{row['reachable_successes']}/{row['reachable_n']}")),flush=True)

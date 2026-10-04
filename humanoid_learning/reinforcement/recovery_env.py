@@ -13,7 +13,7 @@ from humanoid_learning.envs.factory_config import FactoryConfig
 from humanoid_learning.envs.factory_env import FactoryEnv
 from humanoid_learning.expert.factory_recovery import FactoryRecovery, RecoveryConfig
 
-SCHEMA = 'line2_hand_residual_v3'
+SCHEMA = 'line2_hand_residual_v4'
 STAGES = ('NONE','CROUCH','LOWER','CLOSE','ALIGN','PICK_CLEAR','RISE','HOLD',
           'DOWN','RELEASE','RETRACT','STAND','READY_TO_VERIFY','BACKOFF','ABORT')
 STATES = ('WAIT_FAULT','PREPARE_HANDS','AISLE_APPROACH','TURN','WALK','SETTLE',
@@ -21,7 +21,14 @@ STATES = ('WAIT_FAULT','PREPARE_HANDS','AISLE_APPROACH','TURN','WALK','SETTLE',
 ACTIVE = {'LOWER','CLOSE','ALIGN','PICK_CLEAR','RISE','HOLD','DOWN'}
 MILESTONES = {'CLOSE':2.,'ALIGN':2.,'PICK_CLEAR':3.,'RISE':5.,'DOWN':5.,
               'RELEASE':5.,'RETRACT':3.,'READY_TO_VERIFY':3.}
-TERMS = ('time','contact','magnitude','smoothness','progress','distance','outcome','grip','place','disturb')
+TERMS = ('time','contact','magnitude','smoothness','progress','distance','outcome','grip','place','disturb',
+         'collision','grip_force','stability')
+POLICY_STAGES_V4 = ('CROUCH','LOWER','CLOSE','ALIGN','PICK_CLEAR','RISE','HOLD','DOWN','RELEASE','RETRACT','STAND')
+
+
+def action_dim(config):
+    """4 hand terms (xyz offset, squeeze); v4 adds the pace of the scripted stages."""
+    return 5 if config.reward_version == 'v4' else 4
 
 
 class SkippedEpisode(RuntimeError):
@@ -54,6 +61,14 @@ class ResidualConfig:
     # face gap, m) make the crouched torso hit the table; no hand offset
     # changes that. Such seeds are skipped (counted). 0 disables.
     skip_near_table_gap_m: float = .062
+    # v4 (2026-10-04): optimize the whole floor->table flow, not only success.
+    # The policy also sets the pace of the time-parametrized scripted stages
+    # (1 +- speed_range) from CROUCH to STAND, the hand offset still acts in
+    # active_stages, and the reward trades time, collision force, grip force,
+    # body sway and place accuracy against a verified restart.
+    speed_range: float = .3
+    start_stage: str = 'LOWER'
+    policy_stages: tuple = ()
 
     def __post_init__(self):
         if min(self.action_repeat,self.history,self.max_physics_steps)<1:
@@ -62,20 +77,26 @@ class ResidualConfig:
             raise ValueError('invalid smoothing or mass jitter')
         if min(self.position_scale_m,self.squeeze_scale_m)<=0:
             raise ValueError('positive residual scales required')
-        if self.reward_version not in ('v1','v3'):
-            raise ValueError('reward_version must be v1 or v3')
+        if self.reward_version not in ('v1','v3','v4'):
+            raise ValueError('reward_version must be v1, v3 or v4')
+        if not 0 <= self.speed_range < 1:
+            raise ValueError('speed_range must be in [0, 1)')
         self.active_stages=tuple(self.active_stages)
+        self.policy_stages=tuple(self.policy_stages) or (
+            POLICY_STAGES_V4 if self.reward_version == 'v4' else self.active_stages)
 
 class RecoveryResidualEnv(gym.Env):
     metadata = {'render_modes': []}
 
     def __init__(self, config=None):
         self.config = config or ResidualConfig()
-        self.action_space = spaces.Box(-1.,1.,(4,),np.float32)
+        self.n_act = action_dim(self.config)
+        self.action_space = spaces.Box(-1.,1.,(self.n_act,),np.float32)
         self.factory = self.recovery = None
         self.observation_space = None  # determined from compiled model at reset
         self.frames = deque(maxlen=self.config.history)
-        self.scale = np.array([self.config.position_scale_m]*3+[self.config.squeeze_scale_m])
+        self.scale = np.array([self.config.position_scale_m]*3+[self.config.squeeze_scale_m]
+                              +([self.config.speed_range] if self.n_act == 5 else []))
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -96,8 +117,10 @@ class RecoveryResidualEnv(gym.Env):
         self.recovery = FactoryRecovery(self.factory,RecoveryConfig(motion_profile=self.config.motion_profile,
             floor_pad_grip=True,floor_frog_stance=True,floor_table_place=True,
             restart_observe_steps=self.config.restart_observe_steps,max_steps=self.config.max_physics_steps))
-        self.previous_action = np.zeros(4)
-        self.filtered = np.zeros(4)
+        self.previous_action = np.zeros(self.n_act)
+        self.filtered = np.zeros(self.n_act)
+        self.metrics = dict(flow_ticks=0, max_collision_force_n=0., collision_impulse_ns=0.,
+                            max_hand_object_force_n=0., max_roll_rad=0., time_scale_sum=0., time_scale_ticks=0)
         self.seen = set()
         self.done = False
         self.episode_return = 0.
@@ -108,7 +131,7 @@ class RecoveryResidualEnv(gym.Env):
         self.place_scored = set()
         self.ended_before_policy = False
         if self.config.start_at_lower:
-            while self._stage()!='LOWER':
+            while self._stage()!=self.config.start_stage:
                 self.recovery.step()
                 if self.recovery.state in self.recovery.TERMINAL or self.recovery.total_steps>=self.config.max_physics_steps:
                     raise RuntimeError(f'prefix failed: {self.recovery.state}: {self.recovery.failure}')
@@ -121,8 +144,8 @@ class RecoveryResidualEnv(gym.Env):
             # Up to the first stage the residual acts in, with zero residual:
             # identical to the scripted controller, so not a policy sample.
             scratch = dict.fromkeys(TERMS,0.)
-            while self._stage() not in self.config.active_stages and not self._ended():
-                self._tick(np.zeros(4),scratch)
+            while self._stage() not in self.config.policy_stages and not self._ended():
+                self._tick(np.zeros(self.n_act),scratch)
             if self._ended():
                 if not forced:
                     raise SkippedEpisode(f'failed before the policy window: {self.recovery.failure}')
@@ -164,23 +187,34 @@ class RecoveryResidualEnv(gym.Env):
         """One physics tick with the given residual target; accumulates reward terms."""
         floor = getattr(self.recovery,'floor_pickup',None)
         stage = self._stage()
-        active = floor is not None and stage in (self.config.active_stages if self.config.reward_version == 'v3' else ACTIVE)
-        target = residual*self.scale if active else np.zeros(4)
+        v4 = self.config.reward_version == 'v4'
+        active = floor is not None and stage in (self.config.active_stages if self.config.reward_version != 'v1' else ACTIVE)
+        target = np.zeros(self.n_act)
+        if active:
+            target[:4] = residual[:4]*self.scale[:4]
+        paced = v4 and floor is not None and stage in floor.TIME_SCALED and stage in self.config.policy_stages
+        if paced:
+            target[4] = residual[4]*self.scale[4]
         self.filtered += self.config.smoothing*(target-self.filtered)
         if floor is not None:
-            floor.rl_hand_residual_m = self.filtered.copy() if active else np.zeros(4)
+            floor.rl_hand_residual_m = self.filtered[:4].copy() if active else np.zeros(4)
+            if v4:
+                floor.rl_time_scale = 1. + float(self.filtered[4]) if paced else 1.
         if active and action is not None:
             self.residual_ticks += 1
-            terms['magnitude'] -= .002*float(np.square(action).mean())
+            terms['magnitude'] -= .002*float(np.square(action[:4]).mean())
         before = self.recovery.forbidden_contact_ticks
         self.recovery.step()
-        terms['time'] -= .001
-        terms['contact'] -= .01*(self.recovery.forbidden_contact_ticks-before)
+        if v4:
+            self._v4_tick(floor, stage, terms)
+        else:
+            terms['time'] -= .001
+            terms['contact'] -= .01*(self.recovery.forbidden_contact_ticks-before)
         stage = self._stage()
         if stage in MILESTONES and stage not in self.seen:
             terms['progress'] += MILESTONES[stage]
             self.seen.add(stage)
-        if self.config.reward_version == 'v3' and floor is not None:
+        if self.config.reward_version in ('v3','v4') and floor is not None:
             if stage in ('HOLD','DOWN') and getattr(floor,'table_supported_ticks',0) == 0:
                 loads = floor.normal_loads
                 left, right = loads.get('left',0.), loads.get('right',0.)
@@ -227,9 +261,22 @@ class RecoveryResidualEnv(gym.Env):
             table_gap_m=getattr(self,'table_gap_m',None),
             near_table=(self.table_gap_m is not None and self.table_gap_m < .062) if getattr(self,'table_gap_m',None) is not None else None,
             ended_before_policy=getattr(self,'ended_before_policy',False),
+            metrics=self._episode_metrics() if self.config.reward_version == 'v4' else None,
             applied_residual_calls=getattr(getattr(r,'floor_pickup',None),'rl_applied_calls',0),
             max_penetration_m=r.max_object_hand_penetration_m,
             forbidden_contact_ticks=r.forbidden_contact_ticks,restart_report=getattr(r,'restart_report',None))
+
+    def _episode_metrics(self):
+        mt = dict(getattr(self,'metrics',{}))
+        if not mt:
+            return None
+        f, floor = self.factory, getattr(self.recovery,'floor_pickup',None)
+        dt = f.model.opt.timestep*f.config.frame_skip
+        mt['flow_seconds'] = mt.pop('flow_ticks')*dt
+        n = mt.pop('time_scale_ticks'); mt['mean_time_scale'] = mt.pop('time_scale_sum')/n if n else 1.
+        mt['place_error_m'] = float(np.linalg.norm(f.part_position(1)[:2]-f.poses[1].canonical_part_xy))
+        mt['place_yaw_rad'] = abs(floor._quarter_yaw_error()) if floor is not None else None
+        return mt
 
     def _success(self):
         r,f=self.recovery,self.factory
@@ -240,22 +287,55 @@ class RecoveryResidualEnv(gym.Env):
             verified=verified and report.get('arm_travel_rad',0.)>.01 and not report.get('arm_faulted',True)
         return bool(verified)
 
+    def _v4_tick(self, floor, stage, terms):
+        """v4 per-tick terms and episode metrics (after the physics tick)."""
+        import mujoco
+        r, f = self.recovery, self.factory
+        m, d = f.model, f.data
+        if r.state in ('FLOOR_PICKUP','PLACE'):
+            terms['time'] -= .004
+            self.metrics['flow_ticks'] += 1
+            if floor is not None and stage in floor.TIME_SCALED:
+                self.metrics['time_scale_sum'] += floor.rl_time_scale
+                self.metrics['time_scale_ticks'] += 1
+        # Collision force on pelvis/torso (the forbidden bodies), not ticks.
+        force = 0.
+        for i in range(d.ncon):
+            c = d.contact[i]
+            if {int(m.geom_bodyid[c.geom1]), int(m.geom_bodyid[c.geom2])} & f._forbidden_body_ids:
+                f6 = np.zeros(6); mujoco.mj_contactForce(m, d, i, f6); force += abs(f6[0])
+        if force:
+            terms['collision'] -= .001*min(force, 200.)
+            self.metrics['max_collision_force_n'] = max(self.metrics['max_collision_force_n'], force)
+            self.metrics['collision_impulse_ns'] += force*m.opt.timestep*f.config.frame_skip
+        # Squeezing harder than holding needs (crushing the block).
+        if floor is not None and stage in ('CLOSE','ALIGN','PICK_CLEAR','RISE','HOLD','DOWN','RELEASE'):
+            hof = floor._hand_object_force()
+            self.metrics['max_hand_object_force_n'] = max(self.metrics['max_hand_object_force_n'], hof)
+            terms['grip_force'] -= .0005*max(0., hof-20.)
+        # Body sway: pelvis angular speed; tilt recorded.
+        if r.state in ('FLOOR_PICKUP','PLACE'):
+            adr = m.jnt_dofadr[m.joint('floating_base_joint').id]
+            terms['stability'] -= .002*min(float(np.linalg.norm(d.qvel[adr+3:adr+6])), 3.)
+            roll = r.stabilizer.tilt()[0]
+            self.metrics['max_roll_rad'] = max(self.metrics['max_roll_rad'], abs(roll))
+
     def step(self, action):
         if self.done:
             raise RuntimeError('reset required')
         action=np.asarray(action,dtype=float)
-        if action.shape!=(4,) or not np.isfinite(action).all() or np.any(np.abs(action)>1.000001):
-            raise ValueError('expected finite bounded action (4,)')
+        if action.shape!=(self.n_act,) or not np.isfinite(action).all() or np.any(np.abs(action)>1.000001):
+            raise ValueError(f'expected finite bounded action ({self.n_act},)')
         action=np.clip(action,-1,1)
         terms=dict.fromkeys(TERMS,0.)
         for _ in range(self.config.action_repeat):
             self._tick(action,terms,action)
             if self._ended():
                 break
-        if self.config.reward_version == 'v3' and self.config.skip_inactive:
-            # Stages the residual does not act in run through inside this step.
-            while not self._ended() and self._stage() not in self.config.active_stages:
-                self._tick(np.zeros(4),terms)
+        if self.config.reward_version in ('v3','v4') and self.config.skip_inactive:
+            # Stages the policy does not act in run through inside this step.
+            while not self._ended() and self._stage() not in self.config.policy_stages:
+                self._tick(np.zeros(self.n_act),terms)
         distance=self._distance()
         terms['distance']=5*(self.previous_distance-distance)
         self.previous_distance=distance
@@ -265,7 +345,7 @@ class RecoveryResidualEnv(gym.Env):
         terminated=self.recovery.state in self.recovery.TERMINAL and not timeout
         truncated=timeout
         if terminated:
-            terms['outcome']=100. if self._success() else -25.
+            terms['outcome']=100. if self._success() else (-50. if self.config.reward_version == 'v4' else -25.)
         terms['smoothness']=-.01*float(np.square(action-self.previous_action).mean())
         reward=sum(terms.values())
         for k,v in terms.items():self.terms[k]+=v

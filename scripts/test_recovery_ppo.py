@@ -74,7 +74,21 @@ def test_v3_window_and_terms():
         print('v3 contract:',info['floor_stage'],info['reward_terms'],flush=True)
     finally:e.close()
 
+def test_v4_pace_and_metrics():
+    e=RecoveryResidualEnv(ResidualConfig(reward_version='v4',start_stage='CROUCH',skip_near_table_gap_m=0.))
+    try:
+        obs,info=e.reset(seed=0,options=dict(condition=dict(part_offset_mm=[0,0],part_mass_scale=1.)))
+        assert e.action_space.shape==(5,) and info['floor_stage']=='CROUCH',info['floor_stage']
+        f=e.recovery.floor_pickup;t0=f.tick
+        for _ in range(3):
+            obs,reward,t,tr,info=e.step(np.array([0,0,0,0,1.]))
+            assert np.isclose(sum(e.last_terms.values()),reward)
+        assert f.rl_time_scale>1. and f.tick-t0>60,(f.rl_time_scale,f.tick-t0)  # faster than 60 scripted ticks
+        assert info['metrics']['flow_seconds']>0 and info['metrics']['mean_time_scale']>1.
+        print('v4 contract:',f.tick-t0,info['metrics'],flush=True)
+    finally:e.close()
+
 if __name__=='__main__':
     tests=[test_timeout_bootstrap,test_rollout_bootstrap,test_policy_bounds_and_update,test_checkpoint_roundtrip_and_contract]
-    if '--physics' in sys.argv:tests+=[test_real_residual,test_v3_window_and_terms]
+    if '--physics' in sys.argv:tests+=[test_real_residual,test_v3_window_and_terms,test_v4_pace_and_metrics]
     for test in tests:test();print('PASS',test.__name__,flush=True)

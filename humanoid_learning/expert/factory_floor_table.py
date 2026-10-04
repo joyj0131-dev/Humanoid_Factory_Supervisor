@@ -444,7 +444,38 @@ class FloorTableCycle(FactoryFloorPickup):
         return nearest > .04
 
     # ----- stages ---------------------------------------------------------
+    # Optional pace for the time-parametrized stages (residual RL): 1 = as
+    # scripted. Only the nominal motion is re-timed; once a stage's planned
+    # duration is reached the extra ticks stop, so timeouts are unchanged.
+    rl_time_scale = 1.
+    TIME_SCALED = ('CROUCH', 'LOWER', 'ALIGN', 'PICK_CLEAR', 'RISE', 'DOWN', 'RETRACT', 'STAND')
+
+    def _stage_duration(self):
+        if self.stage == 'CROUCH':
+            return 1400
+        if self.stage == 'LOWER':
+            return self.lower_ticks()
+        return self.stage_ticks
+
     def step(self):
+        before = self.stage
+        action = self._step_stage()
+        scale = self.rl_time_scale
+        if scale != 1. and self.stage == before and self.stage in self.TIME_SCALED:
+            carry = getattr(self, '_tick_carry', 0.) + scale - 1.
+            limit = self._stage_duration() - 1
+            while carry >= 1. and self.tick < limit:
+                self.tick += 1
+                carry -= 1.
+            while carry <= -1. and 1 < self.tick < limit:
+                self.tick -= 1
+                carry += 1.
+            self._tick_carry = float(np.clip(carry, -1., 1.))
+        elif self.stage != before:
+            self._tick_carry = 0.
+        return action
+
+    def _step_stage(self):
         if self.stage == 'CROUCH' and self.tick == 0:
             self.home_arm_q = self.env._arm_target.copy()
         if self.stage == 'CROUCH':

@@ -126,11 +126,37 @@ def main():
         fig.savefig(out/'eval_matrix.png', dpi=130)
         plt.close(fig)
 
+    # Efficiency metrics (v4): mean over successful evaluation episodes.
+    rows_m = [e for e in evals if e.get('metrics_mean_successful')]
+    if rows_m:
+        keys = [('flow_seconds', 'crouch->verify time (s)'), ('place_error_m', 'place error (m)'),
+                ('place_yaw_rad', 'place yaw error (rad)'), ('max_collision_force_n', 'max torso/pelvis contact (N)'),
+                ('collision_impulse_ns', 'torso/pelvis contact impulse (N s)'),
+                ('max_hand_object_force_n', 'max hand-block force (N)'), ('max_roll_rad', 'max body roll (rad)'),
+                ('mean_time_scale', 'mean pace (x scripted)')]
+        keys = [k for k in keys if k[0] in rows_m[0]['metrics_mean_successful']]
+        fig, axes = plt.subplots(2, (len(keys)+1)//2, figsize=(3.2*((len(keys)+1)//2), 6.5))
+        for a, (k, lab) in zip(axes.flat, keys):
+            vals = [e['metrics_mean_successful'].get(k, np.nan) for e in rows_m]
+            a.bar(range(len(rows_m)), vals, color=['#9e9e9e']+['#2e7d32']*(len(rows_m)-1))
+            a.set_xticks(range(len(rows_m)), [e['label'].replace('zero_residual_baseline', 'scripted').replace('ppo_update_', 'u')
+                                              for e in rows_m], rotation=30, fontsize=7)
+            a.set_title(lab, fontsize=9)
+            for i, v in enumerate(vals):
+                a.text(i, v, f'{v:.3g}', ha='center', va='bottom', fontsize=7)
+        for a in list(axes.flat)[len(keys):]:
+            a.axis('off')
+        fig.suptitle('Efficiency on successful fixed-condition evaluations (lower is better except pace)')
+        fig.tight_layout()
+        fig.savefig(out/'metrics.png', dpi=130)
+        plt.close(fig)
+
     # Parameters table.
     ppo, env = manifest['ppo_config'], manifest['env_config']
     rows = [('algorithm', 'PPO (clipped), residual on the scripted controller'),
-            ('action', '4-D: both hands xyz offset (+-%.0f mm) + squeeze (+-%.0f mm)'
-             % (env['position_scale_m']*1000, env['squeeze_scale_m']*1000)),
+            ('action', '%d-D: both hands xyz offset (+-%.0f mm) + squeeze (+-%.0f mm)%s'
+             % (manifest['action_dim'], env['position_scale_m']*1000, env['squeeze_scale_m']*1000,
+                ' + pace of scripted stages' if manifest['action_dim'] == 5 else '')),
             ('observation', f"{manifest['obs_dim']}-D (robot state, contacts, stage, last actions; 2 frames)"),
             ('policy step', f"{env['action_repeat']} physics ticks = {env['action_repeat']*0.01:.2f} s"),
             ('randomization', f"block start +-{env['part_offset_mm']:.0f} mm, mass +-{100*env['mass_jitter']:.0f} %"),
@@ -138,7 +164,9 @@ def main():
             ('learning rate', ppo['learning_rate']), ('epochs / batch', f"{ppo['epochs']} / {ppo['batch_size']}"),
             ('gamma / lambda', f"{ppo['gamma']} / {ppo['gae_lambda']}"), ('clip / target KL', f"{ppo['clip']} / {ppo['target_kl']}"),
             ('initial log std', ppo['init_log_std']), ('entropy coef', ppo['entropy_coef']),
-            ('policy window', ', '.join(env.get('active_stages') or []) + (' (other stages run through)' if env.get('skip_inactive') else '')),
+            ('policy window', ', '.join(env.get('policy_stages') or env.get('active_stages') or []) + (' (other stages run through)' if env.get('skip_inactive') else '')),
+            ('hand offset stages', ', '.join(env.get('active_stages') or [])),
+            ('pace action', f"1 +- {env.get('speed_range')}" if env.get('reward_version') == 'v4' else 'none'),
             ('excluded in training', f"blocks < {1000*env.get('skip_near_table_gap_m', 0):.0f} mm from the table face"
              if env.get('skip_near_table_gap_m') else 'none'),
             ('reward', manifest.get('reward', '')), ('git commit', (manifest.get('git_commit') or '')[:12])]
