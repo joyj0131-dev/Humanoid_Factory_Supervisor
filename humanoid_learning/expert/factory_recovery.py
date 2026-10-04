@@ -70,6 +70,14 @@ class RecoveryConfig:
     # shorter stand-off puts the feet (and so the reach) closer to the table.
     floor_table_place: bool = False
     floor_table_stand_off_m: float = 0.27
+    # A dropped block can land within a few cm of the table face; at the
+    # nominal stand-off the crouched torso then hits the table edge (measured
+    # 30-105 N) and a wrist is jammed against the torso on the rise. Closer
+    # than this gap, stand back further. Measured: gaps 2.3-2.9 cm recovered
+    # at +6 cm and failed at +0 cm; gaps 3.2-4.6 cm recovered at +0 cm and
+    # dropped the block on the rise at +3.5-4.5 cm (longer reach).
+    floor_table_near_gap_m: float = 0.03
+    floor_table_near_extra_stand_off_m: float = 0.06
     floor_table_place_backoff_m: float = 0.045
     # After the line restarts, keep controlling the robot and record whether
     # the restarted arm actually works (0 = end at RECOVERED as before).
@@ -348,6 +356,21 @@ class FactoryRecovery:
             self.placer = FactoryPlace(self)
         self._transition('PLACE')
 
+    def _floor_table_stand_off(self):
+        """Stand-off for the floor pick, backed off when the block lies close
+        to the table face (front-face gap along the pick heading)."""
+        e, m, d = self.env, self.env.model, self.env.data
+        forward = np.array([np.cos(self.pick_heading), np.sin(self.pick_heading), 0.])
+        t = m.geom(fc.work_surface_geom_name(e.poses[self.station])).id
+        R = d.geom_xmat[t].reshape(3, 3)
+        face = float(d.geom_xpos[t] @ forward - np.abs(R.T @ forward) @ m.geom_size[t])
+        half = float(m.geom_size[m.geom(fc.part_geom_name(self.station)).id][0])
+        self.floor_table_gap_m = face - float(e.part_position(self.station) @ forward) - half
+        extra = (self.config.floor_table_near_extra_stand_off_m
+                 if self.floor_table_gap_m < self.config.floor_table_near_gap_m else 0.)
+        self.floor_table_stand_off_used_m = self.config.floor_table_stand_off_m + extra
+        return self.floor_table_stand_off_used_m
+
     def _placer_owns_legs(self):
         return getattr(getattr(self, 'placer', None), 'owns_legs', False)
 
@@ -418,7 +441,7 @@ class FactoryRecovery:
                 self.walker.holding = False
                 self.walker._apply_policy_gains()
                 self.navigator = PrecisionApproach(self.walker, replace(
-                    self.config, stand_off_m=(self.config.floor_table_stand_off_m if self.config.floor_table_place
+                    self.config, stand_off_m=(self._floor_table_stand_off() if self.config.floor_table_place
                                               else self.config.floor_stand_off_m),
                     arrival_radius_m=.04, arrival_heading_rad=.10,
                     forward_command_bias=0.0), heading=self.pick_heading)

@@ -1127,6 +1127,8 @@ class FloorTableCycle(FactoryFloorPickup):
                     self.release_frame = self.hold_frame.copy()
                     self.release_centre = goal.copy()
                     self.release_squeeze = dict(self.squeeze)
+                    self.release_palm_z = np.array([self.env.palm_pose(s_)[0][2] for s_ in ('left', 'right')])
+                    self.release_lift_bias = np.zeros(2)
                 elif self.tick >= self.stage_ticks + 2400 + getattr(self, 'table_yaw_ticks', 0):
                     self.failure = 'PLACE_SUPPORT_NOT_ESTABLISHED'
         else:
@@ -1148,7 +1150,11 @@ class FloorTableCycle(FactoryFloorPickup):
     retract_lower_m = .15  # STAND: hands down out of the arm's reach
     stand_back_m = .10  # STAND: further back so the fingertips clear the table face
     retract_clear_m = .08  # RETRACT: straight-up clearance before moving back
-    release_open_m = -.035  # pad gap at the end of RELEASE (negative = open)
+    # Pad gap at the end of RELEASE (negative = open). At -.035 a thumb tip
+    # 3-5 cm inside the block's side stayed on its top edge as the hands let go
+    # (block tipped 20-25 deg, fell back turned); -.06 clears it.
+    release_open_m = -.06
+    release_lift_gain = .004  # integral gain holding the opened hands at their set-down height
 
     def _hand_object_force(self):
         m, d = self.env.model, self.env.data
@@ -1178,6 +1184,16 @@ class FloorTableCycle(FactoryFloorPickup):
             # block's top at 6-20 N and dragged it 7-23 deg off square.
             centre = self.release_centre + np.array([0., 0., .015*f])
             palms, rotations = self._palm_targets(centre, self.release_frame, squeeze)
+            # Hold the real hands up while they let go. Set down, the block and
+            # table carried part of the arms' weight; opened, the hands sagged
+            # 3.7 cm below the command and a thumb tip pressed the block's top
+            # edge at 4-5 N, tipped it 25 deg and let it fall back turned
+            # (3 of 4 traced post-place failures). Close the loop on height.
+            actual = np.array([self.env.palm_pose(s_)[0][2] for s_ in ('left', 'right')])
+            sag = self.release_palm_z + .015*f - actual
+            self.release_lift_bias = np.clip(self.release_lift_bias + self.release_lift_gain*sag, 0., .08)
+            palms = palms.copy()
+            palms[:, 2] += self.release_lift_bias
             action = self._plan(palms, rotations, *self.place_posture_full, knees)
             action[3:17] = self._servo_arms(palms, rotations)
             touching = self._hand_object_force() > .5
