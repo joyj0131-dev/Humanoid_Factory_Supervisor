@@ -72,12 +72,17 @@ class RecoveryConfig:
     floor_table_stand_off_m: float = 0.27
     # A dropped block can land within a few cm of the table face; at the
     # nominal stand-off the crouched torso then hits the table edge (measured
-    # 30-105 N) and a wrist is jammed against the torso on the rise. Closer
-    # than this gap, stand back further. Measured: gaps 2.3-2.9 cm recovered
-    # at +6 cm and failed at +0 cm; gaps 3.2-4.6 cm recovered at +0 cm and
-    # dropped the block on the rise at +3.5-4.5 cm (longer reach).
-    floor_table_near_gap_m: float = 0.03
+    # 30-105 N) and a wrist is jammed against the torso on the rise. Stand back
+    # in two steps by the block's front-face gap to the table. Measured (one
+    # full run each): gap 1.6 cm recovered only at +6 cm; gaps 2.9-3.2 cm
+    # recovered at +3 cm but failed at +4 to +6 cm (longer reach dropped the
+    # block on the rise) or at +0 cm (torso on the table); gap 3.5 cm
+    # recovered at +0 cm and failed at +3 cm. The steps sit between those
+    # single-run data points (1 run each, so treat them as approximate).
+    floor_table_near_gap_m: float = 0.02
     floor_table_near_extra_stand_off_m: float = 0.06
+    floor_table_edge_gap_m: float = 0.033
+    floor_table_edge_extra_stand_off_m: float = 0.03
     floor_table_place_backoff_m: float = 0.045
     # After the line restarts, keep controlling the robot and record whether
     # the restarted arm actually works (0 = end at RECOVERED as before).
@@ -366,8 +371,9 @@ class FactoryRecovery:
         face = float(d.geom_xpos[t] @ forward - np.abs(R.T @ forward) @ m.geom_size[t])
         half = float(m.geom_size[m.geom(fc.part_geom_name(self.station)).id][0])
         self.floor_table_gap_m = face - float(e.part_position(self.station) @ forward) - half
-        extra = (self.config.floor_table_near_extra_stand_off_m
-                 if self.floor_table_gap_m < self.config.floor_table_near_gap_m else 0.)
+        gap, c = self.floor_table_gap_m, self.config
+        extra = (c.floor_table_near_extra_stand_off_m if gap < c.floor_table_near_gap_m else
+                 c.floor_table_edge_extra_stand_off_m if gap < c.floor_table_edge_gap_m else 0.)
         self.floor_table_stand_off_used_m = self.config.floor_table_stand_off_m + extra
         return self.floor_table_stand_off_used_m
 

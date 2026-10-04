@@ -519,7 +519,7 @@ class FloorTableCycle(FactoryFloorPickup):
                     goal = self.align_centre
                 else:
                     frame_goal = self.hold_frame
-                    goal = self.clear_start + np.array([0., 0., .035*f])
+                    goal = self.clear_start + np.array([0., 0., .035*f + getattr(self, 'clear_extra', 0.)])
                 palms, rotations = self._palm_targets(goal, frame_goal)
                 if self.stage == 'ALIGN' and self.tick >= self.stage_ticks + 50:
                     self.metrics['align_rotation_deg'] = float(np.degrees(self.align_yaw))
@@ -530,9 +530,16 @@ class FloorTableCycle(FactoryFloorPickup):
                     self.stage_ticks = 350
                     self.clear_start = centre.copy()
                     self.clear_ticks = 0
+                    self.clear_extra = 0.
                     self.env.model.opt.noslip_iterations = self.recovery.expert.config.hold_noslip_iterations
                 elif self.stage == 'PICK_CLEAR':
                     clearance, held = self.recovery.lift_evidence()
+                    # Lift to a measured clearance, not a fixed command: from the
+                    # longer near-table stand-off the arms sagged and the block
+                    # stopped at 25 mm of the 35 mm command (just at the 25 mm
+                    # gate), the lift was declared failed and the replan aborted.
+                    if self.tick >= self.stage_ticks and held and clearance < .03:
+                        self.clear_extra = min(getattr(self, 'clear_extra', 0.) + 5e-5, .04)
                     self.clear_ticks = self.clear_ticks+1 if clearance >= .025 and held else 0
                     if self.clear_ticks >= 30:
                         self._begin_rise(centre)
