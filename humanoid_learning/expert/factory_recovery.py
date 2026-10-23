@@ -42,7 +42,7 @@ class RecoveryConfig:
     # sat at +110 mm for all 2500 ticks while the pelvis stalled at x=1.65.
     # No new forbidden contact was recorded during that stall, so the rail
     # was not what stopped it -- the command was.
-    carry_forward_command_bias: float = 0.0
+    carry_forward_command_bias: float = 0.10
     # Lateral authority is what the carry needs first (0.19 m of it) and
     # what it must give up last: unthrottled to the arrival radius it
     # overshot +211 -> -139 mm, so throttle from twice the radius instead.
@@ -56,6 +56,9 @@ class RecoveryConfig:
     # deepens the squeeze before handing the legs back to the gait.
     carry_arm_kp: float = 300.0
     carry_extra_squeeze_m: float = 0.006
+    # Arm cycle waypoint the stalled Line 1 arm retreats to before a place
+    # (7: jaws open over the table, clear of the belt pick spot).
+    belt_park_arm_waypoint: int = 7
     stand_off_m: float = 0.27
     arrival_radius_m: float = 0.03
     arrival_heading_rad: float = 0.06
@@ -403,6 +406,15 @@ class FactoryRecovery:
                     # its first cycle pose; its own actuators move it there.
                     arm = e.arms[self.station]
                     arm.park_target = np.asarray(arm.active_waypoints[0], dtype=float).copy()
+                if not self.floor_task and self.config.place_after_lift:
+                    # A jam stalls the arm at its grip step: jaws open at belt
+                    # height right over the pick spot the part has to go back
+                    # to (measured: the carried block hit wc0_arm_jaw_left at
+                    # 19 N and was wrenched out of the hands 10 cm short). Send
+                    # it to its retract pose over the table; restart resets it.
+                    arm = e.arms[self.station]
+                    arm.park_target = np.asarray(
+                        arm.active_waypoints[self.config.belt_park_arm_waypoint], dtype=float).copy()
                 self.grasp = self._grasp_view(self.station)
                 self.stabilizer.env = self.grasp
                 self.expert = SharpaBimanualGraspExpert(self.grasp, heading=self.pick_heading)
@@ -542,9 +554,10 @@ class FactoryRecovery:
                 action = self.placer.step()
             else:
                 self._standing_feedback()
+                action = self.placer.step()
         elif self.state == 'VERIFY':
             self._standing_feedback()
-            action[17:25] = -1.
+            action = self.placer.step()  # holds the retracted pose, fingers open
             if not self.placer._hands_clear():
                 e.task_manager.completion_requested = False
                 self.failure = 'HANDS_NOT_CLEAR_FOR_RESTART'
