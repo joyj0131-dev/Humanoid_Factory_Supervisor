@@ -416,6 +416,10 @@ class FactoryRecovery:
                     arm.park_target = np.asarray(
                         arm.active_waypoints[self.config.belt_park_arm_waypoint], dtype=float).copy()
                 self.grasp = self._grasp_view(self.station)
+                # The idle standing arm/waist pose: collision-free by construction,
+                # so it is where the Line 1 place returns the arms after letting go.
+                self.rest_arm_q = self.grasp.data.qpos[self.grasp._arm_qpos_adr].copy()
+                self.rest_waist_q = self.grasp.data.qpos[self.grasp._waist_qpos_adr].copy()
                 self.stabilizer.env = self.grasp
                 self.expert = SharpaBimanualGraspExpert(self.grasp, heading=self.pick_heading)
                 self.expert.ik.kinematics_only = self.config.kinematic_ik

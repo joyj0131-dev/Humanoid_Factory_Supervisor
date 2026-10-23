@@ -46,7 +46,9 @@ class PlaceConfig:
     square_yaw: bool = True
     square_ticks: int = 150
     square_settle_ticks: int = 50
-    square_tolerance_rad: float = 0.05
+    # Releasing can still turn the block 6-7 deg (fs360: 2.2 -> 8.7 deg), so
+    # square to well inside the 0.15 rad gate.
+    square_tolerance_rad: float = 0.02
     square_tries: int = 5
     # The block slips in the hands: each turn removed only 35-40 % of the
     # error (17 -> 11 -> 7 -> 4.5 deg), so turn the hands further than the error.
@@ -62,6 +64,10 @@ class PlaceConfig:
     reseat_open_m: float = 0.02
     reseat_ticks: int = 60
     reseat_settle_ticks: int = 40
+    # Also re-seat as soon as the belt first carries the block, before the
+    # slide: a block landing on its edge (13-21 deg tilt in the hands) wedged
+    # at 72 N and stalled 3.8 cm short.
+    reseat_before_slide: bool = False  # v10: fixed h18 but 18 others broke (yaw 15-24 deg after the slide), 33/52
     square_min_gain_deg: float = 1.0
     # Optional: once the belt carries the weight the hands only have to steer the block.
     # Unregulated, the squeeze climbed 21 -> 88 N through slide and square on
@@ -79,9 +85,17 @@ class PlaceConfig:
     # where the restarted arm's jaw swung into the left thumb and knocked G1
     # over (measured: roll 0.05 -> 0.61 rad within 1 s of the restart).
     retract_up_m: float = 0.06
-    retract_back_m: float = 0.22
-    retract_down_m: float = 0.10
+    retract_back_m: float = 0.12
+    retract_down_m: float = 0.04
+    # ...and out to the sides, away from the block and the pick spot. Pulling
+    # 22 cm straight back pressed the left arm into the torso (70-325 N, thumb
+    # 150 N, ~52 N.m held on the wrist pitch): the arm IK has no self-collision term.
+    retract_out_m: float = 0.10
     retract_lift_fraction: float = 0.4
+    # Optional: return the arms to the idle standing pose in joint space. Off:
+    # standing against the belt, that path swept both wrists into the belt
+    # (wrist pitch up to 287 N.m) and failed.
+    retract_to_rest: bool = False
     # At the slide's end the hands can hold the block 3-5 mm off the belt
     # (measured: 6 and 17 mm from the target, no belt contact, so no release).
     # Press the commanded height down until the belt touches it.
@@ -98,7 +112,7 @@ class PlaceConfig:
     # 2.6 -> 18-19.5 deg (0.9 rad/s) on release. 'fingers_first' holds the
     # palms still while the fingers open; 'spread_first' keeps the fingers
     # closed until the palms are apart; 'together' is the old behaviour.
-    release_order: str = 'together'
+    release_order: str = 'spread_first'  # 20 runs: together 13, fingers_first 13, spread_first 17
     release_finger_ticks: int = 80
     slide_press_max_m: float = 0.02
 
@@ -182,6 +196,14 @@ class FactoryPlace:
         self.square_rotations = {s: R.copy() for s, R in self.last_rotations.items()}
         self._advance('SQUARE')
 
+    def _begin_reseat(self, next_stage):
+        self.reseat_targets = {s: t.copy() for s, t in self.last_targets.items()}
+        self.reseat_rotations = {s: R.copy() for s, R in self.last_rotations.items()}
+        axis = self.reseat_targets['right'] - self.reseat_targets['left']; axis[2] = 0.
+        self.reseat_axis = axis / max(float(np.linalg.norm(axis)), 1e-9)
+        self.reseat_next = next_stage
+        self._advance('RESEAT')
+
     def _advance(self, stage):
         self.stage, self.tick = stage, 0
 
@@ -247,25 +269,26 @@ class FactoryPlace:
             self.final_error_m = float(np.linalg.norm(actual - self.target))
             if self.tick >= cfg.descend_ticks:
                 if self._object_supported_by_belt():
-                    self.slide_start = actual.copy()
-                    self._advance('SLIDE')
+                    if cfg.reseat and cfg.reseat_before_slide:
+                        self._begin_reseat('SLIDE')
+                    else:
+                        self.slide_start = actual.copy()
+                        self._advance('SLIDE')
                 elif self.tick >= cfg.descend_ticks + cfg.settle_ticks:
                     self.failure = 'PLACE_SUPPORT_NOT_ESTABLISHED'
         elif self.stage == 'SLIDE':
             f = _quintic_scale(min(1., self.tick / cfg.slide_ticks))
             self.final_error_m = float(np.linalg.norm(actual - self.target))
             supported = self._object_supported_by_belt()
-            if self.tick >= cfg.slide_ticks and self.final_error_m < cfg.position_tolerance_m and not supported:
+            # Keep the belt under it the whole way: pushing, the hands lifted the
+            # block 1.4 mm off the belt and dropped one palm (PLACE_CONTACT_LOST).
+            if self.tick > 50 and not supported:
                 self.slide_press_m = min(self.slide_press_m + cfg.slide_press_rate_m, cfg.slide_press_max_m)
             self._move((1-f)*self.slide_start + f*self.target - np.r_[0., 0., self.slide_press_m], self.place_R)
             if self.tick >= cfg.slide_ticks:
                 if self.final_error_m < cfg.position_tolerance_m and supported:
                     if cfg.reseat:
-                        self.reseat_targets = {s: t.copy() for s, t in self.last_targets.items()}
-                        self.reseat_rotations = {s: R.copy() for s, R in self.last_rotations.items()}
-                        axis = self.reseat_targets['right'] - self.reseat_targets['left']; axis[2] = 0.
-                        self.reseat_axis = axis / max(float(np.linalg.norm(axis)), 1e-9)
-                        self._advance('RESEAT')
+                        self._begin_reseat('SQUARE')
                     else:
                         self.square_errors_deg.append(round(float(np.degrees(self._yaw_error())), 2))
                         self._begin_square()
@@ -286,8 +309,12 @@ class FactoryPlace:
             self.final_error_m = float(np.linalg.norm(actual - self.target))
             if t >= 2 * cfg.reseat_ticks + cfg.reseat_settle_ticks + 20:
                 self.last_targets, self.last_rotations = self.reseat_targets, self.reseat_rotations
-                self.square_errors_deg.append(round(float(np.degrees(self._yaw_error())), 2))
-                self._begin_square()
+                if self.reseat_next == 'SLIDE':
+                    self.slide_start = actual.copy()
+                    self._advance('SLIDE')
+                else:
+                    self.square_errors_deg.append(round(float(np.degrees(self._yaw_error())), 2))
+                    self._begin_square()
         elif self.stage == 'SQUARE':
             # Turn the commanded block frame about vertical through the block
             # centre; the hands follow it and so does the belt-supported block.
@@ -309,7 +336,8 @@ class FactoryPlace:
             # restart: left uncommanded, the palms drifted 5 cm back toward the
             # block in 22 ticks and failed the hands-clear check.
             action[17:25] = -1.
-            self._solve(self.last_targets, self.last_rotations)
+            if not hasattr(self, 'rest_from'):  # joint-space rest targets already hold
+                self._solve(self.last_targets, self.last_rotations)
         elif self.stage in ('RELEASE', 'RETRACT'):
             action[17:25] = -1.
             delay = cfg.release_finger_ticks if cfg.release_order == 'fingers_first' else 0
@@ -321,15 +349,27 @@ class FactoryPlace:
                                            cfg.release_open_max_m - cfg.release_open_m)
             if self.stage == 'RETRACT':
                 opening = cfg.release_open_m
-            spread = {'left': -self.release_axis * (opening + self.release_extra_m),
-                      'right': self.release_axis * (opening + self.release_extra_m)}
+            out = 0.
+            if self.stage == 'RETRACT':
+                t, a = min(1., self.tick / cfg.retract_ticks), cfg.retract_lift_fraction
+                out = cfg.retract_out_m * _quintic_scale(max(0., (t - a) / (1. - a)))
+            spread = {'left': -self.release_axis * (opening + self.release_extra_m + out),
+                      'right': self.release_axis * (opening + self.release_extra_m + out)}
             up = back = 0.
             if self.stage == 'RETRACT':
                 t, a = min(1., self.tick / cfg.retract_ticks), cfg.retract_lift_fraction
                 up = _quintic_scale(min(1., t / a)); back = _quintic_scale(max(0., (t - a) / (1. - a)))
-            lift = self.expert.task_rotation @ np.array([-cfg.retract_back_m*back, 0.,
-                                                         cfg.retract_up_m*up - cfg.retract_down_m*back])
-            self._solve({s: self.release_start[s] + spread[s] + lift for s in self.offset}, self.release_R)
+            rest = cfg.retract_to_rest and hasattr(self.recovery, 'rest_arm_q')
+            if rest and back > 0.:
+                if not hasattr(self, 'rest_from'):
+                    self.rest_from = (self.expert._arm_ik_target.copy(), self.expert._waist_ik_target.copy())
+                arm0, waist0 = self.rest_from
+                self.expert._arm_ik_target[:] = (1 - back) * arm0 + back * self.recovery.rest_arm_q
+                self.expert._waist_ik_target[:] = (1 - back) * waist0 + back * self.recovery.rest_waist_q
+            else:
+                lift = self.expert.task_rotation @ np.array([-cfg.retract_back_m*back, 0.,
+                                                             cfg.retract_up_m*up - cfg.retract_down_m*back])
+                self._solve({s: self.release_start[s] + spread[s] + lift for s in self.offset}, self.release_R)
             if self.stage == 'RELEASE' and self.tick >= cfg.release_ticks + delay:
                 self.release_free = self._hands_free()
                 if self.release_free or self.tick >= cfg.release_ticks + delay + cfg.release_free_wait_ticks:
@@ -340,7 +380,7 @@ class FactoryPlace:
                     self._advance('READY_TO_VERIFY')
                 elif self.tick >= cfg.retract_ticks + cfg.settle_ticks:
                     self.failure = 'PLACE_RETRACT_OR_SETTLE_NOT_ACHIEVED'
-        if self.stage in ('DESCEND', 'SLIDE', 'SQUARE', 'RESEAT'):
+        if self.stage in ('DESCEND', 'SLIDE', 'SQUARE'):  # not RESEAT: the palms open on purpose
             forces = SharpaContactLift.measure_support_forces(self.view)
             supported = all(np.linalg.norm(f) > 0.5 for f in forces.values())
             self.unsupported_ticks = 0 if supported or self._object_supported_by_belt() else self.unsupported_ticks + 1
